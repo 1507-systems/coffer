@@ -1,0 +1,13 @@
+# Encrypted vault files are synced via Mutagen, not git
+vault/*.yaml
+
+# macOS
+.DS_Store
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
+# Keep vault directory in git (but not its contents)
+!vault/.gitkeep

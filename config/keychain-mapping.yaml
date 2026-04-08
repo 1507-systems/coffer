@@ -1,0 +1,47 @@
+# keychain-mapping.yaml -- Maps macOS Keychain service names to lockbox category/key paths
+# Used by `lockbox import` to translate a keychain CSV dump into vault entries.
+
+mappings:
+  # === Cloudflare ===
+  "Claude Code - DNS": cloudflare/dns-token
+  "Claude Code - CF Pages Token": cloudflare/pages-token
+  "Claude Code - CF Tunnel SNaI": cloudflare/tunnel-snai
+  "Claude Code - Access": cloudflare/access-token
+  "Claude - 1507.systems - Zone Management": cloudflare/zone-mgmt-1507systems
+  "Claude - shashinka.org - Zone Management": cloudflare/zone-mgmt-shashinka
+  "Claude - hellgaskitchen.com - Zone Management": cloudflare/zone-mgmt-hellgaskitchen
+
+  # === Home Automation ===
+  "Claude Code - HA Token": home-automation/home-assistant-token
+  "Claude Code - Hubitat Token": home-automation/hubitat-token
+  "Claude Code - SwitchBot API": home-automation/switchbot-api-token
+  "Claude Code - SwitchBot Secret": home-automation/switchbot-api-secret
+  "BS-IoT": home-automation/bs-iot
+
+  # === Synology NAS ===
+  "Claude Code - BShaCore DSM": synology/bshacore-dsm
+  "Claude Code - NAS000 DSM": synology/nas000-dsm
+  "Claude Code - NAS002 DSM": synology/nas002-dsm
+  "Claude Code - BShaDev DSM": synology/bshadev-dsm
+
+  # === Communications (VoIP, Email, Discord) ===
+  "Claude Code - VoIP.ms": communications/voipms-api
+  "Claude Code - VoIP.ms Portal": communications/voipms-portal
+  "Claude Code - VoIP.ms SIP ASTERISK": communications/voipms-sip-asterisk
+  "Claude Code - Email Sender": communications/email-sender
+  "Claude Code - BPSMail iCloud": communications/bpsmail-icloud
+  "Claude Code - Resend HK": communications/resend-hk
+  "Claude Code - HK Email Auth": communications/hk-email-auth
+
+  # === Zoho CRM ===
+  "Claude Code - Zoho CRM Client ID": misc/zoho-crm-client-id
+  "Claude Code - Zoho CRM Client Secret": misc/zoho-crm-client-secret
+  "Claude Code - CRM Worker Auth": misc/crm-worker-auth
+  "Claude Code - Zoho Client Portal ID": misc/zoho-client-portal-id
+  "Claude Code - Zoho Client Portal Secret": misc/zoho-client-portal-secret
+
+  # === Misc ===
+  "Claude Code - Memory Sync": misc/memory-sync
+  "Claude Code - Tailscale": misc/tailscale
+  "Claude Code - Proxmox PVE000": misc/proxmox-pve000
+  "Claude Code - TUG BBS": misc/tug-bbs

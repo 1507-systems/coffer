@@ -1,0 +1,4 @@
+# ShellCheck configuration for lockbox
+# Allow sourcing files relative to the script
+source-path=SCRIPTDIR
+source-path=SCRIPTDIR/../lib

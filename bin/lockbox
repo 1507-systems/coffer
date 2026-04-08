@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# lockbox -- Offline encrypted secrets vault CLI
+# Dispatches subcommands to lib/ scripts using SOPS + age for encryption.
+set -euo pipefail
+
+# Resolve the lockbox root directory (parent of bin/)
+LOCKBOX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export LOCKBOX_ROOT
+
+# Source shared helpers (die, warn, log, require_cmd, ntfy, etc.)
+# shellcheck source=../lib/common.sh
+source "${LOCKBOX_ROOT}/lib/common.sh"
+
+# Lockbox configuration paths
+export LOCKBOX_CONFIG_DIR="${HOME}/.config/lockbox"
+export LOCKBOX_IDENTITY="${LOCKBOX_CONFIG_DIR}/identity.txt"
+export LOCKBOX_VAULT="${LOCKBOX_ROOT}/vault"
+export LOCKBOX_SOPS_CONFIG="${LOCKBOX_ROOT}/config/.sops.yaml"
+export LOCKBOX_SESSION_KEY="${LOCKBOX_CONFIG_DIR}/.session-key"
+
+usage() {
+    cat <<'EOF'
+Usage: lockbox <command> [args...]
+
+Commands:
+  get    <category/key>         Retrieve a secret (prints to stdout)
+  set    <category/key> [value] Store or update a secret
+  list   [category]             List categories and keys
+  edit   <category>             Edit a category file interactively
+  import <csv-file>             Import secrets from a keychain CSV dump
+  init                          First-time setup (generate age keypair)
+  unlock [--auto]               Decrypt identity and export SOPS_AGE_KEY
+  lock                          Clear session key and unset SOPS_AGE_KEY
+
+Options:
+  -h, --help    Show this help message
+  -v, --version Show version
+
+EOF
+}
+
+version() {
+    echo "lockbox 1.0.0"
+}
+
+# Require at least one argument
+if [[ $# -lt 1 ]]; then
+    usage >&2
+    die "No command specified"
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    get)
+        # shellcheck source=../lib/get.sh
+        source "${LOCKBOX_ROOT}/lib/get.sh"
+        cmd_get "$@"
+        ;;
+    set)
+        # shellcheck source=../lib/set.sh
+        source "${LOCKBOX_ROOT}/lib/set.sh"
+        cmd_set "$@"
+        ;;
+    list)
+        # shellcheck source=../lib/list.sh
+        source "${LOCKBOX_ROOT}/lib/list.sh"
+        cmd_list "$@"
+        ;;
+    edit)
+        # shellcheck source=../lib/edit.sh
+        source "${LOCKBOX_ROOT}/lib/edit.sh"
+        cmd_edit "$@"
+        ;;
+    import)
+        # shellcheck source=../lib/import.sh
+        source "${LOCKBOX_ROOT}/lib/import.sh"
+        cmd_import "$@"
+        ;;
+    init)
+        # shellcheck source=../lib/init.sh
+        source "${LOCKBOX_ROOT}/lib/init.sh"
+        cmd_init "$@"
+        ;;
+    unlock)
+        # shellcheck source=../lib/unlock.sh
+        source "${LOCKBOX_ROOT}/lib/unlock.sh"
+        cmd_unlock "$@"
+        ;;
+    lock)
+        # shellcheck source=../lib/lock.sh
+        source "${LOCKBOX_ROOT}/lib/lock.sh"
+        cmd_lock "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    -v|--version|version)
+        version
+        ;;
+    *)
+        usage >&2
+        die "Unknown command: ${command}"
+        ;;
+esac
