@@ -31,10 +31,17 @@ cmd_set() {
     [[ -n "$path" ]] || die "Usage: lockbox set <category/key> [value] [--stdin]"
 
     require_cmd sops
-    require_cmd yq
+    require_cmd jq
     require_identity
     ensure_unlocked
     parse_path "$path"
+
+    # Read the public key for encrypting (stored during init)
+    local public_key_file="${LOCKBOX_CONFIG_DIR}/public-key"
+    [[ -f "$public_key_file" ]] || die "Public key not found at ${public_key_file}. Run: lockbox init"
+    local age_recipient
+    age_recipient=$(cat "$public_key_file")
+    [[ -n "$age_recipient" ]] || die "Empty public key file"
 
     # Get the value from stdin, argument, or interactive prompt
     if [[ "$from_stdin" == true ]]; then
@@ -47,34 +54,32 @@ cmd_set() {
         [[ -n "$value" ]] || die "Empty value provided"
     fi
 
-    # If the category file doesn't exist, create it with just this key
-    if [[ ! -f "$LOCKBOX_VAULT_FILE" ]]; then
+    # All vault operations use JSON for data manipulation to avoid yq's YAML
+    # parsing issues with special characters (%, !, $, etc. in passwords).
+    # sops handles the YAML encryption layer; we never parse decrypted YAML ourselves.
+
+    # If the category file doesn't exist or is empty, create it with just this key
+    if [[ ! -f "$LOCKBOX_VAULT_FILE" ]] || [[ ! -s "$LOCKBOX_VAULT_FILE" ]]; then
         log "Creating new category: ${LOCKBOX_CATEGORY}"
-        local new_content
-        new_content=$(printf '%s: "%s"\n' "$LOCKBOX_KEY" "$value" | yq '.')
-        echo "$new_content" | SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops encrypt \
-            --config "$LOCKBOX_SOPS_CONFIG" \
-            --input-type yaml --output-type yaml \
-            /dev/stdin > "$LOCKBOX_VAULT_FILE" \
+        jq -n --arg key "$LOCKBOX_KEY" --arg val "$value" '{($key): $val}' \
+            | SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops encrypt \
+                --age "$age_recipient" \
+                --input-type json --output-type yaml \
+                /dev/stdin > "$LOCKBOX_VAULT_FILE" \
             || die "Failed to encrypt new category file: ${LOCKBOX_CATEGORY}"
         log "Set ${path}"
         return 0
     fi
 
-    # Decrypt the full category file to memory
-    local content
-    content=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops decrypt "$LOCKBOX_VAULT_FILE" 2>&1) \
-        || die "Failed to decrypt '${LOCKBOX_CATEGORY}': ${content}"
-
-    # Update the key-value pair using yq
+    # Decrypt to JSON, update with jq, re-encrypt to YAML
     local updated
-    updated=$(echo "$content" | yq ".\"${LOCKBOX_KEY}\" = \"${value}\"") \
-        || die "Failed to update key '${LOCKBOX_KEY}' in '${LOCKBOX_CATEGORY}'"
+    updated=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops decrypt --output-type json "$LOCKBOX_VAULT_FILE" \
+        | jq --arg key "$LOCKBOX_KEY" --arg val "$value" '.[$key] = $val') \
+        || die "Failed to decrypt/update '${LOCKBOX_CATEGORY}'"
 
-    # Re-encrypt and write back
     echo "$updated" | SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops encrypt \
-        --config "$LOCKBOX_SOPS_CONFIG" \
-        --input-type yaml --output-type yaml \
+        --age "$age_recipient" \
+        --input-type json --output-type yaml \
         /dev/stdin > "$LOCKBOX_VAULT_FILE" \
         || die "Failed to re-encrypt '${LOCKBOX_CATEGORY}'"
 

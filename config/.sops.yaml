@@ -1,0 +1,4 @@
+creation_rules:
+  - path_regex: vault/.*\.yaml$
+    age: >-
+      age1cmrhn8qqx2cqdpejrl6zhf4x9rw2ttetfm8y553s5r4j69z58f4sm7g5jn

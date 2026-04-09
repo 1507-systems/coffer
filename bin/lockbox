@@ -13,7 +13,6 @@ source "${LOCKBOX_ROOT}/lib/common.sh"
 
 # Lockbox configuration paths
 export LOCKBOX_CONFIG_DIR="${HOME}/.config/lockbox"
-export LOCKBOX_IDENTITY="${LOCKBOX_CONFIG_DIR}/identity.txt"
 export LOCKBOX_VAULT="${LOCKBOX_ROOT}/vault"
 export LOCKBOX_SOPS_CONFIG="${LOCKBOX_ROOT}/config/.sops.yaml"
 export LOCKBOX_SESSION_KEY="${LOCKBOX_CONFIG_DIR}/.session-key"

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # ntfy topic for urgent failure notifications
-LOCKBOX_NTFY_TOPIC="https://ntfy.sh/roguenode-watchdog-6ffbaa666ec3"
+LOCKBOX_NTFY_TOPIC="https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
 
 # --- Logging ---
 
@@ -37,18 +37,14 @@ require_cmd() {
 
 # --- Identity and session key helpers ---
 
-# Check that the identity file exists and has correct permissions.
+# Verify that lockbox has been initialized (secret key exists in Keychain).
 require_identity() {
-    local id_file="${LOCKBOX_IDENTITY:-${HOME}/.config/lockbox/identity.txt}"
-    [[ -f "$id_file" ]] || die "No identity found. Run: lockbox init"
-    local perms
-    perms=$(stat -f "%Lp" "$id_file" 2>/dev/null || stat -c "%a" "$id_file" 2>/dev/null)
-    [[ "$perms" == "600" ]] || die "Identity file permissions too open (${perms}). Run: chmod 600 ${id_file}"
+    security find-generic-password -s "Lockbox" -a "lockbox-secret-key" -w >/dev/null 2>&1 \
+        || die "No identity found. Run: lockbox init"
 }
 
 # Ensure SOPS_AGE_KEY is available for decryption.
-# Checks (in order): environment variable, session key file, then fails.
-# This does NOT prompt for a passphrase -- use `lockbox unlock` for that.
+# Checks (in order): environment variable, session key file, Keychain, then fails.
 ensure_unlocked() {
     # Already unlocked via environment
     if [[ -n "${SOPS_AGE_KEY:-}" ]]; then
@@ -59,6 +55,15 @@ ensure_unlocked() {
     local session_key="${LOCKBOX_SESSION_KEY:-${HOME}/.config/lockbox/.session-key}"
     if [[ -f "$session_key" ]]; then
         SOPS_AGE_KEY="$(cat "$session_key")"
+        export SOPS_AGE_KEY
+        return 0
+    fi
+
+    # Fallback: try Keychain directly (interactive use on laptops)
+    local kc_key
+    kc_key=$(security find-generic-password -s "Lockbox" -a "lockbox-secret-key" -w 2>/dev/null) || true
+    if [[ -n "$kc_key" ]] && [[ "$kc_key" == AGE-SECRET-KEY-* ]]; then
+        SOPS_AGE_KEY="$kc_key"
         export SOPS_AGE_KEY
         return 0
     fi

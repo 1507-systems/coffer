@@ -67,7 +67,7 @@ cmd_import() {
             source "${LOCKBOX_ROOT}/lib/set.sh"
         fi
 
-        if cmd_set "${lockbox_path}" "${password}" 2>/dev/null; then
+        if cmd_set "${lockbox_path}" "${password}"; then
             imported=$((imported + 1))
         else
             warn "Failed to import: ${service} -> ${lockbox_path}"

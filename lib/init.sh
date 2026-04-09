@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # init.sh -- First-time lockbox setup on a new machine
-# Generates an age keypair, creates SOPS config, and sets up vault structure.
+# Generates an age keypair, stores secret key in macOS Keychain, creates SOPS config.
 # Usage: lockbox init
 set -euo pipefail
 
@@ -10,11 +10,10 @@ cmd_init() {
     require_cmd sops
 
     local config_dir="${LOCKBOX_CONFIG_DIR}"
-    local identity_file="${LOCKBOX_IDENTITY}"
 
-    # Check for existing identity -- abort if already initialized
-    if [[ -f "$identity_file" ]]; then
-        die "Identity already exists at ${identity_file}. Remove it first if you want to re-initialize."
+    # Check for existing identity in Keychain -- abort if already initialized
+    if security find-generic-password -s "Lockbox" -a "lockbox-secret-key" -w >/dev/null 2>&1; then
+        die "Identity already exists in Keychain. Run: lockbox reset (or delete 'Lockbox' entries from Keychain manually) to re-initialize."
     fi
 
     # Create config directory
@@ -34,47 +33,24 @@ cmd_init() {
     log "Generating age keypair..."
     local keygen_output
     keygen_output=$(age-keygen 2>&1)
+
     local public_key
-    public_key=$(echo "$keygen_output" | grep "^age1")
-    # The full output includes comments with the public key and the private key
-    # age-keygen outputs: # created: <date>\n# public key: age1...\nAGE-SECRET-KEY-...
+    public_key=$(echo "$keygen_output" | grep -oE "age1[a-z0-9]+" | head -1)
     [[ -n "$public_key" ]] || die "Failed to extract public key from age-keygen output"
 
-    # Prompt for passphrase to encrypt the identity file
-    printf 'Enter passphrase to protect the identity file: ' >&2
-    read -rs passphrase
-    echo >&2
-    [[ -n "$passphrase" ]] || die "Passphrase cannot be empty"
+    local secret_key
+    secret_key=$(echo "$keygen_output" | grep "^AGE-SECRET-KEY-")
+    [[ -n "$secret_key" ]] || die "Failed to extract secret key from age-keygen output"
 
-    printf 'Confirm passphrase: ' >&2
-    read -rs passphrase_confirm
-    echo >&2
-    [[ "$passphrase" == "$passphrase_confirm" ]] || die "Passphrases do not match"
+    # Store secret key in macOS Keychain (the only copy -- no file on disk)
+    log "Storing secret key in Keychain..."
+    security add-generic-password -s "Lockbox" -a "lockbox-secret-key" -w "$secret_key" \
+        -T /usr/bin/security -T /bin/bash 2>/dev/null \
+        || die "Failed to store secret key in Keychain. Cannot proceed without secure storage."
 
-    # Encrypt the private key with the passphrase using age's scrypt encryption.
-    # We write the keygen output to a temp file, encrypt it, then shred the temp.
-    log "Encrypting identity with passphrase..."
-    local tmpkey
-    tmpkey=$(mktemp)
-    echo "$keygen_output" > "$tmpkey"
-    chmod 600 "$tmpkey"
-    echo "$passphrase" | age -p -o "$identity_file" "$tmpkey" 2>/dev/null \
-        || die "Failed to encrypt identity file"
-    # Overwrite and remove the temp file immediately
-    dd if=/dev/zero of="$tmpkey" bs=1 count=256 conv=notrunc 2>/dev/null || true
-    rm -f "$tmpkey"
-    chmod 600 "$identity_file"
-
-    # Offer to store passphrase in macOS Keychain for auto-unlock
-    printf 'Store passphrase in macOS Keychain for auto-unlock at boot? [y/N]: ' >&2
-    read -r store_keychain
-    if [[ "$store_keychain" =~ ^[Yy]$ ]]; then
-        log "Storing passphrase in Keychain..."
-        log "NOTE: You must run this from a GUI terminal for Keychain ACL prompts."
-        security add-generic-password -s "Lockbox" -a "lockbox" -w "$passphrase" \
-            -T /usr/bin/security -T /bin/bash 2>/dev/null \
-            || warn "Failed to store in Keychain. You can add it manually later."
-    fi
+    # Store public key in config dir (not secret, used for SOPS config and recipient management)
+    echo "$public_key" > "${config_dir}/public-key"
+    chmod 644 "${config_dir}/public-key"
 
     # Create SOPS config if it doesn't exist
     local sops_config="${LOCKBOX_SOPS_CONFIG}"
@@ -99,7 +75,6 @@ SOPS_EOF
     for cat_name in "${categories[@]}"; do
         local vault_file="${LOCKBOX_VAULT}/${cat_name}.yaml"
         if [[ ! -f "$vault_file" ]]; then
-            # Create a placeholder file (will be populated on first set/import)
             touch "$vault_file"
         fi
     done
@@ -108,7 +83,7 @@ SOPS_EOF
     log "Lockbox initialized successfully!"
     log "Machine: ${machine_name}"
     log "Public key: ${public_key}"
-    log "Identity: ${identity_file}"
+    log "Secret key stored in: macOS Keychain (service: Lockbox)"
     echo "" >&2
     log "Next steps:"
     log "  1. On the OTHER machine, run: lockbox add-recipient ${public_key}"
