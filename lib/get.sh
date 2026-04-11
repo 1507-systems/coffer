@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # get.sh -- Retrieve a secret value from the vault
-# Usage: lockbox get <category/key> [--newline|-n] [--clip|-c]
+# Usage: coffer get <category/key> [--newline|-n] [--clip|-c]
 set -euo pipefail
 
 cmd_get() {
@@ -25,19 +25,19 @@ cmd_get() {
         esac
     done
 
-    [[ -n "$path" ]] || die "Usage: lockbox get <category/key>"
+    [[ -n "$path" ]] || die "Usage: coffer get <category/key>"
 
     require_cmd sops
     require_identity
     ensure_unlocked
     parse_path "$path"
 
-    [[ -f "$LOCKBOX_VAULT_FILE" ]] || die "Category '${LOCKBOX_CATEGORY}' not found. Available: $(list_categories | tr '\n' ' ')"
+    [[ -f "$COFFER_VAULT_FILE" ]] || die "Category '${COFFER_CATEGORY}' not found. Available: $(list_categories | tr '\n' ' ')"
 
     # Decrypt and extract the specific key
     local value
-    value=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops decrypt --extract "[\"${LOCKBOX_KEY}\"]" "$LOCKBOX_VAULT_FILE" 2>&1) \
-        || die "Failed to decrypt '${LOCKBOX_KEY}' from '${LOCKBOX_CATEGORY}': ${value}"
+    value=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops decrypt --extract "[\"${COFFER_KEY}\"]" "$COFFER_VAULT_FILE" 2>&1) \
+        || die "Failed to decrypt '${COFFER_KEY}' from '${COFFER_CATEGORY}': ${value}"
 
     if [[ "$clip" == true ]]; then
         require_cmd pbcopy

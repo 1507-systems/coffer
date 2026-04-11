@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # lock.sh -- Clear the session key and unset SOPS_AGE_KEY
-# Usage: eval $(lockbox lock)
+# Usage: eval $(coffer lock)
 set -euo pipefail
 
 cmd_lock() {
-    local session_key_file="${LOCKBOX_SESSION_KEY:-${HOME}/.config/lockbox/.session-key}"
+    local session_key_file="${COFFER_SESSION_KEY:-${HOME}/.config/coffer/.session-key}"
 
     # Delete the session key file if it exists
     if [[ -f "$session_key_file" ]]; then
@@ -14,7 +14,7 @@ cmd_lock() {
         log "Session key file removed"
     fi
 
-    # Output the unset command for eval $(lockbox lock)
+    # Output the unset command for eval $(coffer lock)
     echo "unset SOPS_AGE_KEY"
     log "Vault locked"
 }

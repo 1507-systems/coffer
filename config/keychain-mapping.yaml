@@ -1,5 +1,5 @@
-# keychain-mapping.yaml -- Maps macOS Keychain service names to lockbox category/key paths
-# Used by `lockbox import` to translate a keychain CSV dump into vault entries.
+# keychain-mapping.yaml -- Maps macOS Keychain service names to coffer category/key paths
+# Used by `coffer import` to translate a keychain CSV dump into vault entries.
 
 mappings:
   # === Cloudflare ===
