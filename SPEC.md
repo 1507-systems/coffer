@@ -1,4 +1,4 @@
-# Lockbox - Specification
+# Coffer - Specification
 
 **Offline Encrypted Secrets Vault for macOS Developer Credentials**
 
@@ -35,7 +35,7 @@ Status: Design
 
 ## Overview
 
-Lockbox is an offline, encrypted secrets vault that replaces macOS Keychain as the primary store for API tokens, passwords, and developer credentials. It uses **SOPS** for structured encryption and **age** for the underlying cryptography, producing human-readable YAML files where keys are visible but values are encrypted.
+Coffer is an offline, encrypted secrets vault that replaces macOS Keychain as the primary store for API tokens, passwords, and developer credentials. It uses **SOPS** for structured encryption and **age** for the underlying cryptography, producing human-readable YAML files where keys are visible but values are encrypted.
 
 The vault is designed for a 2-machine setup:
 - **Wiles** (Mac Mini 2018, 64GB RAM) -- primary dev machine
@@ -71,14 +71,14 @@ Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │              lockbox CLI                 │
-                    │         (bash, bin/lockbox)              │
+                    │              coffer CLI                 │
+                    │         (bash, bin/coffer)              │
                     └──────┬──────────────────┬───────────────┘
                            │                  │
                     ┌──────▼──────┐    ┌──────▼──────┐
                     │   lib/*.sh  │    │  age identity│
                     │  (commands) │    │  (~/.config/ │
-                    │             │    │   lockbox/)  │
+                    │             │    │   coffer/)  │
                     └──────┬──────┘    └──────┬───────┘
                            │                  │
                     ┌──────▼──────────────────▼───────────────┐
@@ -101,13 +101,13 @@ Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the
 
 | Component | Role |
 |-----------|------|
-| `bin/lockbox` | CLI entrypoint, argument parsing, dispatches to lib/ functions |
+| `bin/coffer` | CLI entrypoint, argument parsing, dispatches to lib/ functions |
 | `lib/*.sh` | Individual command implementations (get, set, list, edit, import, init) |
 | `config/.sops.yaml` | SOPS configuration defining age recipients for each path pattern |
 | `config/categories.yaml` | Category definitions (names, descriptions, default keys) |
 | `vault/*.yaml` | SOPS-encrypted YAML files (one per category) |
-| `~/.config/lockbox/identity.txt` | Machine-local age private key (never synced, never committed) |
-| Mutagen | Syncs the lockbox directory between Wiles and Verve |
+| `~/.config/coffer/identity.txt` | Machine-local age private key (never synced, never committed) |
+| Mutagen | Syncs the coffer directory between Wiles and Verve |
 
 ---
 
@@ -116,7 +116,7 @@ Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the
 ### Algorithm
 - **age** with XChaCha20-Poly1305 (AEAD)
 - Key derivation: **scrypt KDF** with passphrase-based encryption for the identity file itself
-- Each machine generates its own age keypair during `lockbox init`
+- Each machine generates its own age keypair during `coffer init`
 
 ### Multi-Recipient Encryption
 Every SOPS-encrypted file is encrypted to **all authorized age public keys**. This means any machine with a registered keypair can decrypt any file in the vault without needing the other machine's private key.
@@ -131,7 +131,7 @@ creation_rules:
 ```
 
 ### Passphrase Protection
-The age identity file (`~/.config/lockbox/identity.txt`) is itself encrypted with the user's login password via age's scrypt passphrase encryption. This means:
+The age identity file (`~/.config/coffer/identity.txt`) is itself encrypted with the user's login password via age's scrypt passphrase encryption. This means:
 
 1. The encrypted vault files on disk require the age private key to decrypt
 2. The age private key requires the login password to unlock
@@ -151,11 +151,11 @@ SOPS handles the structured encryption layer:
 ## Directory Structure
 
 ```
-lockbox/
+coffer/
 ├── SPEC.md                          # This document
 ├── PROJECT_LOG.md                   # Change history and decisions
 ├── bin/
-│   └── lockbox                      # Main CLI entrypoint (bash)
+│   └── coffer                      # Main CLI entrypoint (bash)
 ├── lib/
 │   ├── init.sh                      # First-time setup
 │   ├── get.sh                       # Retrieve a secret value
@@ -168,7 +168,7 @@ lockbox/
 ├── config/
 │   ├── .sops.yaml                   # SOPS creation rules (age recipients)
 │   ├── categories.yaml              # Category metadata (descriptions, expected keys)
-│   └── keychain-mapping.yaml        # Maps keychain service names to lockbox paths
+│   └── keychain-mapping.yaml        # Maps keychain service names to coffer paths
 ├── vault/                           # Encrypted YAML files (synced via Mutagen)
 │   ├── cloudflare.yaml
 │   ├── github.yaml
@@ -184,8 +184,8 @@ lockbox/
 ```
 
 ### Files NOT in the repo / NOT synced
-- `~/.config/lockbox/identity.txt` -- age private key (machine-local, passphrase-encrypted)
-- `~/.config/lockbox/machine-name` -- plaintext file containing "wiles" or "verve"
+- `~/.config/coffer/identity.txt` -- age private key (machine-local, passphrase-encrypted)
+- `~/.config/coffer/machine-name` -- plaintext file containing "wiles" or "verve"
 
 ---
 
@@ -242,26 +242,26 @@ Key design properties:
 
 ## CLI Interface
 
-### Entrypoint: `bin/lockbox`
+### Entrypoint: `bin/coffer`
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 ```
 
-The CLI uses a subcommand pattern. All commands source shared configuration (lockbox root directory, identity path, SOPS config path).
+The CLI uses a subcommand pattern. All commands source shared configuration (coffer root directory, identity path, SOPS config path).
 
 ### Commands
 
-#### `lockbox get <category/key>`
+#### `coffer get <category/key>`
 Decrypt and print a single secret value to stdout.
 
 ```bash
-lockbox get cloudflare/dns-token
+coffer get cloudflare/dns-token
 # Output: the-actual-token-value (no trailing newline by default)
 
 # Usage in scripts:
-export CF_TOKEN=$(lockbox get cloudflare/dns-token)
+export CF_TOKEN=$(coffer get cloudflare/dns-token)
 ```
 
 **Behavior:**
@@ -275,13 +275,13 @@ export CF_TOKEN=$(lockbox get cloudflare/dns-token)
 - `--newline` / `-n` -- append a newline after the value (useful for interactive use)
 - `--clip` / `-c` -- copy to clipboard instead of stdout (via `pbcopy`), auto-clears after 30 seconds
 
-#### `lockbox set <category/key> [value]`
+#### `coffer set <category/key> [value]`
 Store or update a secret.
 
 ```bash
-lockbox set cloudflare/dns-token              # prompts securely for value
-lockbox set cloudflare/dns-token "new-value"  # sets directly (avoid in shell history)
-echo "new-value" | lockbox set cloudflare/dns-token --stdin  # pipe in
+coffer set cloudflare/dns-token              # prompts securely for value
+coffer set cloudflare/dns-token "new-value"  # sets directly (avoid in shell history)
+echo "new-value" | coffer set cloudflare/dns-token --stdin  # pipe in
 ```
 
 **Behavior:**
@@ -294,12 +294,12 @@ echo "new-value" | lockbox set cloudflare/dns-token --stdin  # pipe in
 **Flags:**
 - `--stdin` -- read value from stdin instead of argument or prompt
 
-#### `lockbox list [category]`
+#### `coffer list [category]`
 List available secrets.
 
 ```bash
-lockbox list                # all categories and their keys
-lockbox list cloudflare     # keys within cloudflare category
+coffer list                # all categories and their keys
+coffer list cloudflare     # keys within cloudflare category
 ```
 
 **Behavior (no args):**
@@ -321,13 +321,13 @@ lockbox list cloudflare     # keys within cloudflare category
 1. Extract and list keys from `vault/<category>.yaml`
 2. No decryption needed (keys are plaintext)
 
-**Implementation note:** Since SOPS leaves keys in plaintext, `lockbox list` can work by parsing the YAML structure and filtering out the `sops:` metadata block. Use `yq` to extract top-level keys excluding `sops`.
+**Implementation note:** Since SOPS leaves keys in plaintext, `coffer list` can work by parsing the YAML structure and filtering out the `sops:` metadata block. Use `yq` to extract top-level keys excluding `sops`.
 
-#### `lockbox edit <category>`
+#### `coffer edit <category>`
 Open a category file for interactive editing.
 
 ```bash
-lockbox edit cloudflare
+coffer edit cloudflare
 ```
 
 **Behavior:**
@@ -338,66 +338,66 @@ lockbox edit cloudflare
 
 **Note:** This is the one case where a decrypted temp file briefly exists (managed by SOPS, not by us). SOPS uses `os.CreateTemp` with restrictive permissions and deletes immediately after the editor closes.
 
-#### `lockbox import <csv-file>`
+#### `coffer import <csv-file>`
 Import secrets from a keychain CSV dump.
 
 ```bash
-lockbox import keychain-backup.csv
+coffer import keychain-backup.csv
 ```
 
 **Behavior:**
 1. Read the CSV (columns: `service,account,password`)
-2. Load the mapping file (`config/keychain-mapping.yaml`) to translate service names to lockbox paths
+2. Load the mapping file (`config/keychain-mapping.yaml`) to translate service names to coffer paths
 3. For each row:
    a. Look up the service name in the mapping
    b. If mapped, call the `set` function with the mapped `category/key` and the password value
    c. If not mapped, print a warning and skip
 4. Print a summary (imported count, skipped count, errors)
 
-#### `lockbox init`
+#### `coffer init`
 First-time setup on a new machine.
 
 ```bash
-lockbox init
+coffer init
 ```
 
 **Behavior:**
-1. Check for existing identity at `~/.config/lockbox/identity.txt`. If exists, abort with message.
+1. Check for existing identity at `~/.config/coffer/identity.txt`. If exists, abort with message.
 2. Prompt for machine name (suggest based on hostname)
 3. Generate a new age keypair: `age-keygen -o /dev/stdout`
 4. Prompt for passphrase (login password)
-5. Encrypt the private key with the passphrase: `age -p -o ~/.config/lockbox/identity.txt`
-6. `chmod 600 ~/.config/lockbox/identity.txt`
-7. Store machine name in `~/.config/lockbox/machine-name`
+5. Encrypt the private key with the passphrase: `age -p -o ~/.config/coffer/identity.txt`
+6. `chmod 600 ~/.config/coffer/identity.txt`
+7. Store machine name in `~/.config/coffer/machine-name`
 8. **Store the master password in macOS Keychain** for auto-unlock at boot:
    ```bash
-   security add-generic-password -s "Lockbox" -a "lockbox" -w "$passphrase" \
+   security add-generic-password -s "Coffer" -a "coffer" -w "$passphrase" \
      -T /usr/bin/security -T /bin/bash
    ```
    This is a **one-time operation** that the user runs manually from a GUI terminal (required for Keychain ACL prompts). The `-T` flags set the partition list so that `security find-generic-password` can read it from non-interactive contexts (LaunchAgents).
-9. Print the public key and instruct user to run `lockbox add-recipient` on the other machine
+9. Print the public key and instruct user to run `coffer add-recipient` on the other machine
 10. If this is the first machine (no existing `.sops.yaml` recipients), create the SOPS config
 11. Create vault directory and empty category files if they don't exist
 
-**Keychain safety:** The `lockbox init` step is the ONLY time lockbox writes to the keychain. See [Keychain Safety Rules](#keychain-safety-rules) for the full policy.
+**Keychain safety:** The `coffer init` step is the ONLY time coffer writes to the keychain. See [Keychain Safety Rules](#keychain-safety-rules) for the full policy.
 
-#### `lockbox add-recipient <age-public-key>`
+#### `coffer add-recipient <age-public-key>`
 Register another machine's public key.
 
 ```bash
-lockbox add-recipient age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+coffer add-recipient age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 ```
 
 **Behavior:**
 1. Validate the key format (must start with `age1`)
 2. Append the key to the recipient list in `config/.sops.yaml`
-3. Run `lockbox rekey` to re-encrypt all vault files for the new recipient set
+3. Run `coffer rekey` to re-encrypt all vault files for the new recipient set
 
-#### `lockbox rekey`
+#### `coffer rekey`
 Re-encrypt all vault files for the current set of recipients.
 
 ```bash
-lockbox rekey
+coffer rekey
 ```
 
 **Behavior:**
@@ -410,10 +410,10 @@ lockbox rekey
 
 ## Data Flow
 
-### Reading a secret (`lockbox get`)
+### Reading a secret (`coffer get`)
 
 ```
-User runs: lockbox get cloudflare/dns-token
+User runs: coffer get cloudflare/dns-token
     │
     ▼
 Parse args: category = "cloudflare", key = "dns-token"
@@ -422,7 +422,7 @@ Parse args: category = "cloudflare", key = "dns-token"
 Verify vault/cloudflare.yaml exists (fail loudly if not)
     │
     ▼
-Set SOPS_AGE_KEY_FILE=~/.config/lockbox/identity.txt
+Set SOPS_AGE_KEY_FILE=~/.config/coffer/identity.txt
     │
     ▼
 age prompts for passphrase (scrypt decrypts identity)
@@ -437,10 +437,10 @@ SOPS decrypts value using age private key
 Value printed to stdout (never touches disk)
 ```
 
-### Writing a secret (`lockbox set`)
+### Writing a secret (`coffer set`)
 
 ```
-User runs: lockbox set cloudflare/dns-token
+User runs: coffer set cloudflare/dns-token
     │
     ▼
 Parse args, prompt for value with read -s
@@ -460,26 +460,26 @@ Done (decrypted content only existed in shell variables / pipes)
 
 ### Session passphrase caching
 
-To avoid prompting for the passphrase on every single operation, lockbox uses `SOPS_AGE_KEY` environment variable approach:
+To avoid prompting for the passphrase on every single operation, coffer uses `SOPS_AGE_KEY` environment variable approach:
 
-1. On first `lockbox` invocation in a shell session, if `SOPS_AGE_KEY` is not set:
+1. On first `coffer` invocation in a shell session, if `SOPS_AGE_KEY` is not set:
    a. Prompt for passphrase
-   b. Decrypt the identity file to a variable: `key=$(age -d ~/.config/lockbox/identity.txt)`
+   b. Decrypt the identity file to a variable: `key=$(age -d ~/.config/coffer/identity.txt)`
    c. Export `SOPS_AGE_KEY="$key"` for the current process
 2. Subsequent operations in the same invocation reuse the variable
-3. For multi-command workflows, the user can run `eval $(lockbox unlock)` which exports `SOPS_AGE_KEY` into the current shell session
-4. The `lockbox lock` command unsets `SOPS_AGE_KEY`
+3. For multi-command workflows, the user can run `eval $(coffer unlock)` which exports `SOPS_AGE_KEY` into the current shell session
+4. The `coffer lock` command unsets `SOPS_AGE_KEY`
 
 **The decrypted key only lives in shell environment variables, never on disk.**
 
-**Headless machines (Wiles):** On dedicated headless dev machines, lockbox should unlock
+**Headless machines (Wiles):** On dedicated headless dev machines, coffer should unlock
 once at boot (via auto-unlock LaunchAgent) and stay unlocked until reboot or explicit
-`lockbox lock`. These machines run autonomous operations (marathon mode, cron, LaunchAgents)
-and are monitored from mobile devices where re-prompting is impractical. The `lockbox agent`
+`coffer lock`. These machines run autonomous operations (marathon mode, cron, LaunchAgents)
+and are monitored from mobile devices where re-prompting is impractical. The `coffer agent`
 (future work) will hold the decrypted identity in a persistent Unix socket, surviving across
 shell sessions. Until then, the auto-unlock LaunchAgent sets `SOPS_AGE_KEY` in a file at
-`~/.config/lockbox/.session-key` (mode 0600, owned by user) that lockbox reads as a fallback
-when the environment variable is not set. This file is deleted on `lockbox lock` or shutdown.
+`~/.config/coffer/.session-key` (mode 0600, owned by user) that coffer reads as a fallback
+when the environment variable is not set. This file is deleted on `coffer lock` or shutdown.
 
 **Laptops (Verve):** Session caching via environment variables is appropriate. The machine
 sleeps and travels, so credentials naturally clear when the shell exits.
@@ -499,9 +499,9 @@ sleeps and travels, so credentials naturally clear when the shell exits.
 ```yaml
 # ~/.mutagen/mutagen.yml (relevant section)
 sync:
-  lockbox:
-    alpha: "/Users/bryce/dev/lockbox/vault"
-    beta: "wiles:/Users/rogue/dev/lockbox/vault"
+  coffer:
+    alpha: "/Users/bryce/dev/coffer/vault"
+    beta: "wiles:/Users/rogue/dev/coffer/vault"
     mode: "two-way-resolved"
     resolve:
       strategy: "alpha-wins"
@@ -510,9 +510,9 @@ sync:
         - ".DS_Store"
 ```
 
-**Wait -- since both machines use the same iCloud path, Mutagen syncs the `vault/` directory specifically (not the whole lockbox directory).** The rest of the project (bin, lib, config) syncs via iCloud or git. Only the vault files need the tighter sync control.
+**Wait -- since both machines use the same iCloud path, Mutagen syncs the `vault/` directory specifically (not the whole coffer directory).** The rest of the project (bin, lib, config) syncs via iCloud or git. Only the vault files need the tighter sync control.
 
-Actually, a cleaner approach: the lockbox project itself lives in git. The vault directory is gitignored and synced exclusively via Mutagen. This separates code (git) from secrets (Mutagen).
+Actually, a cleaner approach: the coffer project itself lives in git. The vault directory is gitignored and synced exclusively via Mutagen. This separates code (git) from secrets (Mutagen).
 
 ### Conflict Resolution Strategy
 
@@ -525,12 +525,12 @@ Actually, a cleaner approach: the lockbox project itself lives in git. The vault
    - Secrets change rarely (new token, rotation)
    - Only one person uses both machines
    - The CLI can warn if the vault file's mtime is very recent (< 60 seconds), suggesting a sync may be in progress
-3. **Pre-edit sync check**: Before any write operation, `lockbox` runs `mutagen sync list` to check sync status. If a sync is in progress or paused, it warns the user and asks for confirmation.
-4. **Post-edit sync flush**: After any write operation, `lockbox` runs `mutagen sync flush lockbox` to trigger an immediate sync.
+3. **Pre-edit sync check**: Before any write operation, `coffer` runs `mutagen sync list` to check sync status. If a sync is in progress or paused, it warns the user and asks for confirmation.
+4. **Post-edit sync flush**: After any write operation, `coffer` runs `mutagen sync flush coffer` to trigger an immediate sync.
 5. **Conflict recovery**: If a conflict does occur (alpha-wins discards beta changes):
    - Mutagen logs the conflict
    - The discarded version can be recovered from Mutagen's staging directory
-   - `lockbox` can provide a `lockbox sync-status` command that surfaces Mutagen conflict state
+   - `coffer` can provide a `coffer sync-status` command that surfaces Mutagen conflict state
 
 ### What gets synced where
 
@@ -538,8 +538,8 @@ Actually, a cleaner approach: the lockbox project itself lives in git. The vault
 |-----------|-------------|--------|
 | `bin/`, `lib/`, `config/`, `SPEC.md`, etc. | Git (private repo) | Code changes, versioned |
 | `vault/*.yaml` | Mutagen (two-way-resolved) | Encrypted secrets, not in git |
-| `~/.config/lockbox/identity.txt` | NEVER synced | Machine-local private key |
-| `~/.config/lockbox/machine-name` | NEVER synced | Machine identifier |
+| `~/.config/coffer/identity.txt` | NEVER synced | Machine-local private key |
+| `~/.config/coffer/machine-name` | NEVER synced | Machine identifier |
 
 ---
 
@@ -555,9 +555,9 @@ Every error is fatal and loud. No silent fallbacks. The user must know immediate
 | Missing `sops` binary | Exit 1, print: "sops not found. Install: brew install sops" |
 | Missing `age` binary | Exit 1, print: "age not found. Install: brew install age" |
 | Missing `yq` binary | Exit 1, print: "yq not found. Install: brew install yq" |
-| Identity file missing | Exit 1, print: "No identity found. Run: lockbox init" |
-| Identity file wrong permissions | Exit 1, print: "Identity file permissions too open. Run: chmod 600 ~/.config/lockbox/identity.txt" |
-| Wrong passphrase | age exits non-zero, lockbox propagates: "Failed to decrypt identity. Wrong passphrase?" |
+| Identity file missing | Exit 1, print: "No identity found. Run: coffer init" |
+| Identity file wrong permissions | Exit 1, print: "Identity file permissions too open. Run: chmod 600 ~/.config/coffer/identity.txt" |
+| Wrong passphrase | age exits non-zero, coffer propagates: "Failed to decrypt identity. Wrong passphrase?" |
 | Category file not found | Exit 1, print: "Category '<name>' not found. Available: ..." |
 | Key not found in category | Exit 1, print: "Key '<key>' not found in '<category>'. Available keys: ..." |
 | SOPS MAC verification failure | Exit 1, print: "Integrity check failed for <file>. File may be tampered or corrupted." |
@@ -566,12 +566,12 @@ Every error is fatal and loud. No silent fallbacks. The user must know immediate
 
 ### Urgent Notifications on Failure
 
-**All failures must push to ntfy as urgent.** Any lockbox operation that fails (decrypt error, file not found, SOPS error, sync conflict) must send an ntfy notification with priority "urgent" before exiting. This ensures the user is alerted immediately on any device (phone, watch, desktop).
+**All failures must push to ntfy as urgent.** Any coffer operation that fails (decrypt error, file not found, SOPS error, sync conflict) must send an ntfy notification with priority "urgent" before exiting. This ensures the user is alerted immediately on any device (phone, watch, desktop).
 
 ```bash
 # ntfy notification pattern for all errors:
-curl -s -H "Priority: urgent" -H "Title: Lockbox Error" -H "Tags: lock,warning" \
-  -d "Error description here" "https://ntfy.sh/roguenode-watchdog-6ffbaa666ec3"
+curl -s -H "Priority: urgent" -H "Title: Coffer Error" -H "Tags: lock,warning" \
+  -d "Error description here" "https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
 ```
 
 This is integrated into the `die()` function so every fatal error automatically sends a push notification. Non-fatal warnings (`warn()`) do NOT send ntfy notifications.
@@ -582,19 +582,19 @@ This is integrated into the `die()` function so every fatal error automatically 
 # Every lib/*.sh script starts with:
 set -euo pipefail
 
-LOCKBOX_NTFY_TOPIC="https://ntfy.sh/roguenode-watchdog-6ffbaa666ec3"
+COFFER_NTFY_TOPIC="https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
 
 # Shared error handler in lib/common.sh:
 die() {
-    echo "lockbox: error: $*" >&2
+    echo "coffer: error: $*" >&2
     # Push urgent notification on every failure
-    curl -s -H "Priority: urgent" -H "Title: Lockbox Error" -H "Tags: lock,warning" \
-      -d "$*" "$LOCKBOX_NTFY_TOPIC" >/dev/null 2>&1 || true
+    curl -s -H "Priority: urgent" -H "Title: Coffer Error" -H "Tags: lock,warning" \
+      -d "$*" "$COFFER_NTFY_TOPIC" >/dev/null 2>&1 || true
     exit 1
 }
 
 warn() {
-    echo "lockbox: warning: $*" >&2
+    echo "coffer: warning: $*" >&2
 }
 
 require_cmd() {
@@ -602,8 +602,8 @@ require_cmd() {
 }
 
 require_identity() {
-    local id_file="${LOCKBOX_IDENTITY:-$HOME/.config/lockbox/identity.txt}"
-    [[ -f "$id_file" ]] || die "No identity found. Run: lockbox init"
+    local id_file="${COFFER_IDENTITY:-$HOME/.config/coffer/identity.txt}"
+    [[ -f "$id_file" ]] || die "No identity found. Run: coffer init"
     local perms
     perms=$(stat -f "%Lp" "$id_file")
     [[ "$perms" == "600" ]] || die "Identity file permissions too open ($perms). Run: chmod 600 $id_file"
@@ -622,9 +622,9 @@ require_identity() {
 | Network interception | No network calls. Mutagen uses SSH transport (encrypted). |
 | Memory scraping | Decrypted values exist in memory briefly (shell variables, pipes). Acceptable risk for CLI tools. |
 | Malicious modification of vault files | SOPS MAC detects tampering. |
-| Compromised machine | Attacker needs both the identity file AND the passphrase. Rotate keys with `lockbox rekey` after compromise. |
-| Shell history exposure | `lockbox set` without a value argument prompts interactively. Warn in docs against passing secrets as CLI args. |
-| Temp file leakage | No temp files created by lockbox. SOPS `edit` creates a brief temp file with restrictive permissions (SOPS-managed). |
+| Compromised machine | Attacker needs both the identity file AND the passphrase. Rotate keys with `coffer rekey` after compromise. |
+| Shell history exposure | `coffer set` without a value argument prompts interactively. Warn in docs against passing secrets as CLI args. |
+| Temp file leakage | No temp files created by coffer. SOPS `edit` creates a brief temp file with restrictive permissions (SOPS-managed). |
 | Clipboard exposure | `--clip` auto-clears after 30 seconds. Optional, not default behavior. |
 
 ### Key Rotation Procedure
@@ -632,12 +632,12 @@ require_identity() {
 If a machine is compromised or decommissioned:
 1. Generate a new keypair on the replacement/surviving machine
 2. Remove the compromised machine's public key from `.sops.yaml`
-3. Run `lockbox rekey` to re-encrypt all vault files without the compromised key
+3. Run `coffer rekey` to re-encrypt all vault files without the compromised key
 4. Rotate any secrets that may have been exposed
 
 ### Identity File Security
 
-- Location: `~/.config/lockbox/identity.txt`
+- Location: `~/.config/coffer/identity.txt`
 - Permissions: `600` (owner read/write only)
 - Encrypted with age passphrase encryption (scrypt KDF)
 - Never committed to git
@@ -649,7 +649,7 @@ If a machine is compromised or decommissioned:
 ## Keychain Migration
 
 ### Overview
-Migrate all secrets currently stored in macOS Keychain (accessed via `security find-generic-password`) to lockbox. The migration is a one-time operation using a CSV export.
+Migrate all secrets currently stored in macOS Keychain (accessed via `security find-generic-password`) to coffer. The migration is a one-time operation using a CSV export.
 
 ### Export from Keychain
 
@@ -701,10 +701,10 @@ Claude Code - Zoho Client Portal Secret
 SERVICES
 ```
 
-### Import into Lockbox
+### Import into Coffer
 
 ```bash
-lockbox import keychain-backup.csv
+coffer import keychain-backup.csv
 ```
 
 The import command reads the mapping file to know which category/key each service name maps to.
@@ -715,10 +715,10 @@ The import command reads the mapping file to know which category/key each servic
 
 ### config/keychain-mapping.yaml
 
-This file maps macOS Keychain service names to lockbox `category/key` paths.
+This file maps macOS Keychain service names to coffer `category/key` paths.
 
 ```yaml
-# Keychain service name -> lockbox category/key
+# Keychain service name -> coffer category/key
 mappings:
   # === Cloudflare ===
   "Claude Code - DNS": cloudflare/dns-token
@@ -812,7 +812,7 @@ service,account,password
 
 After import, run a verification pass:
 ```bash
-lockbox verify-import keychain-backup.csv
+coffer verify-import keychain-backup.csv
 ```
 
 This decrypts each imported secret and compares it to the CSV value (done in memory, no disk writes). Reports any mismatches.
@@ -833,7 +833,7 @@ All dependencies installable via Homebrew. No compiled code, no runtimes beyond 
 
 ### Version Check
 
-`lockbox` will check for minimum versions of all dependencies on every invocation (cached check, refreshed daily) and print clear upgrade instructions if any are outdated.
+`coffer` will check for minimum versions of all dependencies on every invocation (cached check, refreshed daily) and print clear upgrade instructions if any are outdated.
 
 ---
 
@@ -841,17 +841,17 @@ All dependencies installable via Homebrew. No compiled code, no runtimes beyond 
 
 ### LaunchAgent
 
-A LaunchAgent runs `lockbox unlock --auto` at boot, which reads the master password from the macOS Keychain and decrypts the age identity without user interaction.
+A LaunchAgent runs `coffer unlock --auto` at boot, which reads the master password from the macOS Keychain and decrypts the age identity without user interaction.
 
 ```xml
-<!-- ~/Library/LaunchAgents/com.lockbox.auto-unlock.plist -->
+<!-- ~/Library/LaunchAgents/com.coffer.auto-unlock.plist -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.lockbox.auto-unlock</string>
+    <string>com.coffer.auto-unlock</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/path/to/bin/lockbox</string>
+        <string>/path/to/bin/coffer</string>
         <string>unlock</string>
         <string>--auto</string>
     </array>
@@ -861,16 +861,16 @@ A LaunchAgent runs `lockbox unlock --auto` at boot, which reads the master passw
 </plist>
 ```
 
-### `lockbox unlock --auto` Behavior
+### `coffer unlock --auto` Behavior
 
-1. Read the master password from Keychain: `security find-generic-password -s "Lockbox" -a "lockbox" -w`
+1. Read the master password from Keychain: `security find-generic-password -s "Coffer" -a "coffer" -w`
 2. If keychain read succeeds: decrypt the age identity and export `SOPS_AGE_KEY` (or write to a session-scoped Unix socket / agent mechanism)
 3. If keychain read fails (e.g., after a macOS restore, Keychain corruption, or missing entry):
    - Send an ntfy urgent notification:
      ```bash
-     curl -s -H "Priority: urgent" -H "Title: Lockbox Locked" -H "Tags: lock,warning" \
+     curl -s -H "Priority: urgent" -H "Title: Coffer Locked" -H "Tags: lock,warning" \
        -d "Auto-unlock failed on $(hostname). Keychain read failed. Manual unlock required." \
-       "https://ntfy.sh/roguenode-watchdog-6ffbaa666ec3"
+       "https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
      ```
    - Exit non-zero and wait for manual unlock
    - Do NOT attempt to fix, reset, or re-create the keychain entry
@@ -879,7 +879,7 @@ A LaunchAgent runs `lockbox unlock --auto` at boot, which reads the master passw
 
 ## Remote Unlock from Verve
 
-When lockbox is locked on Wiles and needs manual unlock, the notification and unlock flow is:
+When coffer is locked on Wiles and needs manual unlock, the notification and unlock flow is:
 
 ### Notification Flow
 
@@ -888,13 +888,13 @@ When lockbox is locked on Wiles and needs manual unlock, the notification and un
 
 ### Unlock from Verve (preferred)
 
-On Verve, a helper script `wiles-unlock` pops a **native macOS osascript password dialog** that appears over all apps (including fullscreen), collects the password, and sends it to Wiles via SSH to unlock lockbox.
+On Verve, a helper script `wiles-unlock` pops a **native macOS osascript password dialog** that appears over all apps (including fullscreen), collects the password, and sends it to Wiles via SSH to unlock coffer.
 
 The osascript dialog is preferred over tmux prompts because the user is usually attached to a Claude Code session in tmux and shouldn't need to detach to type a password.
 
 ### Unlock from Frolic / iOS
 
-The ntfy notification on iOS instructs the user to open Jump Desktop and unlock lockbox on Wiles directly (type the password into the Wiles terminal).
+The ntfy notification on iOS instructs the user to open Jump Desktop and unlock coffer on Wiles directly (type the password into the Wiles terminal).
 
 ---
 
@@ -904,7 +904,7 @@ The ntfy notification on iOS instructs the user to open Jump Desktop and unlock 
 `~/bin/wiles-unlock` on Verve
 
 ### Purpose
-Pops a native macOS password dialog and sends the password to Wiles to unlock lockbox remotely. This avoids needing to detach from the current tmux/Claude Code session.
+Pops a native macOS password dialog and sends the password to Wiles to unlock coffer remotely. This avoids needing to detach from the current tmux/Claude Code session.
 
 ### Implementation
 
@@ -912,13 +912,13 @@ Pops a native macOS password dialog and sends the password to Wiles to unlock lo
 #!/usr/bin/env bash
 set -euo pipefail
 
-# wiles-unlock -- Pop a native macOS dialog on Verve, send password to Wiles lockbox
+# wiles-unlock -- Pop a native macOS dialog on Verve, send password to Wiles coffer
 # Installed at ~/bin/wiles-unlock on Verve
 
-pass=$(osascript -e 'display dialog "Unlock Lockbox on Wiles:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK"' -e 'text returned of result' 2>/dev/null)
+pass=$(osascript -e 'display dialog "Unlock Coffer on Wiles:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK"' -e 'text returned of result' 2>/dev/null)
 
 if [ -n "$pass" ]; then
-  ssh wiles "lockbox unlock <<< \"$pass\"" && echo "Lockbox unlocked" || echo "Unlock failed"
+  ssh wiles "coffer unlock <<< \"$pass\"" && echo "Coffer unlocked" || echo "Unlock failed"
 else
   echo "Cancelled"
 fi
@@ -928,7 +928,7 @@ fi
 - The `osascript` dialog pops over all apps, including fullscreen windows
 - The password is sent to Wiles over SSH (encrypted in transit)
 - If SSH to Wiles fails, the script exits with a clear error (no silent failure)
-- This script is NOT in the lockbox repo (it's a Verve-local utility in `~/bin/`)
+- This script is NOT in the coffer repo (it's a Verve-local utility in `~/bin/`)
 
 ---
 
@@ -936,7 +936,7 @@ fi
 
 **NEVER touch the macOS Keychain from automated scripts or Claude Code.**
 
-The only keychain write operation in the entire lockbox system is during `lockbox init`, which the user runs **manually from a GUI terminal**. This is required because:
+The only keychain write operation in the entire coffer system is during `coffer init`, which the user runs **manually from a GUI terminal**. This is required because:
 
 1. Keychain ACL prompts (the "Always Allow" dialog) require a GUI session
 2. The partition list (`-T` flags) must be set during creation to allow non-interactive reads
@@ -946,9 +946,9 @@ The only keychain write operation in the entire lockbox system is during `lockbo
 
 | Operation | Allowed? | Context |
 |-----------|----------|---------|
-| `security add-generic-password` during `lockbox init` | Yes | User runs manually from GUI terminal |
-| `security find-generic-password` during `lockbox unlock --auto` | Yes | LaunchAgent reads at boot |
-| `security find-generic-password` from any lockbox command | Yes | Read-only, uses partition list set during init |
+| `security add-generic-password` during `coffer init` | Yes | User runs manually from GUI terminal |
+| `security find-generic-password` during `coffer unlock --auto` | Yes | LaunchAgent reads at boot |
+| `security find-generic-password` from any coffer command | Yes | Read-only, uses partition list set during init |
 | `security add-generic-password` from Claude Code | **NEVER** | Write a script for the user to run manually |
 | `security delete-generic-password` from any automated context | **NEVER** | Manual intervention only |
 | Any keychain modification after init | **NEVER** | If read fails, notify and wait for manual fix |
@@ -957,7 +957,7 @@ If a keychain read fails at any point:
 1. Send an ntfy urgent notification describing the failure
 2. Exit non-zero with a clear error message
 3. **Do not** attempt to fix, reset, re-create, or modify the keychain entry
-4. Wait for the user to resolve manually (re-run `lockbox init` or fix Keychain Access)
+4. Wait for the user to resolve manually (re-run `coffer init` or fix Keychain Access)
 
 ---
 
@@ -967,14 +967,14 @@ If a keychain read fails at any point:
 When Bitwarden ships their AI retrieval API, add an optional backend that:
 - Stores secrets in Bitwarden instead of (or in addition to) SOPS files
 - Uses the Bitwarden CLI or API for encrypt/decrypt
-- Maintains the same `lockbox` CLI interface (swappable backend)
+- Maintains the same `coffer` CLI interface (swappable backend)
 - Enables cloud sync as an alternative to Mutagen
 
 ### Potential Enhancements
-- **`lockbox audit`** -- report on secret age, detect potentially rotated tokens
-- **`lockbox env`** -- generate a `.env` file from a template mapping lockbox paths to env var names
-- **`lockbox agent`** -- a background agent that caches the decrypted identity in a Unix socket (similar to ssh-agent), avoiding repeated passphrase prompts across terminal sessions
-- **`lockbox rotate <category/key>`** -- guided rotation workflow (fetch new token from provider API where possible, update vault, verify)
+- **`coffer audit`** -- report on secret age, detect potentially rotated tokens
+- **`coffer env`** -- generate a `.env` file from a template mapping coffer paths to env var names
+- **`coffer agent`** -- a background agent that caches the decrypted identity in a Unix socket (similar to ssh-agent), avoiding repeated passphrase prompts across terminal sessions
+- **`coffer rotate <category/key>`** -- guided rotation workflow (fetch new token from provider API where possible, update vault, verify)
 - **Shell completion** -- bash/zsh completions for categories and keys
 - **Touch ID integration** -- use macOS Secure Enclave via `age-plugin-se` for passphrase-less decryption on machines with Touch ID
 
@@ -990,7 +990,7 @@ security find-generic-password -s "Claude Code - DNS" -w
 
 After migration, this becomes:
 ```bash
-lockbox get cloudflare/dns-token
+coffer get cloudflare/dns-token
 ```
 
 ### CLAUDE.md Update
@@ -1003,11 +1003,11 @@ After migration, update `CLAUDE.md` to replace the credential retrieval instruct
 
 **After:**
 ```
-- `lockbox get cloudflare/dns-token`
+- `coffer get cloudflare/dns-token`
 ```
 
 ### Transition Period
-During migration, both systems will work simultaneously. The keychain entries remain until lockbox is verified working on both machines. Removal of keychain entries is a manual step after full verification.
+During migration, both systems will work simultaneously. The keychain entries remain until coffer is verified working on both machines. Removal of keychain entries is a manual step after full verification.
 
 ---
 
@@ -1027,8 +1027,8 @@ creation_rules:
 
 | Variable | Purpose | Set By |
 |----------|---------|--------|
-| `SOPS_AGE_KEY_FILE` | Path to age identity file | lockbox (default) |
-| `SOPS_AGE_KEY` | Decrypted age private key (in-memory) | `lockbox unlock` |
-| `LOCKBOX_ROOT` | Override lockbox directory location | User (optional) |
-| `LOCKBOX_IDENTITY` | Override identity file path | User (optional) |
-| `EDITOR` | Editor for `lockbox edit` | User's shell config |
+| `SOPS_AGE_KEY_FILE` | Path to age identity file | coffer (default) |
+| `SOPS_AGE_KEY` | Decrypted age private key (in-memory) | `coffer unlock` |
+| `COFFER_ROOT` | Override coffer directory location | User (optional) |
+| `COFFER_IDENTITY` | Override identity file path | User (optional) |
+| `EDITOR` | Editor for `coffer edit` | User's shell config |
