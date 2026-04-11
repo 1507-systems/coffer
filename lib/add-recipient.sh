@@ -28,27 +28,30 @@ cmd_add_recipient() {
     [[ -n "$current_recipients" ]] || die "Could not read current recipients from ${sops_config}"
 
     # Check if this key is already a recipient
+    local key_exists=false
     if echo "$current_recipients" | grep -qF "$new_key"; then
-        log "Key ${new_key} is already a recipient. Nothing to do."
-        return 0
+        key_exists=true
+        log "Key ${new_key} is already a recipient. Re-encrypting vault files..."
     fi
 
-    # Build the updated comma-separated recipient list
-    local updated_recipients="${current_recipients},${new_key}"
+    if [[ "$key_exists" == "false" ]]; then
+        # Build the updated comma-separated recipient list
+        local updated_recipients="${current_recipients},${new_key}"
 
-    log "Adding recipient: ${new_key}"
-    log "Updated recipient list: ${updated_recipients}"
+        log "Adding recipient: ${new_key}"
+        log "Updated recipient list: ${updated_recipients}"
 
-    # Update the SOPS config file with the new recipient list
-    # Rewrite the entire file to avoid sed edge cases with multi-line YAML
-    cat > "$sops_config" <<SOPS_EOF
+        # Update the SOPS config file with the new recipient list
+        # Rewrite the entire file to avoid sed edge cases with multi-line YAML
+        cat > "$sops_config" <<SOPS_EOF
 creation_rules:
   - path_regex: vault/.*\\.yaml\$
     age: >-
       ${updated_recipients}
 SOPS_EOF
 
-    log "Updated ${sops_config}"
+        log "Updated ${sops_config}"
+    fi
 
     # Re-encrypt all existing vault files with the updated recipient list.
     # sops updatekeys reads the new .sops.yaml and adds/removes recipients
@@ -76,7 +79,8 @@ SOPS_EOF
         log "Re-encrypting ${filename}..."
         # updatekeys re-wraps the data key for the new recipient list.
         # --yes skips the interactive confirmation prompt.
-        if SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops updatekeys --yes --config "$sops_config" "$vault_file"; then
+        # SOPS_CONFIG tells sops where to find .sops.yaml since vault/ and config/ are siblings
+        if SOPS_AGE_KEY="${SOPS_AGE_KEY}" SOPS_CONFIG="$sops_config" sops updatekeys --yes "$vault_file"; then
             re_encrypted=$((re_encrypted + 1))
         else
             die "Failed to re-encrypt ${filename}. Vault may be in an inconsistent state — check ${sops_config}"
