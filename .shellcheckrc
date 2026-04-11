@@ -1,4 +1,4 @@
-# ShellCheck configuration for lockbox
+# ShellCheck configuration for coffer
 # Allow sourcing files relative to the script
 source-path=SCRIPTDIR
 source-path=SCRIPTDIR/../lib

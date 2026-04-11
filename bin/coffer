@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# lockbox -- Offline encrypted secrets vault CLI
+# coffer -- Offline encrypted secrets vault CLI
 # Dispatches subcommands to lib/ scripts using SOPS + age for encryption.
 set -euo pipefail
 
-# Resolve the lockbox root directory (parent of bin/)
-LOCKBOX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export LOCKBOX_ROOT
+# Resolve the coffer root directory (parent of bin/)
+COFFER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export COFFER_ROOT
 
 # Source shared helpers (die, warn, log, require_cmd, ntfy, etc.)
 # shellcheck source=../lib/common.sh
-source "${LOCKBOX_ROOT}/lib/common.sh"
+source "${COFFER_ROOT}/lib/common.sh"
 
-# Lockbox configuration paths
-export LOCKBOX_CONFIG_DIR="${HOME}/.config/lockbox"
-export LOCKBOX_VAULT="${LOCKBOX_ROOT}/vault"
-export LOCKBOX_SOPS_CONFIG="${LOCKBOX_ROOT}/config/.sops.yaml"
-export LOCKBOX_SESSION_KEY="${LOCKBOX_CONFIG_DIR}/.session-key"
+# Coffer configuration paths
+export COFFER_CONFIG_DIR="${HOME}/.config/coffer"
+export COFFER_VAULT="${COFFER_ROOT}/vault"
+export COFFER_SOPS_CONFIG="${COFFER_ROOT}/config/.sops.yaml"
+export COFFER_SESSION_KEY="${COFFER_CONFIG_DIR}/.session-key"
 
 usage() {
     cat <<'EOF'
-Usage: lockbox <command> [args...]
+Usage: coffer <command> [args...]
 
 Commands:
   get    <category/key>         Retrieve a secret (prints to stdout)
@@ -39,7 +39,7 @@ EOF
 }
 
 version() {
-    echo "lockbox 1.0.0"
+    echo "coffer 1.0.0"
 }
 
 # Require at least one argument
@@ -54,42 +54,42 @@ shift
 case "$command" in
     get)
         # shellcheck source=../lib/get.sh
-        source "${LOCKBOX_ROOT}/lib/get.sh"
+        source "${COFFER_ROOT}/lib/get.sh"
         cmd_get "$@"
         ;;
     set)
         # shellcheck source=../lib/set.sh
-        source "${LOCKBOX_ROOT}/lib/set.sh"
+        source "${COFFER_ROOT}/lib/set.sh"
         cmd_set "$@"
         ;;
     list)
         # shellcheck source=../lib/list.sh
-        source "${LOCKBOX_ROOT}/lib/list.sh"
+        source "${COFFER_ROOT}/lib/list.sh"
         cmd_list "$@"
         ;;
     edit)
         # shellcheck source=../lib/edit.sh
-        source "${LOCKBOX_ROOT}/lib/edit.sh"
+        source "${COFFER_ROOT}/lib/edit.sh"
         cmd_edit "$@"
         ;;
     import)
         # shellcheck source=../lib/import.sh
-        source "${LOCKBOX_ROOT}/lib/import.sh"
+        source "${COFFER_ROOT}/lib/import.sh"
         cmd_import "$@"
         ;;
     init)
         # shellcheck source=../lib/init.sh
-        source "${LOCKBOX_ROOT}/lib/init.sh"
+        source "${COFFER_ROOT}/lib/init.sh"
         cmd_init "$@"
         ;;
     unlock)
         # shellcheck source=../lib/unlock.sh
-        source "${LOCKBOX_ROOT}/lib/unlock.sh"
+        source "${COFFER_ROOT}/lib/unlock.sh"
         cmd_unlock "$@"
         ;;
     lock)
         # shellcheck source=../lib/lock.sh
-        source "${LOCKBOX_ROOT}/lib/lock.sh"
+        source "${COFFER_ROOT}/lib/lock.sh"
         cmd_lock "$@"
         ;;
     -h|--help|help)

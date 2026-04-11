@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# init.sh -- First-time lockbox setup on a new machine
+# init.sh -- First-time coffer setup on a new machine
 # Generates an age keypair, stores secret key in macOS Keychain, creates SOPS config.
-# Usage: lockbox init
+# Usage: coffer init
 set -euo pipefail
 
 cmd_init() {
@@ -9,11 +9,11 @@ cmd_init() {
     require_cmd age-keygen
     require_cmd sops
 
-    local config_dir="${LOCKBOX_CONFIG_DIR}"
+    local config_dir="${COFFER_CONFIG_DIR}"
 
     # Check for existing identity in Keychain -- abort if already initialized
-    if security find-generic-password -s "Lockbox" -a "lockbox-secret-key" -w >/dev/null 2>&1; then
-        die "Identity already exists in Keychain. Run: lockbox reset (or delete 'Lockbox' entries from Keychain manually) to re-initialize."
+    if security find-generic-password -s "Coffer" -a "coffer-secret-key" -w >/dev/null 2>&1; then
+        die "Identity already exists in Keychain. Run: coffer reset (or delete 'Coffer' entries from Keychain manually) to re-initialize."
     fi
 
     # Create config directory
@@ -44,7 +44,7 @@ cmd_init() {
 
     # Store secret key in macOS Keychain (the only copy -- no file on disk)
     log "Storing secret key in Keychain..."
-    security add-generic-password -s "Lockbox" -a "lockbox-secret-key" -w "$secret_key" \
+    security add-generic-password -s "Coffer" -a "coffer-secret-key" -w "$secret_key" \
         -T /usr/bin/security -T /bin/bash 2>/dev/null \
         || die "Failed to store secret key in Keychain. Cannot proceed without secure storage."
 
@@ -53,7 +53,7 @@ cmd_init() {
     chmod 644 "${config_dir}/public-key"
 
     # Create SOPS config if it doesn't exist
-    local sops_config="${LOCKBOX_SOPS_CONFIG}"
+    local sops_config="${COFFER_SOPS_CONFIG}"
     if [[ ! -f "$sops_config" ]]; then
         log "Creating SOPS configuration..."
         mkdir -p "$(dirname "$sops_config")"
@@ -66,27 +66,27 @@ SOPS_EOF
         log "SOPS config created at ${sops_config}"
     else
         log "SOPS config already exists at ${sops_config}"
-        log "Run 'lockbox add-recipient ${public_key}' on the other machine to register this key."
+        log "Run 'coffer add-recipient ${public_key}' on the other machine to register this key."
     fi
 
     # Create vault directory and empty category files
-    mkdir -p "${LOCKBOX_VAULT}"
+    mkdir -p "${COFFER_VAULT}"
     local categories=("cloudflare" "github" "home-automation" "synology" "communications" "misc")
     for cat_name in "${categories[@]}"; do
-        local vault_file="${LOCKBOX_VAULT}/${cat_name}.yaml"
+        local vault_file="${COFFER_VAULT}/${cat_name}.yaml"
         if [[ ! -f "$vault_file" ]]; then
             touch "$vault_file"
         fi
     done
 
     echo "" >&2
-    log "Lockbox initialized successfully!"
+    log "Coffer initialized successfully!"
     log "Machine: ${machine_name}"
     log "Public key: ${public_key}"
-    log "Secret key stored in: macOS Keychain (service: Lockbox)"
+    log "Secret key stored in: macOS Keychain (service: Coffer)"
     echo "" >&2
     log "Next steps:"
-    log "  1. On the OTHER machine, run: lockbox add-recipient ${public_key}"
-    log "  2. Import secrets: lockbox import keychain-backup.csv"
-    log "  3. Unlock the vault: eval \$(lockbox unlock)"
+    log "  1. On the OTHER machine, run: coffer add-recipient ${public_key}"
+    log "  2. Import secrets: coffer import keychain-backup.csv"
+    log "  3. Unlock the vault: eval \$(coffer unlock)"
 }

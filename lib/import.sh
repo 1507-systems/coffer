@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # import.sh -- Import secrets from a keychain CSV dump
 # CSV format: service,account,password
-# Uses config/keychain-mapping.yaml to map service names to lockbox paths.
-# Usage: lockbox import <csv-file>
+# Uses config/keychain-mapping.yaml to map service names to coffer paths.
+# Usage: coffer import <csv-file>
 set -euo pipefail
 
 cmd_import() {
     local csv_file="${1:-}"
-    [[ -n "$csv_file" ]] || die "Usage: lockbox import <csv-file>"
+    [[ -n "$csv_file" ]] || die "Usage: coffer import <csv-file>"
     [[ -f "$csv_file" ]] || die "CSV file not found: ${csv_file}"
 
     require_cmd sops
@@ -15,7 +15,7 @@ cmd_import() {
     require_identity
     ensure_unlocked
 
-    local mapping_file="${LOCKBOX_ROOT}/config/keychain-mapping.yaml"
+    local mapping_file="${COFFER_ROOT}/config/keychain-mapping.yaml"
     [[ -f "$mapping_file" ]] || die "Mapping file not found: ${mapping_file}"
 
     local imported=0
@@ -50,10 +50,10 @@ cmd_import() {
         fi
 
         # Look up the service name in the mapping file
-        local lockbox_path
-        lockbox_path=$(yq ".mappings[\"${service}\"] // \"\"" "$mapping_file")
+        local coffer_path
+        coffer_path=$(yq ".mappings[\"${service}\"] // \"\"" "$mapping_file")
 
-        if [[ -z "$lockbox_path" ]] || [[ "$lockbox_path" == "null" ]]; then
+        if [[ -z "$coffer_path" ]] || [[ "$coffer_path" == "null" ]]; then
             warn "No mapping for service: ${service}"
             skipped_services+=("$service")
             skipped=$((skipped + 1))
@@ -64,13 +64,13 @@ cmd_import() {
         # Source set.sh if not already loaded
         if ! type cmd_set &>/dev/null; then
             # shellcheck source=set.sh
-            source "${LOCKBOX_ROOT}/lib/set.sh"
+            source "${COFFER_ROOT}/lib/set.sh"
         fi
 
-        if cmd_set "${lockbox_path}" "${password}"; then
+        if cmd_set "${coffer_path}" "${password}"; then
             imported=$((imported + 1))
         else
-            warn "Failed to import: ${service} -> ${lockbox_path}"
+            warn "Failed to import: ${service} -> ${coffer_path}"
             errors=$((errors + 1))
         fi
     done < "$csv_file"

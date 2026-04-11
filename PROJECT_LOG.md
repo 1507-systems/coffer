@@ -1,4 +1,4 @@
-# Lockbox - Project Log
+# Coffer - Project Log
 
 ## Overview
 Offline encrypted secrets vault for developer credentials on macOS, using SOPS + age.
@@ -10,7 +10,7 @@ Offline encrypted secrets vault for developer credentials on macOS, using SOPS +
 - Project directory created in iCloud dev folder
 
 ### 2026-04-08 - Initial implementation (feat/initial-implementation)
-- Built complete CLI tool: `bin/lockbox` dispatcher + 8 lib/ modules
+- Built complete CLI tool: `bin/coffer` dispatcher + 8 lib/ modules
   - `common.sh`: die() with ntfy, warn(), log(), require_cmd(), parse_path(), ensure_unlocked()
   - `init.sh`: age keypair generation, passphrase encryption, optional keychain storage
   - `get.sh`: decrypt single value via sops --extract, supports --clip and --newline
@@ -24,4 +24,4 @@ Offline encrypted secrets vault for developer credentials on macOS, using SOPS +
 - ShellCheck CI workflow (.github/workflows/shellcheck.yml)
 - Test suite: 16 tests covering helpers, list, get errors, and entrypoint dispatch
 - All scripts pass shellcheck with zero warnings/errors
-- GitHub repo created: bryce-shashinka/lockbox (private)
+- GitHub repo created: bryce-shashinka/coffer (private)

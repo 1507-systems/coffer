@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # unlock.sh -- Read age secret key from Keychain and export SOPS_AGE_KEY
-# Usage: eval $(lockbox unlock)
+# Usage: eval $(coffer unlock)
 #
 # Reads the age secret key directly from macOS Keychain.
 # On headless machines (Wiles), also writes a session key file for persistence.
@@ -17,7 +17,7 @@ cmd_unlock() {
     fi
 
     # Check session key file (headless machines persist across shell sessions)
-    local session_key_file="${LOCKBOX_SESSION_KEY}"
+    local session_key_file="${COFFER_SESSION_KEY}"
     if [[ -f "$session_key_file" ]]; then
         secret_key=$(cat "$session_key_file")
         if [[ -n "$secret_key" ]]; then
@@ -28,11 +28,11 @@ cmd_unlock() {
     fi
 
     # Read secret key from Keychain
-    secret_key=$(security find-generic-password -s "Lockbox" -a "lockbox-secret-key" -w 2>/dev/null) || {
-        curl -s -H "Priority: urgent" -H "Title: Lockbox Locked" -H "Tags: lock,warning" \
+    secret_key=$(security find-generic-password -s "Coffer" -a "coffer-secret-key" -w 2>/dev/null) || {
+        curl -s -H "Priority: urgent" -H "Title: Coffer Locked" -H "Tags: lock,warning" \
             -d "Unlock failed on $(hostname). Secret key not found in Keychain." \
-            "${LOCKBOX_NTFY_TOPIC}" >/dev/null 2>&1 || true
-        die "Secret key not found in Keychain. Run: lockbox init"
+            "${COFFER_NTFY_TOPIC}" >/dev/null 2>&1 || true
+        die "Secret key not found in Keychain. Run: coffer init"
     }
 
     [[ -n "$secret_key" ]] || die "Empty secret key in Keychain"
@@ -43,7 +43,7 @@ cmd_unlock() {
     log "Unlocked from Keychain"
 
     # On headless machines (Wiles), write session key file for persistence
-    local config_dir="${LOCKBOX_CONFIG_DIR}"
+    local config_dir="${COFFER_CONFIG_DIR}"
     local machine_name=""
     if [[ -f "${config_dir}/machine-name" ]]; then
         machine_name=$(cat "${config_dir}/machine-name")
@@ -56,6 +56,6 @@ cmd_unlock() {
         log "Session key written to ${session_key_file}"
     fi
 
-    # Output the export command for eval $(lockbox unlock)
+    # Output the export command for eval $(coffer unlock)
     echo "export SOPS_AGE_KEY='${secret_key}'"
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # list.sh -- List categories and keys in the vault
-# Usage: lockbox list [category]
+# Usage: coffer list [category]
 # No decryption needed -- SOPS leaves keys in plaintext.
 set -euo pipefail
 
@@ -14,9 +14,9 @@ cmd_list() {
         list_keys_in_category "$category"
     else
         # List all categories and their keys in tree format
-        local vault_dir="${LOCKBOX_VAULT}"
+        local vault_dir="${COFFER_VAULT}"
         if [[ ! -d "$vault_dir" ]] || [[ -z "$(ls -A "$vault_dir" 2>/dev/null)" ]]; then
-            die "No vault files found. Run: lockbox init"
+            die "No vault files found. Run: coffer init"
         fi
 
         for f in "${vault_dir}"/*.yaml; do

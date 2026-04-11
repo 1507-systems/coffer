@@ -1,4 +1,4 @@
-# categories.yaml -- Category definitions for lockbox vault
+# categories.yaml -- Category definitions for coffer vault
 # Each category maps to a vault/*.yaml file containing encrypted secrets.
 
 categories:

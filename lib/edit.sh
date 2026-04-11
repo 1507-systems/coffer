@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # edit.sh -- Edit a category file interactively via $EDITOR
 # SOPS handles decrypt -> edit -> re-encrypt natively.
-# Usage: lockbox edit <category>
+# Usage: coffer edit <category>
 set -euo pipefail
 
 cmd_edit() {
     local category="${1:-}"
-    [[ -n "$category" ]] || die "Usage: lockbox edit <category>"
+    [[ -n "$category" ]] || die "Usage: coffer edit <category>"
 
     require_cmd sops
     require_identity
@@ -15,7 +15,7 @@ cmd_edit() {
     # Verify EDITOR is set
     [[ -n "${EDITOR:-}" ]] || die "\$EDITOR is not set. Export it first: export EDITOR=vim"
 
-    local vault_file="${LOCKBOX_VAULT}/${category}.yaml"
+    local vault_file="${COFFER_VAULT}/${category}.yaml"
     [[ -f "$vault_file" ]] || die "Category '${category}' not found. Available: $(list_categories | tr '\n' ' ')"
 
     # SOPS handles the full decrypt -> $EDITOR -> re-encrypt cycle.
