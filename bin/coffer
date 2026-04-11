@@ -30,6 +30,7 @@ Commands:
   init                          First-time setup (generate age keypair)
   unlock [--auto]               Decrypt identity and export SOPS_AGE_KEY
   lock                          Clear session key and unset SOPS_AGE_KEY
+  add-recipient <age-pubkey>    Add an age public key and re-encrypt vault
 
 Options:
   -h, --help    Show this help message
@@ -91,6 +92,11 @@ case "$command" in
         # shellcheck source=../lib/lock.sh
         source "${COFFER_ROOT}/lib/lock.sh"
         cmd_lock "$@"
+        ;;
+    add-recipient)
+        # shellcheck source=../lib/add-recipient.sh
+        source "${COFFER_ROOT}/lib/add-recipient.sh"
+        cmd_add_recipient "$@"
         ;;
     -h|--help|help)
         usage
