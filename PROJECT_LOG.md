@@ -25,7 +25,7 @@ Offline encrypted secrets vault for developer credentials on macOS, using SOPS +
 - ShellCheck CI workflow (.github/workflows/shellcheck.yml)
 - Test suite: 16 tests covering helpers, list, get errors, and entrypoint dispatch
 - All scripts pass shellcheck with zero warnings/errors
-- GitHub repo created: bryce-shashinka/coffer (private)
+- GitHub repo created: 1507-systems/coffer (public)
 
 ### 2026-04-13 - Full Audit
 
