@@ -11,3 +11,6 @@ vault/*.yaml
 
 # Keep vault directory in git (but not its contents)
 !vault/.gitkeep
+
+# Claude Code local files
+.claude/
