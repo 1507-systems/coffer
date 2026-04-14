@@ -1,3 +1,4 @@
+<!-- summary: Offline encrypted secrets vault CLI using SOPS + age for developer credentials on macOS. -->
 # Coffer - Project Log
 
 ## Overview
@@ -25,3 +26,25 @@ Offline encrypted secrets vault for developer credentials on macOS, using SOPS +
 - Test suite: 16 tests covering helpers, list, get errors, and entrypoint dispatch
 - All scripts pass shellcheck with zero warnings/errors
 - GitHub repo created: bryce-shashinka/coffer (private)
+
+### 2026-04-13 - Full Audit
+
+**Phase 1: Documentation**
+- PROJECT_LOG.md and SPEC.md accurate; added `<!-- summary -->` marker
+
+**Phase 2: Functionality**
+- All 16 tests pass
+- ShellCheck: zero warnings/errors on all scripts
+- No dead code, no stale TODOs
+
+**Phase 3: Security**
+- macOS Keychain usage in `init.sh`, `unlock.sh`, `common.sh` is by design: coffer is the
+  credential vault itself and needs bootstrap storage for the age secret key. Keychain stores
+  only the root age identity — all other secrets are in the SOPS-encrypted vault.
+- `set.sh` uses `--stdin` for piped input; `import.sh` passes values via shell function
+  parameters (not subprocess CLI args), so no ps exposure risk
+- Session key file (`~/.config/coffer/.session-key`) has chmod 600 and is zeroed on lock
+- No hardcoded secrets in source
+- `die()` sends ntfy notifications on all failures
+
+**Result**: Clean on first pass. No code changes required.
