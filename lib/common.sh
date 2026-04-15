@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # ntfy topic for urgent failure notifications
-COFFER_NTFY_TOPIC="https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
+COFFER_NTFY_TOPIC="https://ntfy.1507.cloud/infra-alerts-0f1ddcff97b3"
 
 # --- Logging ---
 
