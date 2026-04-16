@@ -47,7 +47,14 @@ cmd_unlock() {
         machine_name=$(cat "${config_dir}/machine-name")
     fi
 
-    if [[ "${machine_name,,}" == "wiles" ]]; then
+    # Lowercase-compare using `tr` rather than ${var,,} — that expansion is
+    # bash 4+ only, and macOS ships bash 3.2 at /bin/bash. Using ${var,,}
+    # caused `coffer unlock` to print `bad substitution` and abort on the
+    # default interpreter, breaking the session-key persistence path.
+    local machine_name_lc
+    machine_name_lc="$(printf '%s' "$machine_name" | tr '[:upper:]' '[:lower:]')"
+
+    if [[ "$machine_name_lc" == "wiles" ]]; then
         mkdir -p "$(dirname "$session_key_file")"
         echo "$secret_key" > "$session_key_file"
         chmod 600 "$session_key_file"
