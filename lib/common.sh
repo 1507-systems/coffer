@@ -23,8 +23,9 @@ coffer_machine_id() {
 }
 
 # Send an urgent ntfy alert tagged with the machine identity so multi-host
-# vaults disclose which machine produced the error. Title, tags, and body
-# all include the identity — phone lock screens often show only the title.
+# vaults disclose which machine produced the error. The title carries the
+# identity (lock screens show it) and the tag list includes it for filtering;
+# the body stays unprefixed since repeating the identity there is noise.
 coffer_ntfy_urgent() {
     local title="$1"
     local body="$2"
@@ -34,7 +35,7 @@ coffer_ntfy_urgent() {
         -H "Priority: urgent" \
         -H "Title: ${title} [${machine}]" \
         -H "Tags: lock,warning,${machine}" \
-        -d "[${machine}] ${body}" \
+        -d "${body}" \
         "${COFFER_NTFY_TOPIC}" >/dev/null 2>&1 || true
 }
 
