@@ -8,13 +8,42 @@ COFFER_NTFY_TOPIC="https://ntfy.1507.cloud/infra-alerts-0f1ddcff97b3"
 
 # --- Logging ---
 
+# Return the machine identity used in alert titles/tags.
+# Prefers the coffer machine-name file (wiles/verve) and falls back to the
+# short hostname if coffer hasn't been initialized. Always prints something.
+coffer_machine_id() {
+    local machine_id=""
+    if [[ -f "${HOME}/.config/coffer/machine-name" ]]; then
+        machine_id="$(cat "${HOME}/.config/coffer/machine-name" 2>/dev/null || echo '')"
+    fi
+    if [[ -z "$machine_id" ]]; then
+        machine_id="$(hostname -s 2>/dev/null || echo unknown)"
+    fi
+    printf '%s' "$machine_id"
+}
+
+# Send an urgent ntfy alert tagged with the machine identity so multi-host
+# vaults disclose which machine produced the error. The title carries the
+# identity (lock screens show it) and the tag list includes it for filtering;
+# the body stays unprefixed since repeating the identity there is noise.
+coffer_ntfy_urgent() {
+    local title="$1"
+    local body="$2"
+    local machine
+    machine="$(coffer_machine_id)"
+    curl -s \
+        -H "Priority: urgent" \
+        -H "Title: ${title} [${machine}]" \
+        -H "Tags: lock,warning,${machine}" \
+        -d "${body}" \
+        "${COFFER_NTFY_TOPIC}" >/dev/null 2>&1 || true
+}
+
 # Print an error message, send an ntfy urgent notification, and exit 1.
 # Every failure in coffer is fatal and loud.
 die() {
     echo "coffer: error: $*" >&2
-    # Push urgent notification so the user knows immediately on any device
-    curl -s -H "Priority: urgent" -H "Title: Coffer Error" -H "Tags: lock,warning" \
-        -d "$*" "${COFFER_NTFY_TOPIC}" >/dev/null 2>&1 || true
+    coffer_ntfy_urgent "Coffer Error" "$*"
     exit 1
 }
 
