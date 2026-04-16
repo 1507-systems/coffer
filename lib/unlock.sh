@@ -29,9 +29,7 @@ cmd_unlock() {
 
     # Read secret key from Keychain
     secret_key=$(security find-generic-password -s "Coffer" -a "coffer-secret-key" -w 2>/dev/null) || {
-        curl -s -H "Priority: urgent" -H "Title: Coffer Locked" -H "Tags: lock,warning" \
-            -d "Unlock failed on $(hostname). Secret key not found in Keychain." \
-            "${COFFER_NTFY_TOPIC}" >/dev/null 2>&1 || true
+        coffer_ntfy_urgent "Coffer Locked" "Unlock failed: secret key not found in Keychain."
         die "Secret key not found in Keychain. Run: coffer init"
     }
 
