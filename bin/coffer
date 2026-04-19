@@ -11,11 +11,19 @@ export COFFER_ROOT
 # shellcheck source=../lib/common.sh
 source "${COFFER_ROOT}/lib/common.sh"
 
-# Coffer configuration paths
-export COFFER_CONFIG_DIR="${HOME}/.config/coffer"
-export COFFER_VAULT="${COFFER_ROOT}/vault"
-export COFFER_SOPS_CONFIG="${COFFER_ROOT}/config/.sops.yaml"
-export COFFER_SESSION_KEY="${COFFER_CONFIG_DIR}/.session-key"
+# Coffer configuration paths.
+# These default to the usual per-user locations but respect pre-set values
+# so tests, sandboxes, and alternative configs can override them. Using the
+# ${VAR:-default} idiom instead of unconditional assignment is critical:
+# unconditional exports used to clobber COFFER_SESSION_KEY mid-flight, which
+# meant tests that passed COFFER_SESSION_KEY in the environment were
+# actually reading the caller's real ~/.config/coffer/.session-key. That
+# produced false-positive passes and made the session-key override useless
+# outside the dispatcher.
+export COFFER_CONFIG_DIR="${COFFER_CONFIG_DIR:-${HOME}/.config/coffer}"
+export COFFER_VAULT="${COFFER_VAULT:-${COFFER_ROOT}/vault}"
+export COFFER_SOPS_CONFIG="${COFFER_SOPS_CONFIG:-${COFFER_ROOT}/config/.sops.yaml}"
+export COFFER_SESSION_KEY="${COFFER_SESSION_KEY:-${COFFER_CONFIG_DIR}/.session-key}"
 
 usage() {
     cat <<'EOF'
@@ -27,9 +35,15 @@ Commands:
   list   [category]             List categories and keys
   edit   <category>             Edit a category file interactively
   import <csv-file>             Import secrets from a keychain CSV dump
-  init                          First-time setup (generate age keypair)
-  unlock [--auto]               Decrypt identity and export SOPS_AGE_KEY
-  lock                          Clear session key and unset SOPS_AGE_KEY
+  init   [--force]              First-time setup (generate age keypair; writes
+                                ~/.config/coffer/.session-key). Refuses to
+                                overwrite an existing identity unless --force.
+  unlock [--auto]               Print `export SOPS_AGE_KEY=...` for
+                                `eval $(coffer unlock)`. --auto is a no-op
+                                kept for LaunchAgent backward compatibility.
+  lock                          Emit `unset SOPS_AGE_KEY`. Does NOT delete
+                                the session-key file (the file is the
+                                persistent identity store; see lock.sh).
   add-recipient <age-pubkey>    Add an age public key and re-encrypt vault
 
 Options:

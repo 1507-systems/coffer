@@ -12,7 +12,8 @@ cmd_import() {
 
     require_cmd sops
     require_cmd yq
-    require_identity
+    # ensure_unlocked covers the identity-present check; calling
+    # require_identity first would just repeat the same stat() calls.
     ensure_unlocked
 
     local mapping_file="${COFFER_ROOT}/config/keychain-mapping.yaml"

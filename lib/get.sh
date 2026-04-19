@@ -28,7 +28,10 @@ cmd_get() {
     [[ -n "$path" ]] || die "Usage: coffer get <category/key>"
 
     require_cmd sops
-    require_identity
+    # ensure_unlocked performs the same existence/readability/non-empty
+    # checks as require_identity before loading the key, so calling
+    # require_identity first would just duplicate the stat() calls. Keep
+    # it as a single call site for identity loading.
     ensure_unlocked
     parse_path "$path"
 

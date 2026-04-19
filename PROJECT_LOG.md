@@ -48,3 +48,60 @@ Offline encrypted secrets vault for developer credentials on macOS, using SOPS +
 - `die()` sends ntfy notifications on all failures
 
 **Result**: Clean on first pass. No code changes required.
+
+### 2026-04-19 - Single-source identity refactor (refactor/single-source-identity)
+
+**Problem.** `require_identity()` tested macOS Keychain presence while
+`ensure_unlocked()` had a Keychain fallback *plus* a session-key file
+fallback. The two functions disagreed: contexts where the Keychain was
+unavailable (SSH-spawned shells, non-GUI processes) would die at the
+identity check even when `.session-key` was present and valid. This
+produced repeat "No identity found" failures in cron jobs and
+SSH-driven backup scripts, and a general "false alert" pattern the user
+surfaced in session transcripts.
+
+**Change.** Collapsed the dual identity model to a single source of
+truth: the session-key file at `${COFFER_SESSION_KEY}` (default
+`~/.config/coffer/.session-key`, mode 600).
+
+- `lib/common.sh`: `require_identity()` checks file presence / readability /
+  non-emptiness only. `ensure_unlocked()` is exactly two paths — env var,
+  then file. Both die with actionable errors pointing at `coffer init`.
+- `lib/init.sh`: writes the age secret key directly to the session-key
+  file (mode 600, under a tightened umask). No Keychain write. Refuses
+  to overwrite an existing identity unless `--force` is passed.
+- `lib/unlock.sh`: reads the session-key file and emits
+  `export SOPS_AGE_KEY=...`. `--auto` is retained as a documented no-op
+  for LaunchAgent backward compatibility.
+- `lib/lock.sh`: emits `unset SOPS_AGE_KEY` only — does NOT delete the
+  session-key file, because the file is the persistent identity store.
+- No library/bin code calls the macOS `security` helper anymore; a
+  structural test (`test_no_keychain_calls_in_library`) enforces that.
+- `SPEC.md`: added "Identity and Unlock Model" section (threat-model
+  equivalence, single-source rationale, future passphrase-encrypted
+  identity). Removed obsolete "Auto-Unlock at Boot", "Remote Unlock
+  from Verve", "wiles-unlock", and "Keychain Safety Rules" sections —
+  their contents were never implemented and their premise (Keychain
+  holds the master passphrase) is gone.
+
+**Breaking change.** A machine whose identity lived ONLY in the Keychain
+(no `.session-key` file) will now fail with "No identity found". Recovery
+on such a machine:
+
+1. Retrieve the old age secret key from Keychain:
+   `security find-generic-password -s "Coffer" -a "coffer-secret-key" -w`
+2. Write it to the session-key file:
+   `umask 077; printf '%s\n' "<key>" > ~/.config/coffer/.session-key; chmod 600 ~/.config/coffer/.session-key`
+3. Optionally delete the Keychain entry:
+   `security delete-generic-password -s "Coffer" -a "coffer-secret-key"`
+
+If the old Keychain entry is lost, run `coffer init --force` on the
+affected machine and re-register its new pubkey as a SOPS recipient
+on the other machine (`coffer add-recipient`).
+
+**Tests.** 28/28 passing (added 10 new tests covering the file-only
+identity model: happy path, missing file, empty file, env-var
+precedence, SSH/headless simulation, structural Keychain-free guard,
+`coffer unlock` and `coffer lock` smoke). Shellcheck clean on `bin/`
+and `lib/`.
+

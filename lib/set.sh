@@ -32,7 +32,9 @@ cmd_set() {
 
     require_cmd sops
     require_cmd jq
-    require_identity
+    # ensure_unlocked handles the "identity missing?" check before it
+    # loads the key, so there's no need for a separate require_identity
+    # call — it would only repeat the same stat() calls.
     ensure_unlocked
     parse_path "$path"
 
