@@ -36,12 +36,18 @@ cmd_set() {
     ensure_unlocked
     parse_path "$path"
 
-    # Read the public key for encrypting (stored during init)
-    local public_key_file="${COFFER_CONFIG_DIR}/public-key"
-    [[ -f "$public_key_file" ]] || die "Public key not found at ${public_key_file}. Run: coffer init"
-    local age_recipient
-    age_recipient=$(cat "$public_key_file")
-    [[ -n "$age_recipient" ]] || die "Empty public key file"
+    # Encryption recipients come from .sops.yaml (COFFER_SOPS_CONFIG), NOT from
+    # the local public-key file. Passing --age on the command line overrides
+    # .sops.yaml entirely and silently drops every other recipient — which is
+    # exactly the bug that locked Wiles out of cloudflare/* and ai/* in
+    # April 2026, because every cross-machine `coffer set` re-encrypted with
+    # only the writing machine's key.
+    #
+    # SOPS matches creation_rules.path_regex against the input filename; when
+    # we pipe via /dev/stdin we have no filename, so we use --filename-override
+    # to point at the destination vault file path.
+    local sops_config="${COFFER_SOPS_CONFIG}"
+    [[ -f "$sops_config" ]] || die "SOPS config not found at ${sops_config}. Run: coffer init"
 
     # Get the value from stdin, argument, or interactive prompt
     if [[ "$from_stdin" == true ]]; then
@@ -61,9 +67,13 @@ cmd_set() {
     # If the category file doesn't exist or is empty, create it with just this key
     if [[ ! -f "$COFFER_VAULT_FILE" ]] || [[ ! -s "$COFFER_VAULT_FILE" ]]; then
         log "Creating new category: ${COFFER_CATEGORY}"
+        # shellcheck disable=SC2094
+        # SC2094 is a false positive here: --filename-override is just a path
+        # string SOPS uses to match .sops.yaml creation_rules; sops never reads
+        # that file. The actual input comes from /dev/stdin.
         jq -n --arg key "$COFFER_KEY" --arg val "$value" '{($key): $val}' \
-            | SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops encrypt \
-                --age "$age_recipient" \
+            | SOPS_AGE_KEY="${SOPS_AGE_KEY}" SOPS_CONFIG="$sops_config" sops encrypt \
+                --filename-override "$COFFER_VAULT_FILE" \
                 --input-type json --output-type yaml \
                 /dev/stdin > "$COFFER_VAULT_FILE" \
             || die "Failed to encrypt new category file: ${COFFER_CATEGORY}"
@@ -71,14 +81,16 @@ cmd_set() {
         return 0
     fi
 
-    # Decrypt to JSON, update with jq, re-encrypt to YAML
+    # Decrypt to JSON, update with jq, re-encrypt to YAML.
+    # Same recipient-preservation reasoning as the create path above.
     local updated
     updated=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops decrypt --output-type json "$COFFER_VAULT_FILE" \
         | jq --arg key "$COFFER_KEY" --arg val "$value" '.[$key] = $val') \
         || die "Failed to decrypt/update '${COFFER_CATEGORY}'"
 
-    echo "$updated" | SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops encrypt \
-        --age "$age_recipient" \
+    # shellcheck disable=SC2094
+    echo "$updated" | SOPS_AGE_KEY="${SOPS_AGE_KEY}" SOPS_CONFIG="$sops_config" sops encrypt \
+        --filename-override "$COFFER_VAULT_FILE" \
         --input-type json --output-type yaml \
         /dev/stdin > "$COFFER_VAULT_FILE" \
         || die "Failed to re-encrypt '${COFFER_CATEGORY}'"

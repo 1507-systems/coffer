@@ -276,6 +276,133 @@ test_coffer_version() {
     assert_contains "$output" "coffer 1.0.0" "coffer --version should show version"
 }
 
+# --- Set: recipient preservation (regression test for the April 2026 lockout) ---
+#
+# Bug: cmd_set called `sops encrypt --age <single-pubkey>`, which overrode the
+# .sops.yaml multi-recipient list and silently re-encrypted with only the
+# writing machine's key. Any cross-machine `coffer set` then locked the other
+# machine out of that category file. Caught after Wiles couldn't decrypt
+# cloudflare/* and ai/* (last-written-on-Verve) on 2026-04-19.
+#
+# Fix: drop --age, use SOPS_CONFIG + --filename-override so all recipients
+# from .sops.yaml are applied to both new-file and update paths.
+
+test_set_preserves_all_recipients_on_create() {
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    # Two test identities — one is "this machine" (A), the other is "remote" (B).
+    age-keygen -o "${sandbox}/keyA.txt" 2>/dev/null
+    age-keygen -o "${sandbox}/keyB.txt" 2>/dev/null
+    local pub_a pub_b
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    pub_b=$(grep "public key" "${sandbox}/keyB.txt" | awk '{print $4}')
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config" "${sandbox}/.coffer-config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_a},${pub_b}
+EOF
+    echo "$pub_a" > "${sandbox}/.coffer-config/public-key"
+
+    # Run cmd_set in a subshell with all the env coffer would normally set.
+    (
+        export SOPS_AGE_KEY
+        SOPS_AGE_KEY=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/test.yaml"
+        export COFFER_CATEGORY="test"
+        export COFFER_KEY="key1"
+        export COFFER_CONFIG_DIR="${sandbox}/.coffer-config"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+
+        # Stub out helpers from common.sh that we're not testing here.
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }
+        warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked() { :; }
+        parse_path() { :; }
+
+        # shellcheck source=../lib/set.sh
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set test/key1 "value-1"
+    ) || { rm -rf "$sandbox"; return 1; }
+
+    local count
+    count=$(grep -c "recipient:" "${sandbox}/vault/test.yaml")
+    rm -rf "$sandbox"
+    assert_eq "2" "$count" "create path should preserve both recipients from .sops.yaml"
+}
+
+test_set_preserves_all_recipients_on_update() {
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/keyA.txt" 2>/dev/null
+    age-keygen -o "${sandbox}/keyB.txt" 2>/dev/null
+    local pub_a pub_b
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    pub_b=$(grep "public key" "${sandbox}/keyB.txt" | awk '{print $4}')
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config" "${sandbox}/.coffer-config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_a},${pub_b}
+EOF
+    echo "$pub_a" > "${sandbox}/.coffer-config/public-key"
+
+    (
+        export SOPS_AGE_KEY
+        SOPS_AGE_KEY=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/test.yaml"
+        export COFFER_CATEGORY="test"
+        export COFFER_CONFIG_DIR="${sandbox}/.coffer-config"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }
+        warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked() { :; }
+        parse_path() { :; }
+
+        # shellcheck source=../lib/set.sh
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+
+        export COFFER_KEY="first"
+        cmd_set test/first "value-1"
+        export COFFER_KEY="second"
+        cmd_set test/second "value-2"   # exercises the update path
+
+        # Critical assertion: the OTHER key (B) must still decrypt — proves
+        # we didn't strip its recipient on the update.
+        SOPS_AGE_KEY=$(grep AGE-SECRET "${sandbox}/keyB.txt") sops decrypt \
+            --extract '["first"]' "${sandbox}/vault/test.yaml" >/dev/null \
+            || die "key B locked out — update stripped its recipient"
+    ) || { rm -rf "$sandbox"; return 1; }
+
+    local count
+    count=$(grep -c "recipient:" "${sandbox}/vault/test.yaml")
+    rm -rf "$sandbox"
+    assert_eq "2" "$count" "update path should preserve both recipients from .sops.yaml"
+}
+
 # --- Main ---
 
 main() {
@@ -307,6 +434,10 @@ main() {
     run_test test_coffer_unknown_command_fails
     run_test test_coffer_help
     run_test test_coffer_version
+
+    # Set: recipient preservation regression tests
+    run_test test_set_preserves_all_recipients_on_create
+    run_test test_set_preserves_all_recipients_on_update
 
     teardown_test_env
 
