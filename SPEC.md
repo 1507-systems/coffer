@@ -4,6 +4,7 @@
 
 Version: 1.0.0-draft
 Created: 2026-04-07
+Last significant revision: 2026-04-19 (single-source identity refactor)
 Status: Design
 
 ---
@@ -21,21 +22,23 @@ Status: Design
 9. [Sync Strategy (Mutagen)](#sync-strategy-mutagen)
 10. [Error Handling](#error-handling)
 11. [Security Model](#security-model)
-12. [Keychain Migration](#keychain-migration)
-13. [Category Mapping](#category-mapping)
-14. [Import CSV Format](#import-csv-format)
-15. [Dependencies](#dependencies)
-16. [Auto-Unlock at Boot](#auto-unlock-at-boot)
-17. [Remote Unlock from Verve](#remote-unlock-from-verve)
-18. [Verve-Side Helper Script: wiles-unlock](#verve-side-helper-script-wiles-unlock)
-19. [Keychain Safety Rules](#keychain-safety-rules)
-20. [Future Work](#future-work)
+12. [Identity and Unlock Model](#identity-and-unlock-model)
+13. [Keychain Migration (historical)](#keychain-migration-historical)
+14. [Category Mapping](#category-mapping)
+15. [Import CSV Format](#import-csv-format)
+16. [Dependencies](#dependencies)
+17. [Future Work](#future-work)
 
 ---
 
 ## Overview
 
 Coffer is an offline, encrypted secrets vault that replaces macOS Keychain as the primary store for API tokens, passwords, and developer credentials. It uses **SOPS** for structured encryption and **age** for the underlying cryptography, producing human-readable YAML files where keys are visible but values are encrypted.
+
+Coffer's own age identity (the private key it uses to decrypt vault
+files) is stored in a single local file at `~/.config/coffer/.session-key`
+(mode 600) — no Keychain dependency. See [Identity and Unlock Model](#identity-and-unlock-model)
+for the design rationale.
 
 The vault is designed for a 2-machine setup:
 - **Wiles** (Mac Mini 2018, 64GB RAM) -- primary dev machine
@@ -106,7 +109,7 @@ Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the
 | `config/.sops.yaml` | SOPS configuration defining age recipients for each path pattern |
 | `config/categories.yaml` | Category definitions (names, descriptions, default keys) |
 | `vault/*.yaml` | SOPS-encrypted YAML files (one per category) |
-| `~/.config/coffer/identity.txt` | Machine-local age private key (never synced, never committed) |
+| `~/.config/coffer/.session-key` | Machine-local age private key (plaintext, mode 600, never synced, never committed). Single source of truth for coffer's identity; see [Identity and Unlock Model](#identity-and-unlock-model). |
 | Mutagen | Syncs the coffer directory between Wiles and Verve |
 
 ---
@@ -130,14 +133,21 @@ creation_rules:
       age1verve_public_key_here
 ```
 
-### Passphrase Protection
-The age identity file (`~/.config/coffer/identity.txt`) is itself encrypted with the user's login password via age's scrypt passphrase encryption. This means:
+### Identity-at-Rest Protection (current implementation)
+The age identity (secret key) is stored **in cleartext** at
+`~/.config/coffer/.session-key` with mode 600, owned by the invoking user.
+At-rest protection comes from three layers — FileVault (full-disk
+encryption while the Mac is locked/powered-off), UNIX permissions
+(other local users cannot read the file), and user isolation. This is
+equivalent to the effective security of a default-ACL macOS Keychain
+entry on an unlocked Mac: in both cases, any process running as the
+user can read the key. See [Identity and Unlock Model](#identity-and-unlock-model)
+for the full threat-model discussion and the rationale for choosing
+this over a dual file+Keychain design.
 
-1. The encrypted vault files on disk require the age private key to decrypt
-2. The age private key requires the login password to unlock
-3. No unencrypted secrets ever touch the filesystem
-
-The passphrase is prompted once per session. The decrypted identity is held in memory only (via process substitution) and never written to a temp file.
+A passphrase-encrypted identity file (age scrypt KDF wrapping the
+session key) is listed in [Future Work](#future-work) as the next
+hardening step if/when a stronger at-rest posture is required.
 
 ### SOPS Integration
 SOPS handles the structured encryption layer:
@@ -184,8 +194,9 @@ coffer/
 ```
 
 ### Files NOT in the repo / NOT synced
-- `~/.config/coffer/identity.txt` -- age private key (machine-local, passphrase-encrypted)
-- `~/.config/coffer/machine-name` -- plaintext file containing "wiles" or "verve"
+- `~/.config/coffer/.session-key` -- age private key (cleartext, mode 600, machine-local). Single source of truth for coffer's identity; see [Identity and Unlock Model](#identity-and-unlock-model).
+- `~/.config/coffer/public-key` -- age public key for this machine (used when registering as a recipient on the other machine). Not secret.
+- `~/.config/coffer/machine-name` -- plaintext file containing "wiles" or "verve", used for ntfy alert tagging.
 
 ---
 
@@ -354,32 +365,35 @@ coffer import keychain-backup.csv
    c. If not mapped, print a warning and skip
 4. Print a summary (imported count, skipped count, errors)
 
-#### `coffer init`
+#### `coffer init [--force]`
 First-time setup on a new machine.
 
 ```bash
-coffer init
+coffer init            # fresh setup
+coffer init --force    # overwrite an existing identity (DESTRUCTIVE)
 ```
 
 **Behavior:**
-1. Check for existing identity at `~/.config/coffer/identity.txt`. If exists, abort with message.
-2. Prompt for machine name (suggest based on hostname)
-3. Generate a new age keypair: `age-keygen -o /dev/stdout`
-4. Prompt for passphrase (login password)
-5. Encrypt the private key with the passphrase: `age -p -o ~/.config/coffer/identity.txt`
-6. `chmod 600 ~/.config/coffer/identity.txt`
-7. Store machine name in `~/.config/coffer/machine-name`
-8. **Store the master password in macOS Keychain** for auto-unlock at boot:
-   ```bash
-   security add-generic-password -s "Coffer" -a "coffer" -w "$passphrase" \
-     -T /usr/bin/security -T /bin/bash
-   ```
-   This is a **one-time operation** that the user runs manually from a GUI terminal (required for Keychain ACL prompts). The `-T` flags set the partition list so that `security find-generic-password` can read it from non-interactive contexts (LaunchAgents).
-9. Print the public key and instruct user to run `coffer add-recipient` on the other machine
-10. If this is the first machine (no existing `.sops.yaml` recipients), create the SOPS config
-11. Create vault directory and empty category files if they don't exist
+1. Check for an existing identity at `${COFFER_SESSION_KEY}` (default
+   `~/.config/coffer/.session-key`). If present, abort unless `--force`
+   is passed. Overwriting a working identity locks you out of any vault
+   files that were encrypted only to that key.
+2. Prompt for machine name (suggest based on hostname) and save it to
+   `~/.config/coffer/machine-name`.
+3. Generate a new age keypair via `age-keygen`.
+4. Write the secret key to `${COFFER_SESSION_KEY}` with mode 600
+   (umask is tightened before the write so the file is never briefly
+   world-readable).
+5. Write the public key to `~/.config/coffer/public-key` (not secret).
+6. If `config/.sops.yaml` does not exist, create it with this public key
+   as the sole recipient (first-machine setup). Otherwise leave it alone
+   and instruct the user to run `coffer add-recipient <pubkey>` on the
+   other machine so both machines can decrypt the shared vault.
+7. Create `vault/` and placeholder category files if they don't exist.
 
-**Keychain safety:** The `coffer init` step is the ONLY time coffer writes to the keychain. See [Keychain Safety Rules](#keychain-safety-rules) for the full policy.
+**No Keychain interaction.** The `.session-key` file IS the persistent
+identity store — see [Identity and Unlock Model](#identity-and-unlock-model)
+for the rationale.
 
 #### `coffer add-recipient <age-public-key>`
 Register another machine's public key.
@@ -458,31 +472,56 @@ Re-encrypt and write: echo "$updated" | sops encrypt --input-type yaml --output-
 Done (decrypted content only existed in shell variables / pipes)
 ```
 
-### Session passphrase caching
+### Identity loading at runtime
 
-To avoid prompting for the passphrase on every single operation, coffer uses `SOPS_AGE_KEY` environment variable approach:
+Every coffer subcommand auto-loads the identity via `ensure_unlocked()`
+in `lib/common.sh`. The logic is intentionally minimal — exactly two
+paths in a strict order:
 
-1. On first `coffer` invocation in a shell session, if `SOPS_AGE_KEY` is not set:
-   a. Prompt for passphrase
-   b. Decrypt the identity file to a variable: `key=$(age -d ~/.config/coffer/identity.txt)`
-   c. Export `SOPS_AGE_KEY="$key"` for the current process
-2. Subsequent operations in the same invocation reuse the variable
-3. For multi-command workflows, the user can run `eval $(coffer unlock)` which exports `SOPS_AGE_KEY` into the current shell session
-4. The `coffer lock` command unsets `SOPS_AGE_KEY`
+1. **`SOPS_AGE_KEY` already set in the environment.** Trust it, return.
+   This supports `eval $(coffer unlock)` having been run in the parent
+   shell and also alternative delivery mechanisms (e.g., a CI job runner
+   that injects the key from its own secret manager). Coffer does not
+   rewrite a pre-set value.
+2. **Read `${COFFER_SESSION_KEY}` from disk** (default
+   `~/.config/coffer/.session-key`). Load the contents, export as
+   `SOPS_AGE_KEY`, return.
 
-**The decrypted key only lives in shell environment variables, never on disk.**
+If neither is available, coffer dies with an actionable error:
 
-**Headless machines (Wiles):** On dedicated headless dev machines, coffer should unlock
-once at boot (via auto-unlock LaunchAgent) and stay unlocked until reboot or explicit
-`coffer lock`. These machines run autonomous operations (marathon mode, cron, LaunchAgents)
-and are monitored from mobile devices where re-prompting is impractical. The `coffer agent`
-(future work) will hold the decrypted identity in a persistent Unix socket, surviving across
-shell sessions. Until then, the auto-unlock LaunchAgent sets `SOPS_AGE_KEY` in a file at
-`~/.config/coffer/.session-key` (mode 0600, owned by user) that coffer reads as a fallback
-when the environment variable is not set. This file is deleted on `coffer lock` or shutdown.
+    No identity found at ~/.config/coffer/.session-key. Run: coffer init
 
-**Laptops (Verve):** Session caching via environment variables is appropriate. The machine
-sleeps and travels, so credentials naturally clear when the shell exits.
+**There is no Keychain fallback.** The previous implementation had one,
+but it produced inconsistent behavior between `require_identity` (which
+demanded Keychain access) and `ensure_unlocked` (which had a file
+fallback), causing SSH-spawned shells to fail at the identity check
+even when the session-key file was readable and valid. See
+[Identity and Unlock Model](#identity-and-unlock-model) for the full
+design rationale.
+
+**`eval $(coffer unlock)`** is a convenience that reads the file and
+emits the corresponding `export SOPS_AGE_KEY=...` line, so the user's
+interactive shell retains the key for subsequent ad-hoc coffer
+invocations without re-reading the file each time. It is not required
+for coffer to work — every subcommand can load the file directly.
+
+**`coffer lock`** emits `unset SOPS_AGE_KEY` for the caller's shell and
+does NOT delete the session-key file. The file is the persistent store;
+wiping it would force a full `coffer init` on every "lock". A real
+lock-at-rest capability (passphrase-encrypted identity file) is listed
+in [Future Work](#future-work).
+
+**Headless machines (Wiles):** The session-key file covers this use
+case natively — no LaunchAgent, no boot-time unlock step, no Keychain
+dance. The LaunchAgent recipe that used to live in this section has
+been removed; `coffer unlock --auto` is retained as a documented no-op
+so any legacy LaunchAgent still configured on a machine continues to
+exit 0 without side effects.
+
+**Laptops (Verve):** Same model. If the user wants their credentials
+to clear on sleep or shutdown, they can put a `coffer lock` in a logout
+hook or simply not worry about it (FileVault re-locks the disk on
+shutdown).
 
 ---
 
@@ -555,9 +594,9 @@ Every error is fatal and loud. No silent fallbacks. The user must know immediate
 | Missing `sops` binary | Exit 1, print: "sops not found. Install: brew install sops" |
 | Missing `age` binary | Exit 1, print: "age not found. Install: brew install age" |
 | Missing `yq` binary | Exit 1, print: "yq not found. Install: brew install yq" |
-| Identity file missing | Exit 1, print: "No identity found. Run: coffer init" |
-| Identity file wrong permissions | Exit 1, print: "Identity file permissions too open. Run: chmod 600 ~/.config/coffer/identity.txt" |
-| Wrong passphrase | age exits non-zero, coffer propagates: "Failed to decrypt identity. Wrong passphrase?" |
+| Identity file missing | Exit 1, print: "No identity found at ~/.config/coffer/.session-key. Run: coffer init" |
+| Identity file unreadable (perms/ownership wrong) | Exit 1, print: "Identity file ... is not readable by this user." |
+| Identity file empty (corruption) | Exit 1, print: "Identity file ... is empty. Run: coffer init (or restore from backup)." |
 | Category file not found | Exit 1, print: "Category '<name>' not found. Available: ..." |
 | Key not found in category | Exit 1, print: "Key '<key>' not found in '<category>'. Available keys: ..." |
 | SOPS MAC verification failure | Exit 1, print: "Integrity check failed for <file>. File may be tampered or corrupted." |
@@ -602,13 +641,19 @@ require_cmd() {
 }
 
 require_identity() {
-    local id_file="${COFFER_IDENTITY:-$HOME/.config/coffer/identity.txt}"
-    [[ -f "$id_file" ]] || die "No identity found. Run: coffer init"
-    local perms
-    perms=$(stat -f "%Lp" "$id_file")
-    [[ "$perms" == "600" ]] || die "Identity file permissions too open ($perms). Run: chmod 600 $id_file"
+    local key_file="${COFFER_SESSION_KEY:-$HOME/.config/coffer/.session-key}"
+    [[ -e "$key_file" ]]  || die "No identity found at ${key_file}. Run: coffer init"
+    [[ -r "$key_file" ]]  || die "Identity file ${key_file} exists but is not readable by this user."
+    [[ -s "$key_file" ]]  || die "Identity file ${key_file} is empty. Run: coffer init (or restore from backup)."
 }
 ```
+
+The real implementation in `lib/common.sh` matches this spec and is
+kept minimal by design. There is intentionally no permissions check
+here: the file is created mode 600 by `coffer init`, and `ensure_unlocked`
+only requires readability. Tightening to a "must be exactly 600" check
+added failure modes without adding security (the file is already
+protected by user isolation + FileVault) and was dropped.
 
 ---
 
@@ -618,11 +663,13 @@ require_identity() {
 
 | Threat | Mitigation |
 |--------|------------|
-| Disk theft / unauthorized file access | All vault files encrypted with age (XChaCha20-Poly1305). Identity file passphrase-protected with scrypt. |
+| Disk theft (powered-off Mac) | FileVault encrypts the whole volume at rest, including `~/.config/coffer/.session-key`. Without the login password the attacker gets ciphertext only. |
+| Unauthorized access from other local users on an unlocked Mac | Session-key file is mode 600, owned by the invoking user. Other local accounts can't read it; `sudo` from another admin is the weak point, same as Keychain's default ACL. |
+| Process running as the same user exfiltrates the key | Accepted risk, same as Keychain on an unlocked Mac. Any malware running as the user can read the session-key file OR query Keychain. The future passphrase-encrypted identity (see [Future Work](#future-work)) would raise this bar by requiring an unlock step. |
 | Network interception | No network calls. Mutagen uses SSH transport (encrypted). |
 | Memory scraping | Decrypted values exist in memory briefly (shell variables, pipes). Acceptable risk for CLI tools. |
 | Malicious modification of vault files | SOPS MAC detects tampering. |
-| Compromised machine | Attacker needs both the identity file AND the passphrase. Rotate keys with `coffer rekey` after compromise. |
+| Compromised machine | Rotate keys: generate a new identity on the replacement machine, remove the compromised pubkey from `.sops.yaml`, `sops updatekeys` every vault file. |
 | Shell history exposure | `coffer set` without a value argument prompts interactively. Warn in docs against passing secrets as CLI args. |
 | Temp file leakage | No temp files created by coffer. SOPS `edit` creates a brief temp file with restrictive permissions (SOPS-managed). |
 | Clipboard exposure | `--clip` auto-clears after 30 seconds. Optional, not default behavior. |
@@ -637,16 +684,110 @@ If a machine is compromised or decommissioned:
 
 ### Identity File Security
 
-- Location: `~/.config/coffer/identity.txt`
+- Location: `${COFFER_SESSION_KEY}` (default `~/.config/coffer/.session-key`)
+- Content: cleartext age secret key (single line, `AGE-SECRET-KEY-...`)
 - Permissions: `600` (owner read/write only)
-- Encrypted with age passphrase encryption (scrypt KDF)
+- At-rest protection: FileVault + UNIX perms + user isolation
 - Never committed to git
-- Never synced between machines
-- Each machine has its own unique keypair
+- Never synced between machines (Mutagen is configured to sync only `vault/`)
+- Each machine has its own unique keypair; both pubkeys are listed as SOPS recipients so either machine can decrypt shared vault files.
 
 ---
 
-## Keychain Migration
+## Identity and Unlock Model
+
+### Single Source of Truth
+
+Coffer's identity — the age secret key it uses to decrypt every vault
+file — lives in **exactly one place**: the session-key file at
+`${COFFER_SESSION_KEY}` (default `~/.config/coffer/.session-key`), mode
+600, owned by the invoking user. Every coffer subcommand loads the key
+from that file (via `ensure_unlocked`) and, if the file is missing,
+dies with an actionable error telling the user to run `coffer init`.
+
+This is "Option 2" in the April 2026 refactor. The previous design
+had two parallel identity stores — the file AND a macOS Keychain entry
+at service `Coffer`, account `coffer-secret-key` — which caused a
+family of real bugs:
+
+- **SSH / headless contexts failed the identity check.** macOS does
+  not grant Keychain access to SSH-spawned processes by default.
+  `require_identity` tested Keychain presence only, so any
+  remotely-invoked coffer operation died with "No identity found"
+  even when `.session-key` was present and `ensure_unlocked` would
+  have happily loaded it. This manifested as silent failures in
+  `save-r2-keys.sh` (cron-driven backup job) and repeated "false
+  alert" incidents Bryce surfaced in session transcripts.
+
+- **Drift.** The Keychain entry and the file could get out of sync
+  (one rotated without the other), producing "works here, broken
+  there" symptoms across Wiles / Verve.
+
+- **Coupled CI footprint.** The Keychain code path required the
+  `security` binary and an unlocked login keychain, which is
+  unavailable in GitHub Actions or any non-interactive test runner.
+
+The refactor removes the Keychain path entirely. `ensure_unlocked`
+is now a two-branch function (env var → file), `require_identity`
+checks file presence only, and `coffer init` writes only to the file.
+No library code calls `security find-generic-password` /
+`security add-generic-password` / `security delete-generic-password`
+anymore; a structural test (`test_no_keychain_calls_in_library`)
+enforces that.
+
+### Threat-Model Equivalence
+
+On an **unlocked Mac with the user logged in**, a cleartext file at
+`~/.config/coffer/.session-key` (mode 600) provides the same effective
+security as a macOS Keychain entry with the default ACL:
+
+- Both are readable by any process running as the user.
+- Neither protects against malware running as the user.
+- Both are opaque to other local users (Keychain: login keychain is
+  per-user; file: mode 600).
+- Both are protected at rest by FileVault when the Mac is powered
+  off or locked pre-login.
+
+The Keychain wins in exactly one scenario: partition-list ACLs that
+require a GUI prompt ("Always Allow") for specific binaries. Coffer
+did not use this feature — it called `security` with the default ACL,
+putting it at parity with a mode-600 file.
+
+### Future Hardening: Passphrase-Encrypted Identity
+
+If the threat model ever tightens (e.g., coffer starts holding
+credentials that survive beyond the user's control, or a compliance
+regime demands a separate unlock step), the next step is a
+passphrase-encrypted identity file:
+
+1. `coffer init` encrypts the age secret key with a user-chosen
+   passphrase via age's scrypt KDF, writes the encrypted blob to
+   `~/.config/coffer/identity.age`.
+2. `coffer unlock` prompts for the passphrase, decrypts the key, and
+   either (a) exports `SOPS_AGE_KEY` for the shell, or (b) writes
+   `~/.config/coffer/.session-key` with mode 600 for the duration
+   of the session.
+3. `coffer lock` removes `.session-key` AND unsets `SOPS_AGE_KEY`
+   (at that point the "lock" command becomes a real at-rest lock).
+
+This is deferred, not planned for a specific milestone, because the
+current model is sufficient for the user's single-user dev
+environment and the added friction of a passphrase prompt per
+shell session isn't worth the marginal security gain until the
+threat model changes.
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `SOPS_AGE_KEY` | Decrypted age private key, in-memory, exported by `eval $(coffer unlock)` or any coffer subcommand that loads the file. |
+| `COFFER_SESSION_KEY` | Path override for the session-key file (default `~/.config/coffer/.session-key`). Used by tests and alternative configs. |
+| `COFFER_ROOT` | Override coffer directory location. |
+| `EDITOR` | Editor for `coffer edit`. |
+
+---
+
+## Keychain Migration (historical)
 
 ### Overview
 Migrate all secrets currently stored in macOS Keychain (accessed via `security find-generic-password`) to coffer. The migration is a one-time operation using a CSV export.
@@ -837,127 +978,32 @@ All dependencies installable via Homebrew. No compiled code, no runtimes beyond 
 
 ---
 
-## Auto-Unlock at Boot
+## Historical: Keychain-Based Auto-Unlock (removed 2026-04-19)
 
-### LaunchAgent
+Earlier drafts of this document specified:
 
-A LaunchAgent runs `coffer unlock --auto` at boot, which reads the master password from the macOS Keychain and decrypts the age identity without user interaction.
+1. A `coffer unlock --auto` LaunchAgent that read a master passphrase
+   from the macOS Keychain at boot and decrypted a passphrase-encrypted
+   identity file.
+2. A Verve-side `wiles-unlock` helper that popped an osascript dialog
+   and sent the passphrase to Wiles via SSH.
+3. A "Keychain Safety Rules" policy governing when automated code was
+   allowed to touch `security find-generic-password`.
 
-```xml
-<!-- ~/Library/LaunchAgents/com.coffer.auto-unlock.plist -->
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.coffer.auto-unlock</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/bin/coffer</string>
-        <string>unlock</string>
-        <string>--auto</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-```
+**None of this was ever implemented** (coffer shipped with a simpler
+Keychain-stores-the-age-key-directly design), and even the shipped
+simpler version was problematic — see "Single Source of Truth" in
+[Identity and Unlock Model](#identity-and-unlock-model) for the bug
+family it produced. The April 2026 refactor removed the Keychain
+dependency entirely in favor of a session-key file.
 
-### `coffer unlock --auto` Behavior
-
-1. Read the master password from Keychain: `security find-generic-password -s "Coffer" -a "coffer" -w`
-2. If keychain read succeeds: decrypt the age identity and export `SOPS_AGE_KEY` (or write to a session-scoped Unix socket / agent mechanism)
-3. If keychain read fails (e.g., after a macOS restore, Keychain corruption, or missing entry):
-   - Send an ntfy urgent notification:
-     ```bash
-     curl -s -H "Priority: urgent" -H "Title: Coffer Locked" -H "Tags: lock,warning" \
-       -d "Auto-unlock failed on $(hostname). Keychain read failed. Manual unlock required." \
-       "https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
-     ```
-   - Exit non-zero and wait for manual unlock
-   - Do NOT attempt to fix, reset, or re-create the keychain entry
-
----
-
-## Remote Unlock from Verve
-
-When coffer is locked on Wiles and needs manual unlock, the notification and unlock flow is:
-
-### Notification Flow
-
-1. **ntfy urgent notification** is sent (by the failed auto-unlock or any operation that hits a locked vault)
-2. The notification is received on all subscribed devices (phone, watch, Verve desktop)
-
-### Unlock from Verve (preferred)
-
-On Verve, a helper script `wiles-unlock` pops a **native macOS osascript password dialog** that appears over all apps (including fullscreen), collects the password, and sends it to Wiles via SSH to unlock coffer.
-
-The osascript dialog is preferred over tmux prompts because the user is usually attached to a Claude Code session in tmux and shouldn't need to detach to type a password.
-
-### Unlock from Frolic / iOS
-
-The ntfy notification on iOS instructs the user to open Jump Desktop and unlock coffer on Wiles directly (type the password into the Wiles terminal).
-
----
-
-## Verve-Side Helper Script: `wiles-unlock`
-
-### Location
-`~/bin/wiles-unlock` on Verve
-
-### Purpose
-Pops a native macOS password dialog and sends the password to Wiles to unlock coffer remotely. This avoids needing to detach from the current tmux/Claude Code session.
-
-### Implementation
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# wiles-unlock -- Pop a native macOS dialog on Verve, send password to Wiles coffer
-# Installed at ~/bin/wiles-unlock on Verve
-
-pass=$(osascript -e 'display dialog "Unlock Coffer on Wiles:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK"' -e 'text returned of result' 2>/dev/null)
-
-if [ -n "$pass" ]; then
-  ssh wiles "coffer unlock <<< \"$pass\"" && echo "Coffer unlocked" || echo "Unlock failed"
-else
-  echo "Cancelled"
-fi
-```
-
-### Notes
-- The `osascript` dialog pops over all apps, including fullscreen windows
-- The password is sent to Wiles over SSH (encrypted in transit)
-- If SSH to Wiles fails, the script exits with a clear error (no silent failure)
-- This script is NOT in the coffer repo (it's a Verve-local utility in `~/bin/`)
-
----
-
-## Keychain Safety Rules
-
-**NEVER touch the macOS Keychain from automated scripts or Claude Code.**
-
-The only keychain write operation in the entire coffer system is during `coffer init`, which the user runs **manually from a GUI terminal**. This is required because:
-
-1. Keychain ACL prompts (the "Always Allow" dialog) require a GUI session
-2. The partition list (`-T` flags) must be set during creation to allow non-interactive reads
-3. Programmatic keychain modification can corrupt ACLs or trigger security lockouts
-
-### Rules
-
-| Operation | Allowed? | Context |
-|-----------|----------|---------|
-| `security add-generic-password` during `coffer init` | Yes | User runs manually from GUI terminal |
-| `security find-generic-password` during `coffer unlock --auto` | Yes | LaunchAgent reads at boot |
-| `security find-generic-password` from any coffer command | Yes | Read-only, uses partition list set during init |
-| `security add-generic-password` from Claude Code | **NEVER** | Write a script for the user to run manually |
-| `security delete-generic-password` from any automated context | **NEVER** | Manual intervention only |
-| Any keychain modification after init | **NEVER** | If read fails, notify and wait for manual fix |
-
-If a keychain read fails at any point:
-1. Send an ntfy urgent notification describing the failure
-2. Exit non-zero with a clear error message
-3. **Do not** attempt to fix, reset, re-create, or modify the keychain entry
-4. Wait for the user to resolve manually (re-run `coffer init` or fix Keychain Access)
+If a future requirement re-introduces passphrase-based unlock, the
+implementation should NOT recreate the Keychain dependency. Instead,
+use age's built-in scrypt passphrase encryption (which works
+cross-platform, has no macOS API quirks, and is testable in CI). See
+"Future Hardening: Passphrase-Encrypted Identity" in the
+[Identity and Unlock Model](#identity-and-unlock-model) section for
+the proposed design.
 
 ---
 
@@ -973,7 +1019,7 @@ When Bitwarden ships their AI retrieval API, add an optional backend that:
 ### Potential Enhancements
 - **`coffer audit`** -- report on secret age, detect potentially rotated tokens
 - **`coffer env`** -- generate a `.env` file from a template mapping coffer paths to env var names
-- **`coffer agent`** -- a background agent that caches the decrypted identity in a Unix socket (similar to ssh-agent), avoiding repeated passphrase prompts across terminal sessions
+- **`coffer agent`** -- a background agent that brokers the identity over a Unix socket (similar to ssh-agent), so multiple processes don't each hold a copy of `SOPS_AGE_KEY` in their own environment. Most useful if/when the passphrase-encrypted identity lands (see [Identity and Unlock Model](#identity-and-unlock-model)).
 - **`coffer rotate <category/key>`** -- guided rotation workflow (fetch new token from provider API where possible, update vault, verify)
 - **Shell completion** -- bash/zsh completions for categories and keys
 - **Touch ID integration** -- use macOS Secure Enclave via `age-plugin-se` for passphrase-less decryption on machines with Touch ID
@@ -1027,8 +1073,9 @@ creation_rules:
 
 | Variable | Purpose | Set By |
 |----------|---------|--------|
-| `SOPS_AGE_KEY_FILE` | Path to age identity file | coffer (default) |
-| `SOPS_AGE_KEY` | Decrypted age private key (in-memory) | `coffer unlock` |
-| `COFFER_ROOT` | Override coffer directory location | User (optional) |
-| `COFFER_IDENTITY` | Override identity file path | User (optional) |
+| `SOPS_AGE_KEY` | age private key (cleartext, in-memory) | `eval $(coffer unlock)` or `ensure_unlocked` |
+| `COFFER_SESSION_KEY` | Path override for the session-key file (default `~/.config/coffer/.session-key`) | User (optional); exported by `bin/coffer` |
+| `COFFER_ROOT` | Override coffer directory location | User (optional); exported by `bin/coffer` |
+| `COFFER_VAULT` | Path to the vault directory (default `${COFFER_ROOT}/vault`) | Exported by `bin/coffer` |
+| `COFFER_SOPS_CONFIG` | Path to `.sops.yaml` | Exported by `bin/coffer` |
 | `EDITOR` | Editor for `coffer edit` | User's shell config |

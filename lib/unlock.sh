@@ -1,66 +1,88 @@
 #!/usr/bin/env bash
-# unlock.sh -- Read age secret key from Keychain and export SOPS_AGE_KEY
-# Usage: eval $(coffer unlock)
+# unlock.sh -- Load the age secret key from the session-key file and print
+# an `export SOPS_AGE_KEY=...` line suitable for `eval $(coffer unlock)`.
 #
-# Reads the age secret key directly from macOS Keychain.
-# On headless machines (Wiles), also writes a session key file for persistence.
+# Since the April 2026 refactor, coffer's identity lives entirely in the
+# session-key file at ${COFFER_SESSION_KEY}. `coffer unlock` is now a thin
+# convenience: it reads the file and emits the export statement so the user
+# can load the key into their current shell in one step. There is no Keychain
+# path anymore — if the file is missing, unlock tells the user to run
+# `coffer init`.
+#
+# Usage:
+#   eval $(coffer unlock)          # loads SOPS_AGE_KEY into current shell
+#   coffer unlock --auto           # no-op (retained for backward compatibility
+#                                  # with LaunchAgent configs; prints an info
+#                                  # message explaining the new model)
 set -euo pipefail
 
 cmd_unlock() {
-    local secret_key=""
+    # --- Argument parsing ---
+    # --auto is retained as a documented no-op because an older LaunchAgent
+    # recipe (see SPEC.md history) may still invoke it. Silently succeeding
+    # with an informational log avoids breaking those installations; the
+    # operator can remove the LaunchAgent at their convenience.
+    local auto=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --auto) auto=true; shift ;;
+            -h|--help)
+                cat >&2 <<'EOF'
+Usage: coffer unlock [--auto]
 
-    # Check environment first -- already unlocked
+Prints `export SOPS_AGE_KEY=...` for use with `eval $(coffer unlock)`.
+Reads the identity from the session-key file (default:
+~/.config/coffer/.session-key). If --auto is passed, prints an informational
+message and exits 0 — the identity is always auto-loaded from the file by
+every coffer subcommand, so no explicit auto-unlock step is required.
+EOF
+                return 0
+                ;;
+            *) die "Unknown argument to unlock: $1" ;;
+        esac
+    done
+
+    if [[ "$auto" == true ]]; then
+        # Since the refactor the identity file IS the persistent store;
+        # every coffer subcommand auto-loads it via ensure_unlocked. A
+        # dedicated auto-unlock step is no longer meaningful. We log this
+        # and return success so legacy LaunchAgents don't flap.
+        log "coffer unlock --auto: no-op. Identity is auto-loaded from ${COFFER_SESSION_KEY} by every command."
+        return 0
+    fi
+
+    # --- Environment shortcut: already unlocked ---
+    # If the shell already has SOPS_AGE_KEY set, emit it back so that
+    # eval $(coffer unlock) is idempotent and doesn't tamper with the value.
     if [[ -n "${SOPS_AGE_KEY:-}" ]]; then
-        log "Already unlocked (SOPS_AGE_KEY set)"
+        log "Already unlocked (SOPS_AGE_KEY set in environment)"
+        # Single-quote the value so shell metacharacters in the key (unlikely
+        # but possible if the file is ever corrupted) don't get reinterpreted.
         echo "export SOPS_AGE_KEY='${SOPS_AGE_KEY}'"
         return 0
     fi
 
-    # Check session key file (headless machines persist across shell sessions)
+    # --- Load from session-key file (single source of truth) ---
     local session_key_file="${COFFER_SESSION_KEY}"
-    if [[ -f "$session_key_file" ]]; then
-        secret_key=$(cat "$session_key_file")
-        if [[ -n "$secret_key" ]]; then
-            log "Using session key from ${session_key_file}"
-            echo "export SOPS_AGE_KEY='${secret_key}'"
-            return 0
-        fi
+    if [[ ! -f "$session_key_file" ]]; then
+        coffer_ntfy_urgent "Coffer Locked" "Unlock failed: session-key file missing at ${session_key_file}."
+        die "No identity found at ${session_key_file}. Run: coffer init"
+    fi
+    if [[ ! -r "$session_key_file" ]]; then
+        die "Identity file ${session_key_file} is not readable by this user."
     fi
 
-    # Read secret key from Keychain
-    secret_key=$(security find-generic-password -s "Coffer" -a "coffer-secret-key" -w 2>/dev/null) || {
-        coffer_ntfy_urgent "Coffer Locked" "Unlock failed: secret key not found in Keychain."
-        die "Secret key not found in Keychain. Run: coffer init"
-    }
+    local secret_key
+    secret_key=$(cat "$session_key_file")
+    [[ -n "$secret_key" ]] || die "Identity file ${session_key_file} is empty. Run: coffer init"
 
-    [[ -n "$secret_key" ]] || die "Empty secret key in Keychain"
+    # Sanity check: guard against accidentally emitting a non-age blob if
+    # someone ever clobbers the file with the wrong content.
+    [[ "$secret_key" == AGE-SECRET-KEY-* ]] || die "Identity file does not contain a valid age secret key (expected AGE-SECRET-KEY-* prefix)"
 
-    # Validate it looks like an age secret key
-    [[ "$secret_key" == AGE-SECRET-KEY-* ]] || die "Keychain entry is not a valid age secret key"
+    log "Loaded identity from ${session_key_file}"
 
-    log "Unlocked from Keychain"
-
-    # On headless machines (Wiles), write session key file for persistence
-    local config_dir="${COFFER_CONFIG_DIR}"
-    local machine_name=""
-    if [[ -f "${config_dir}/machine-name" ]]; then
-        machine_name=$(cat "${config_dir}/machine-name")
-    fi
-
-    # Lowercase-compare using `tr` rather than ${var,,} — that expansion is
-    # bash 4+ only, and macOS ships bash 3.2 at /bin/bash. Using ${var,,}
-    # caused `coffer unlock` to print `bad substitution` and abort on the
-    # default interpreter, breaking the session-key persistence path.
-    local machine_name_lc
-    machine_name_lc="$(printf '%s' "$machine_name" | tr '[:upper:]' '[:lower:]')"
-
-    if [[ "$machine_name_lc" == "wiles" ]]; then
-        mkdir -p "$(dirname "$session_key_file")"
-        echo "$secret_key" > "$session_key_file"
-        chmod 600 "$session_key_file"
-        log "Session key written to ${session_key_file}"
-    fi
-
-    # Output the export command for eval $(coffer unlock)
+    # Output the export command for eval $(coffer unlock).
+    # Single-quoted so the caller's shell doesn't reinterpret any characters.
     echo "export SOPS_AGE_KEY='${secret_key}'"
 }

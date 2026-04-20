@@ -9,7 +9,8 @@ cmd_edit() {
     [[ -n "$category" ]] || die "Usage: coffer edit <category>"
 
     require_cmd sops
-    require_identity
+    # ensure_unlocked covers the "identity missing?" check, so a separate
+    # require_identity call here would be redundant.
     ensure_unlocked
 
     # Verify EDITOR is set

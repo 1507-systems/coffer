@@ -76,7 +76,6 @@ setup_test_env() {
     export COFFER_ROOT="${TEST_DIR}/coffer"
     export COFFER_VAULT="${COFFER_ROOT}/vault"
     export COFFER_CONFIG_DIR="${TEST_DIR}/config"
-    export COFFER_IDENTITY="${COFFER_CONFIG_DIR}/identity.txt"
     export COFFER_SOPS_CONFIG="${COFFER_ROOT}/config/.sops.yaml"
     export COFFER_SESSION_KEY="${COFFER_CONFIG_DIR}/.session-key"
 
@@ -91,6 +90,18 @@ setup_test_env() {
     # Source common helpers
     # shellcheck source=../lib/common.sh
     source "${COFFER_ROOT}/lib/common.sh"
+}
+
+# Write a fake session-key file so require_identity passes in tests that
+# exercise downstream code (list/get/set). Tests that need to verify the
+# *absence* of an identity should call this helper's inverse by leaving the
+# file un-written. The content must begin with AGE-SECRET-KEY- for unlock
+# validation; we don't use this as a real key (tests either stub SOPS out
+# or generate real keys via age-keygen in their own sandbox).
+seed_fake_identity() {
+    mkdir -p "${COFFER_CONFIG_DIR}"
+    printf 'AGE-SECRET-KEY-FAKETESTFAKETESTFAKETESTFAKETESTFAKETEST\n' > "${COFFER_SESSION_KEY}"
+    chmod 600 "${COFFER_SESSION_KEY}"
 }
 
 teardown_test_env() {
@@ -224,9 +235,11 @@ test_get_missing_category_fails() {
     # shellcheck source=../lib/get.sh
     source "${COFFER_ROOT}/lib/get.sh"
 
-    # Set up a fake identity so require_identity doesn't fail first
-    touch "${COFFER_IDENTITY}"
-    chmod 600 "${COFFER_IDENTITY}"
+    # require_identity now checks the session-key file (post Option 2
+    # refactor), so seed one. ensure_unlocked short-circuits because we
+    # export SOPS_AGE_KEY below, so the fake file's contents don't need
+    # to be a real key for this test.
+    seed_fake_identity
     export SOPS_AGE_KEY="AGE-SECRET-KEY-fake"
 
     local output
@@ -403,6 +416,170 @@ EOF
     assert_eq "2" "$count" "update path should preserve both recipients from .sops.yaml"
 }
 
+# --- Identity: Option 2 (file-only, no Keychain) tests ---
+#
+# These tests cover the April 2026 refactor that made ~/.config/coffer/.session-key
+# the single source of truth for coffer's identity. The previous dual-path
+# design (file OR Keychain) produced real bugs in SSH-spawned shells where
+# Keychain access is denied by default. The tests below simulate that
+# "headless / no-Keychain" context by running coffer in a bash subshell
+# with no access to `security` helpers (we don't actually strip `security`
+# from PATH — we just never invoke it in the new code path, which is the
+# point of the refactor).
+
+test_require_identity_passes_with_file() {
+    # Happy path: session-key file present, require_identity returns 0.
+    seed_fake_identity
+    local output
+    output=$(bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_SESSION_KEY="'"${COFFER_SESSION_KEY}"'"
+        require_identity
+        echo "ok"
+    ' 2>&1)
+    assert_contains "$output" "ok" "require_identity should succeed when session-key file exists"
+}
+
+test_require_identity_fails_without_file() {
+    # Missing file: require_identity dies with an actionable message that
+    # mentions `coffer init` so the user knows exactly what to do.
+    local missing="${COFFER_CONFIG_DIR}/no-such-file"
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_SESSION_KEY="'"$missing"'"
+        require_identity
+    ' 2>&1) || true
+    assert_contains "$output" "No identity found" "require_identity should fail loudly when file is missing" && \
+    assert_contains "$output" "coffer init" "error message should tell the user to run coffer init"
+}
+
+test_require_identity_fails_on_empty_file() {
+    # Zero-byte file is a corruption case, not a "missing" one. We want a
+    # distinct, actionable error rather than silently falling through.
+    mkdir -p "${COFFER_CONFIG_DIR}"
+    : > "${COFFER_SESSION_KEY}"
+    chmod 600 "${COFFER_SESSION_KEY}"
+
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_SESSION_KEY="'"${COFFER_SESSION_KEY}"'"
+        require_identity
+    ' 2>&1) || true
+    assert_contains "$output" "empty" "require_identity should call out empty identity files"
+}
+
+test_ensure_unlocked_loads_from_file() {
+    # This is the SSH / headless regression test: with NO SOPS_AGE_KEY in
+    # the environment and NO Keychain access, ensure_unlocked must pick up
+    # the key from the session-key file. Before Option 2 this worked on some
+    # contexts and failed on SSH-spawned shells; now there's only one path.
+    seed_fake_identity
+    local output
+    output=$(bash -c '
+        unset SOPS_AGE_KEY
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_SESSION_KEY="'"${COFFER_SESSION_KEY}"'"
+        ensure_unlocked
+        echo "key=${SOPS_AGE_KEY:0:16}"
+    ' 2>&1)
+    assert_contains "$output" "key=AGE-SECRET-KEY-" "ensure_unlocked should export SOPS_AGE_KEY from file"
+}
+
+test_ensure_unlocked_prefers_env_var() {
+    # If SOPS_AGE_KEY is already set (e.g., user ran `eval $(coffer unlock)`
+    # in the parent shell), ensure_unlocked must trust it and not rewrite
+    # it from the file. This keeps `eval $(coffer unlock)` idempotent and
+    # also supports alternative identity delivery (e.g., passed through an
+    # LDAP-fed env var in a job runner).
+    seed_fake_identity
+    local output
+    output=$(bash -c '
+        export SOPS_AGE_KEY="AGE-SECRET-KEY-FROM-ENV"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_SESSION_KEY="'"${COFFER_SESSION_KEY}"'"
+        ensure_unlocked
+        echo "${SOPS_AGE_KEY}"
+    ' 2>&1)
+    assert_contains "$output" "AGE-SECRET-KEY-FROM-ENV" "ensure_unlocked should not overwrite a pre-set SOPS_AGE_KEY"
+}
+
+test_ensure_unlocked_fails_without_file_or_env() {
+    # Nothing in env, no file: must die with the same actionable message
+    # as require_identity so the user isn't chasing a mysterious "locked".
+    local missing="${COFFER_CONFIG_DIR}/no-such-file"
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        unset SOPS_AGE_KEY
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_SESSION_KEY="'"$missing"'"
+        ensure_unlocked
+    ' 2>&1) || true
+    assert_contains "$output" "No identity found" "ensure_unlocked should fail loudly when identity is missing" && \
+    assert_contains "$output" "coffer init" "error should tell the user how to fix it"
+}
+
+test_no_keychain_calls_in_library() {
+    # Structural check: the refactor's whole point is to kill Keychain
+    # dependency. If someone reintroduces a `security find-generic-password`
+    # call in the library, this test catches it before the diff lands.
+    local real_root
+    real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    local hits
+    hits=$(grep -l 'security find-generic-password\|security add-generic-password\|security delete-generic-password' \
+        "${real_root}/bin/coffer" "${real_root}"/lib/*.sh 2>/dev/null || true)
+    assert_eq "" "$hits" "no library/bin file should call the macOS 'security' helper"
+}
+
+test_unlock_reads_from_file() {
+    # `coffer unlock` emits `export SOPS_AGE_KEY=...` from the file. This
+    # smoke-tests the dispatcher path, not just the library function.
+    local real_root
+    real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+    seed_fake_identity
+    local output
+    output=$(COFFER_SESSION_KEY="${COFFER_SESSION_KEY}" \
+             COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+             bash "${real_root}/bin/coffer" unlock 2>/dev/null) || true
+    assert_contains "$output" "export SOPS_AGE_KEY=" "coffer unlock should emit an export statement when the file exists"
+}
+
+test_unlock_auto_is_noop() {
+    # --auto is retained as a no-op for LaunchAgent backward compatibility.
+    # It must exit 0 without emitting an export (nothing to eval).
+    local real_root
+    real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+    seed_fake_identity
+    local stdout
+    stdout=$(COFFER_SESSION_KEY="${COFFER_SESSION_KEY}" \
+             COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+             bash "${real_root}/bin/coffer" unlock --auto 2>/dev/null) || true
+    # stdout should be empty (no export); the informational log goes to stderr.
+    assert_eq "" "$stdout" "coffer unlock --auto should not emit stdout (it's a no-op)"
+}
+
+test_lock_does_not_delete_file() {
+    # Regression guard: `coffer lock` must leave the session-key file alone
+    # because the file IS the persistent identity. Wiping it would force
+    # a re-init on every "lock" which defeats the command's purpose.
+    local real_root
+    real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+    seed_fake_identity
+    COFFER_SESSION_KEY="${COFFER_SESSION_KEY}" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash "${real_root}/bin/coffer" lock >/dev/null 2>&1 || true
+    if [[ -f "${COFFER_SESSION_KEY}" ]]; then
+        return 0
+    else
+        echo "  FAIL: coffer lock deleted the session-key file"
+        return 1
+    fi
+}
+
 # --- Main ---
 
 main() {
@@ -438,6 +615,18 @@ main() {
     # Set: recipient preservation regression tests
     run_test test_set_preserves_all_recipients_on_create
     run_test test_set_preserves_all_recipients_on_update
+
+    # Identity: Option 2 (file-only, no Keychain) tests
+    run_test test_require_identity_passes_with_file
+    run_test test_require_identity_fails_without_file
+    run_test test_require_identity_fails_on_empty_file
+    run_test test_ensure_unlocked_loads_from_file
+    run_test test_ensure_unlocked_prefers_env_var
+    run_test test_ensure_unlocked_fails_without_file_or_env
+    run_test test_no_keychain_calls_in_library
+    run_test test_unlock_reads_from_file
+    run_test test_unlock_auto_is_noop
+    run_test test_lock_does_not_delete_file
 
     teardown_test_env
 
