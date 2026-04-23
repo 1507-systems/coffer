@@ -1007,6 +1007,80 @@ the proposed design.
 
 ---
 
+## Multi-machine Bootstrap
+
+### The Problem
+
+`coffer init` on a new machine generates a fresh age keypair locally. The
+new machine's pubkey lives only at `~/.config/coffer/public-key` — not in
+git, not in the Mutagen-synced vault, not in any shared location. Getting
+that pubkey onto an already-trusted machine (to run `coffer add-recipient`)
+historically required either SSH access or a manual copy-paste. This
+bootstrapping dependency broke four times in two weeks (see PROJECT_LOG.md
+entries for commits dce6721, 012eb1b, f51e29d, 54975bb).
+
+### The Solution: vault-dir-as-transport
+
+`coffer onboard` and `coffer finalize-onboard` use the Mutagen-synced vault
+directory itself as the out-of-band transport medium. Since `~/dev/coffer/`
+syncs across all machines, a file written to `vault/` on the new machine
+arrives at the trusted machine via Mutagen (or git push/pull if Mutagen is
+not running) without requiring any additional connectivity.
+
+### Canonical Bootstrap Flow
+
+**On the new (or re-initialized) machine:**
+
+```bash
+coffer onboard
+# → Runs `coffer init` if no .session-key exists.
+# → Writes vault/.pending-recipient-<machine-name>.pub  (plaintext pubkey, NOT a secret).
+# → Prints instructions: wait for Mutagen sync, then run finalize-onboard on Wiles.
+```
+
+**On the already-trusted machine (Wiles):**
+
+```bash
+coffer finalize-onboard
+# → Globs vault/.pending-recipient-*.pub.
+# → For each: validates the age pubkey format, calls cmd_add_recipient (which
+#   updates config/.sops.yaml and re-encrypts all vault files for the new recipient).
+# → Deletes each handled pending file on success.
+# → Prints a summary and reminds you to commit + push.
+```
+
+After the trusted machine pushes, Mutagen syncs the updated `.sops.yaml` and
+re-encrypted vault files back to the new machine, which can then decrypt with
+its freshly generated identity.
+
+### Pending-recipient File Format
+
+- **Location:** `vault/.pending-recipient-<machine-name>.pub`
+- **Content:** Single line containing the age public key (`age1...`).
+- **Security:** A pubkey is not a secret. Publishing it allows someone to add
+  the machine as a recipient but does NOT expose any existing vault contents.
+- **Git tracking:** Explicitly allowed via `.gitignore` (`!vault/.pending-recipient-*.pub`).
+- **Lifecycle:** Created by `coffer onboard`, deleted by `coffer finalize-onboard`
+  after successful `add-recipient`.
+
+### Legacy Flow (still works)
+
+If you have direct SSH access or can paste a pubkey manually:
+
+```bash
+# On new machine:
+coffer init
+cat ~/.config/coffer/public-key  # copy this output
+
+# On trusted machine:
+coffer add-recipient age1<paste-pubkey-here>
+```
+
+Use the `onboard` / `finalize-onboard` flow for all other situations — it
+removes the SSH/Tailscale dependency from the bootstrap path.
+
+---
+
 ## Future Work
 
 ### Bitwarden Backend (Planned)

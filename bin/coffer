@@ -45,6 +45,13 @@ Commands:
                                 the session-key file (the file is the
                                 persistent identity store; see lock.sh).
   add-recipient <age-pubkey>    Add an age public key and re-encrypt vault
+  onboard                       Bootstrap this machine: generate identity (if
+                                needed) and drop pubkey into vault/ for
+                                Mutagen transport. Run on the NEW machine.
+  finalize-onboard              Consume pending-recipient files from
+                                vault/.pending-recipient-*.pub, call
+                                add-recipient for each, delete handled files.
+                                Run on an ALREADY-TRUSTED machine (Wiles).
 
 Options:
   -h, --help    Show this help message
@@ -111,6 +118,16 @@ case "$command" in
         # shellcheck source=../lib/add-recipient.sh
         source "${COFFER_ROOT}/lib/add-recipient.sh"
         cmd_add_recipient "$@"
+        ;;
+    onboard)
+        # shellcheck source=../lib/onboard.sh
+        source "${COFFER_ROOT}/lib/onboard.sh"
+        cmd_onboard "$@"
+        ;;
+    finalize-onboard)
+        # shellcheck source=../lib/onboard.sh
+        source "${COFFER_ROOT}/lib/onboard.sh"
+        cmd_finalize_onboard "$@"
         ;;
     -h|--help|help)
         usage
