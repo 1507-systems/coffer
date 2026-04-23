@@ -229,6 +229,190 @@ test_list_missing_category_fails() {
     assert_contains "$output" "not found" "list should fail for missing category"
 }
 
+# Bug C: coffer list must not crash when a vault yaml file is empty or null.
+# Regression: on Verve, github.yaml was null-valued and caused list to print
+#   "Error: cannot get keys of !!null" and stop iterating entirely.
+
+test_list_empty_map_category_does_not_crash() {
+    # A vault file containing `{}` (empty map) has type !!map, zero keys, and
+    # should be listed as an empty category without crashing.
+    printf '{}' > "${COFFER_VAULT}/emptymap.yaml"
+    # Ensure there's at least one normal category file so we can confirm
+    # iteration continues past the empty one.
+    cat > "${COFFER_VAULT}/afterempty.yaml" <<'YAML'
+existing-key: ENC[AES256_GCM,data:abc]
+sops:
+  lastmodified: "2026-04-07T00:00:00Z"
+YAML
+
+    # shellcheck source=../lib/list.sh
+    source "${COFFER_ROOT}/lib/list.sh"
+    local output rc=0
+    output=$(cmd_list 2>/dev/null) || rc=$?
+
+    # Must not crash (exit 0 expected).
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: cmd_list exited ${rc} on empty-map vault file (expected 0)"
+        return 1
+    fi
+    # Must show both categories — iteration must not stop at the empty one.
+    assert_contains "$output" "emptymap/" "list should show empty-map category" && \
+    assert_contains "$output" "afterempty/" "list should continue past empty-map to next category" && \
+    assert_contains "$output" "existing-key" "list should show keys in subsequent category"
+}
+
+test_list_null_category_does_not_crash() {
+    # A vault file containing the literal string "null" (or truly empty —
+    # zero bytes) has yq type !!null and previously crashed the entire list.
+    # Both forms should produce "(empty)" without aborting iteration.
+
+    # Case 1: file containing the YAML null literal
+    printf 'null' > "${COFFER_VAULT}/nullcontent.yaml"
+    # Case 2: zero-byte file (empty)
+    : > "${COFFER_VAULT}/zerobyte.yaml"
+    # Case 3: a normal file AFTER the bad ones, to confirm iteration continues
+    cat > "${COFFER_VAULT}/afternull.yaml" <<'YAML'
+another-key: ENC[AES256_GCM,data:abc]
+sops:
+  lastmodified: "2026-04-07T00:00:00Z"
+YAML
+
+    # shellcheck source=../lib/list.sh
+    source "${COFFER_ROOT}/lib/list.sh"
+    local output rc=0
+    output=$(cmd_list 2>/dev/null) || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: cmd_list exited ${rc} on null/empty vault files (expected 0)"
+        return 1
+    fi
+    # The null/empty categories must appear in output (not skipped silently)
+    # and the subsequent healthy category must also appear.
+    assert_contains "$output" "nullcontent/" "list should show null-content category" && \
+    assert_contains "$output" "zerobyte/" "list should show zero-byte category" && \
+    assert_contains "$output" "afternull/" "list should continue past null/empty to next category" && \
+    assert_contains "$output" "another-key" "list should show keys in subsequent category"
+}
+
+# Bug B: machine name whitespace trimming must strip only leading/trailing
+# whitespace, not everything from the first space onward.
+# Regression: "coffer init" typed at the machine-name prompt became "coffer"
+# (the %%[[:space:]]* pattern killed everything after the first space).
+
+test_onboard_whitespace_machine_name_internal_space() {
+    # A machine-name containing an internal space ("my laptop") must survive
+    # the trim step with the space intact, then be converted to "my-laptop"
+    # by the sanitization step (tr replaces spaces with hyphens).
+    if ! command -v age-keygen >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    local config_dir="${sandbox}/config"
+    local vault_dir="${sandbox}/vault"
+    mkdir -p "$config_dir" "$vault_dir"
+
+    local keygen_out
+    keygen_out=$(age-keygen 2>&1)
+    local pub_key
+    pub_key=$(printf '%s\n' "$keygen_out" | grep -oE 'age1[a-z0-9]+' | head -1)
+    local secret_key
+    secret_key=$(printf '%s\n' "$keygen_out" | grep '^AGE-SECRET-KEY-')
+
+    printf '%s\n' "$secret_key" > "${config_dir}/.session-key"
+    chmod 600 "${config_dir}/.session-key"
+    printf '%s\n' "$pub_key" > "${config_dir}/public-key"
+    # Machine name with internal space — the key regression case
+    printf 'my laptop\n' > "${config_dir}/machine-name"
+
+    # shellcheck disable=SC2030,SC2031
+    (
+        export COFFER_ROOT="${SCRIPT_DIR}/.."
+        export COFFER_CONFIG_DIR="$config_dir"
+        export COFFER_SESSION_KEY="${config_dir}/.session-key"
+        export COFFER_VAULT="$vault_dir"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        # shellcheck source=../lib/common.sh
+        source "${COFFER_ROOT}/lib/common.sh"
+        # shellcheck source=../lib/onboard.sh
+        source "${COFFER_ROOT}/lib/onboard.sh"
+        # shellcheck disable=SC2119
+        cmd_onboard
+    ) 2>/dev/null
+
+    # Sanitization converts internal space to hyphen: "my laptop" → "my-laptop"
+    local pending_file="${vault_dir}/.pending-recipient-my-laptop.pub"
+    local ok=0
+    [[ -f "$pending_file" ]] && ok=1
+    rm -rf "$sandbox"
+
+    if [[ $ok -eq 0 ]]; then
+        echo "  FAIL: expected pending file .pending-recipient-my-laptop.pub (space→hyphen);"
+        echo "        old bug would have created .pending-recipient-my.pub (truncated)"
+        return 1
+    fi
+    return 0
+}
+
+test_onboard_whitespace_machine_name_leading_trailing() {
+    # A machine-name file with leading/trailing whitespace (e.g., " verve ")
+    # should be trimmed to "verve", not produce " verve" or "verve " as the
+    # pending filename.
+    if ! command -v age-keygen >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    local config_dir="${sandbox}/config"
+    local vault_dir="${sandbox}/vault"
+    mkdir -p "$config_dir" "$vault_dir"
+
+    local keygen_out
+    keygen_out=$(age-keygen 2>&1)
+    local pub_key
+    pub_key=$(printf '%s\n' "$keygen_out" | grep -oE 'age1[a-z0-9]+' | head -1)
+    local secret_key
+    secret_key=$(printf '%s\n' "$keygen_out" | grep '^AGE-SECRET-KEY-')
+
+    printf '%s\n' "$secret_key" > "${config_dir}/.session-key"
+    chmod 600 "${config_dir}/.session-key"
+    printf '%s\n' "$pub_key" > "${config_dir}/public-key"
+    # Leading and trailing spaces around a simple name
+    printf '  verve  \n' > "${config_dir}/machine-name"
+
+    # shellcheck disable=SC2030,SC2031
+    (
+        export COFFER_ROOT="${SCRIPT_DIR}/.."
+        export COFFER_CONFIG_DIR="$config_dir"
+        export COFFER_SESSION_KEY="${config_dir}/.session-key"
+        export COFFER_VAULT="$vault_dir"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        source "${COFFER_ROOT}/lib/common.sh"
+        source "${COFFER_ROOT}/lib/onboard.sh"
+        # shellcheck disable=SC2119
+        cmd_onboard
+    ) 2>/dev/null
+
+    local pending_file="${vault_dir}/.pending-recipient-verve.pub"
+    local ok=0
+    [[ -f "$pending_file" ]] && ok=1
+    rm -rf "$sandbox"
+
+    if [[ $ok -eq 0 ]]; then
+        echo "  FAIL: expected pending file .pending-recipient-verve.pub after leading/trailing trim"
+        return 1
+    fi
+    return 0
+}
+
 # --- Get error case tests ---
 
 test_get_missing_category_fails() {
@@ -800,6 +984,9 @@ main() {
     run_test test_list_with_test_vault
     run_test test_list_single_category
     run_test test_list_missing_category_fails
+    # Bug C regression: empty/null vault files must not crash list
+    run_test test_list_empty_map_category_does_not_crash
+    run_test test_list_null_category_does_not_crash
 
     # Get error case tests
     run_test test_get_missing_category_fails
@@ -833,6 +1020,9 @@ main() {
     run_test test_finalize_onboard_no_pending_files
     run_test test_onboard_rejects_unknown_args
     run_test test_finalize_onboard_rejects_unknown_args
+    # Bug B regression: machine-name whitespace trimming must preserve internal spaces
+    run_test test_onboard_whitespace_machine_name_internal_space
+    run_test test_onboard_whitespace_machine_name_leading_trailing
 
     teardown_test_env
 
