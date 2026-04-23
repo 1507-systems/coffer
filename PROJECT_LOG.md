@@ -105,3 +105,46 @@ precedence, SSH/headless simulation, structural Keychain-free guard,
 `coffer unlock` and `coffer lock` smoke). Shellcheck clean on `bin/`
 and `lib/`.
 
+### 2026-04-22 - Multi-machine bootstrap: onboard + finalize-onboard (feat/coffer-onboard-bootstrap)
+
+**Motivation.** The bootstrapping step of adding a new machine to the vault
+has broken four times in two weeks:
+
+| Commit | Regression |
+|--------|-----------|
+| `dce6721` | Verve's pubkey in `.sops.yaml` didn't match its current identity |
+| `012eb1b` | Cleanup of a stale Verve pubkey (old identity nobody held) |
+| `f51e29d` | `cmd_set` re-encrypted with only the writing machine's key, silently stripping the other recipient |
+| `54975bb` | Session-key-file refactor; any machine not yet migrated failed with "No identity found" |
+
+The structural root cause: no tooling existed to transport a new machine's
+pubkey to an already-trusted machine without SSH/Tailscale. `coffer init`
+printed "run `add-recipient <pubkey>` on the other machine" but provided no
+mechanism to make that happen out-of-band.
+
+**Change.** Added two new subcommands in `lib/onboard.sh`:
+
+- **`coffer onboard`** (runs on the new machine): ensures the machine has an
+  age identity (runs `coffer init` if missing), then writes the pubkey to
+  `vault/.pending-recipient-<machine-name>.pub` — a plaintext file that travels
+  via Mutagen and git to all connected machines.
+
+- **`coffer finalize-onboard`** (runs on Wiles or any trusted machine):
+  globs `vault/.pending-recipient-*.pub`, validates each key, calls
+  `cmd_add_recipient` for each (same code path as `coffer add-recipient`),
+  deletes handled files on success, prints a summary + commit reminder.
+
+**Files changed:**
+- `lib/onboard.sh` — NEW: `cmd_onboard` + `cmd_finalize_onboard`
+- `bin/coffer` — two new case entries + updated help text
+- `.gitignore` — `!vault/.pending-recipient-*.pub` allow-list entry
+- `SPEC.md` — "Multi-machine Bootstrap" section added
+- `PROJECT_LOG.md` — this entry
+
+**Tests.** Added `test_onboard_writes_pending_file`,
+`test_onboard_skips_init_if_identity_exists`,
+`test_finalize_onboard_no_pending_files`,
+`test_onboard_rejects_unknown_args`, and
+`test_finalize_onboard_rejects_unknown_args` to `tests/run-tests.sh`.
+32/32 tests passing (was 28). Shellcheck clean on all files.
+

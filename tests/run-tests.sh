@@ -561,6 +561,205 @@ test_unlock_auto_is_noop() {
     assert_eq "" "$stdout" "coffer unlock --auto should not emit stdout (it's a no-op)"
 }
 
+# --- Onboard tests ---
+#
+# These tests cover the vault-dir-as-transport bootstrap flow introduced in
+# the 2026-04-22 multi-machine fix. They simulate a "new machine" by overriding
+# COFFER_CONFIG_DIR and COFFER_SESSION_KEY to a fresh temp directory, then
+# verify that .pending-recipient-*.pub appears (or doesn't) as expected.
+
+test_onboard_writes_pending_file() {
+    # Happy path: machine has an identity, onboard should write the pending file.
+    # We seed a real age keypair (age-keygen) so the pubkey passes the regex.
+    if ! command -v age-keygen >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+
+    # Generate a real keypair into the sandbox config dir.
+    local config_dir="${sandbox}/config"
+    local vault_dir="${sandbox}/vault"
+    mkdir -p "$config_dir" "$vault_dir"
+
+    local keygen_out
+    keygen_out=$(age-keygen 2>&1)
+    local pub_key
+    pub_key=$(printf '%s\n' "$keygen_out" | grep -oE 'age1[a-z0-9]+' | head -1)
+    local secret_key
+    secret_key=$(printf '%s\n' "$keygen_out" | grep '^AGE-SECRET-KEY-')
+
+    printf '%s\n' "$secret_key" > "${config_dir}/.session-key"
+    chmod 600 "${config_dir}/.session-key"
+    printf '%s\n' "$pub_key" > "${config_dir}/public-key"
+    printf 'test-machine\n' > "${config_dir}/machine-name"
+
+    # Source onboard.sh with sandbox env; stub out the sub-invocation of init
+    # (not needed since the identity already exists) and other helpers.
+    # shellcheck disable=SC2030,SC2031
+    (
+        export COFFER_ROOT="${SCRIPT_DIR}/.."
+        export COFFER_CONFIG_DIR="$config_dir"
+        export COFFER_SESSION_KEY="${config_dir}/.session-key"
+        export COFFER_VAULT="$vault_dir"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        # shellcheck source=../lib/common.sh
+        source "${COFFER_ROOT}/lib/common.sh"
+        # shellcheck source=../lib/onboard.sh
+        source "${COFFER_ROOT}/lib/onboard.sh"
+
+        # shellcheck disable=SC2119
+        cmd_onboard
+    ) 2>/dev/null
+
+    local pending_file="${vault_dir}/.pending-recipient-test-machine.pub"
+    local found=0
+    [[ -f "$pending_file" ]] && found=1
+
+    # Check content matches the generated pubkey.
+    local content_ok=0
+    if [[ $found -eq 1 ]]; then
+        local file_content
+        file_content=$(< "$pending_file")
+        file_content="${file_content%%[[:space:]]*}"
+        [[ "$file_content" == "$pub_key" ]] && content_ok=1
+    fi
+
+    rm -rf "$sandbox"
+
+    if [[ $found -eq 0 ]]; then
+        echo "  FAIL: .pending-recipient-test-machine.pub was not created"
+        return 1
+    fi
+    if [[ $content_ok -eq 0 ]]; then
+        echo "  FAIL: pending file content does not match the pubkey"
+        return 1
+    fi
+    return 0
+}
+
+test_onboard_skips_init_if_identity_exists() {
+    # If the session-key file already exists and is non-empty, onboard must NOT
+    # attempt to re-run init (which would prompt the user for a machine name
+    # and block the test). We confirm by checking that onboard exits 0 without
+    # any die() and that the pending file still appears.
+    if ! command -v age-keygen >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    local config_dir="${sandbox}/config"
+    local vault_dir="${sandbox}/vault"
+    mkdir -p "$config_dir" "$vault_dir"
+
+    local keygen_out
+    keygen_out=$(age-keygen 2>&1)
+    local pub_key
+    pub_key=$(printf '%s\n' "$keygen_out" | grep -oE 'age1[a-z0-9]+' | head -1)
+    local secret_key
+    secret_key=$(printf '%s\n' "$keygen_out" | grep '^AGE-SECRET-KEY-')
+
+    printf '%s\n' "$secret_key" > "${config_dir}/.session-key"
+    chmod 600 "${config_dir}/.session-key"
+    printf '%s\n' "$pub_key" > "${config_dir}/public-key"
+    printf 'existing-machine\n' > "${config_dir}/machine-name"
+
+    local rc=0
+    # shellcheck disable=SC2030,SC2031
+    (
+        export COFFER_ROOT="${SCRIPT_DIR}/.."
+        export COFFER_CONFIG_DIR="$config_dir"
+        export COFFER_SESSION_KEY="${config_dir}/.session-key"
+        export COFFER_VAULT="$vault_dir"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        source "${COFFER_ROOT}/lib/common.sh"
+        source "${COFFER_ROOT}/lib/onboard.sh"
+        # shellcheck disable=SC2119
+        cmd_onboard
+    ) 2>/dev/null || rc=$?
+
+    local pending_file="${vault_dir}/.pending-recipient-existing-machine.pub"
+    local ok=0
+    [[ -f "$pending_file" ]] && ok=1
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: cmd_onboard exited ${rc} (expected 0) when identity exists"
+        return 1
+    fi
+    if [[ $ok -eq 0 ]]; then
+        echo "  FAIL: pending file not created even though identity exists"
+        return 1
+    fi
+    return 0
+}
+
+test_finalize_onboard_no_pending_files() {
+    # When there are no .pending-recipient-*.pub files, finalize-onboard should
+    # print "No pending recipients." and exit 0.
+    local sandbox
+    sandbox=$(mktemp -d)
+    local vault_dir="${sandbox}/vault"
+    mkdir -p "$vault_dir"
+
+    local output rc=0
+    output=$(
+        COFFER_ROOT="${SCRIPT_DIR}/.." \
+        COFFER_VAULT="$vault_dir" \
+        COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        COFFER_CONFIG_DIR="${sandbox}/config" \
+        COFFER_SESSION_KEY="${sandbox}/config/.session-key" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/onboard.sh"'"
+            # ensure_unlocked would fail with no identity; stub it since
+            # finalize-onboard only calls it before processing files.
+            # Since there are no files, it never reaches ensure_unlocked in the loop.
+            ensure_unlocked() { return 0; }
+            require_cmd() { return 0; }
+            cmd_finalize_onboard
+        ' 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: finalize-onboard exited ${rc} (expected 0) with no pending files"
+        echo "    output: $output"
+        return 1
+    fi
+    assert_contains "$output" "No pending recipients" "finalize-onboard should report nothing to do"
+}
+
+test_onboard_rejects_unknown_args() {
+    local output rc=0
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        source "'"${COFFER_ROOT}/lib/onboard.sh"'"
+        cmd_onboard --bogus-flag
+    ' 2>&1) || rc=$?
+    assert_contains "$output" "Unknown argument" "onboard should reject unknown flags"
+}
+
+test_finalize_onboard_rejects_unknown_args() {
+    local output rc=0
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        source "'"${COFFER_ROOT}/lib/onboard.sh"'"
+        cmd_finalize_onboard --bogus-flag
+    ' 2>&1) || rc=$?
+    assert_contains "$output" "Unknown argument" "finalize-onboard should reject unknown flags"
+}
+
 test_lock_does_not_delete_file() {
     # Regression guard: `coffer lock` must leave the session-key file alone
     # because the file IS the persistent identity. Wiping it would force
@@ -627,6 +826,13 @@ main() {
     run_test test_unlock_reads_from_file
     run_test test_unlock_auto_is_noop
     run_test test_lock_does_not_delete_file
+
+    # Onboard bootstrap tests
+    run_test test_onboard_writes_pending_file
+    run_test test_onboard_skips_init_if_identity_exists
+    run_test test_finalize_onboard_no_pending_files
+    run_test test_onboard_rejects_unknown_args
+    run_test test_finalize_onboard_rejects_unknown_args
 
     teardown_test_env
 

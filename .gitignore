@@ -12,5 +12,10 @@ vault/*.yaml
 # Keep vault directory in git (but not its contents)
 !vault/.gitkeep
 
+# Allow pending-recipient files — these are plaintext pubkeys (not secrets)
+# that coffer onboard writes so Mutagen + git carry them to the trusted machine.
+# They MUST be tracked so finalize-onboard on Wiles can consume them.
+!vault/.pending-recipient-*.pub
+
 # Claude Code local files
 .claude/
