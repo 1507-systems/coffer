@@ -199,5 +199,13 @@ list_keys_in_category() {
     local vault_file="${COFFER_VAULT}/${category}.yaml"
     [[ -f "$vault_file" ]] || die "Category '${category}' not found. Available: $(list_categories | tr '\n' ' ')"
     require_cmd yq
+    # Bug C fix: guard against null/empty files here too (consistent with the
+    # same fix in list.sh). A null-type file has no keys to iterate; return
+    # cleanly instead of crashing with "cannot get keys of !!null".
+    local node_type
+    node_type=$(yq 'type' "$vault_file" 2>/dev/null || echo "error")
+    if [[ "$node_type" != "!!map" ]]; then
+        return 0  # empty category — no keys to list, not an error
+    fi
     yq 'keys | .[] | select(. != "sops")' "$vault_file"
 }

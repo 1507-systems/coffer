@@ -71,14 +71,28 @@ EOF
     # and init has interactive prompts. Instead we check the file state and
     # delegate to the bin/coffer dispatcher so the user gets the full init UX.
     if [[ ! -f "$session_key_file" ]] || [[ ! -s "$session_key_file" ]]; then
-        log "No identity found — running 'coffer init' first..."
-        # Invoke the real coffer dispatcher so init.sh is sourced in its own
-        # context and the interactive machine-name prompt works correctly.
-        # COFFER_* env vars are already exported by the dispatcher, so the
-        # sub-invocation will write to the same paths.
-        "${COFFER_ROOT}/bin/coffer" init
+        # Bug A fix: the old message "running 'coffer init' first..." looked
+        # like an instruction to the user to type that command. On Verve
+        # (2026-04-22) the user typed "coffer init" at the machine-name prompt
+        # and their machine-name was recorded as that string. The new message
+        # makes clear that coffer is handling this step automatically, and gives
+        # explicit guidance about the upcoming machine-name prompt so the user
+        # knows what to do when it appears.
+        log "No identity found on this machine. Generating one now."
+        log "coffer is running the built-in init flow automatically — do NOT type"
+        log "'coffer init'. Just respond to the prompt below."
         log ""
-        log "Identity created. Continuing with onboard..."
+        log "=== Step 1 of 2: generate age identity ==="
+        log "You will be prompted for a machine name. Press Enter to accept the default"
+        log "(based on hostname), or type a short name like 'verve' or 'macbook'."
+        log ""
+        # Set COFFER_FROM_ONBOARD so init.sh can suppress its manual-steps output
+        # (those steps — add-recipient, import csv — contradict onboard's own flow
+        # and would confuse a user who is mid-onboard).
+        COFFER_FROM_ONBOARD=1 "${COFFER_ROOT}/bin/coffer" init
+        log ""
+        log "=== Step 2 of 2: register this machine for vault access ==="
+        log ""
     fi
 
     # --- Step 2: Read the local public key ---
@@ -101,7 +115,19 @@ EOF
     local machine_name=""
     if [[ -f "$machine_name_file" ]] && [[ -s "$machine_name_file" ]]; then
         machine_name=$(< "$machine_name_file")
-        machine_name="${machine_name%%[[:space:]]*}"
+        # Bug B fix: the previous pattern `${var%%[[:space:]]*}` stripped
+        # everything from the FIRST whitespace character onward, not just
+        # trailing whitespace. A machine name of "my laptop" became "my";
+        # worse, "coffer init" (typed by a confused user during onboard) became
+        # "coffer". Intent was only to strip leading and trailing whitespace
+        # (newlines, spaces) that accumulate from echo/read writes.
+        # The two-step trim below strips only boundary whitespace and leaves
+        # internal spaces intact so the sanitization step can convert them to
+        # hyphens (e.g., "my laptop" → "my-laptop").
+        # Strip leading whitespace
+        machine_name="${machine_name#"${machine_name%%[![:space:]]*}"}"
+        # Strip trailing whitespace
+        machine_name="${machine_name%"${machine_name##*[![:space:]]}"}"
     fi
     if [[ -z "$machine_name" ]]; then
         machine_name=$(hostname -s 2>/dev/null || echo "unknown")

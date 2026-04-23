@@ -114,7 +114,11 @@ SOPS_EOF
     for cat_name in "${categories[@]}"; do
         local vault_file="${COFFER_VAULT}/${cat_name}.yaml"
         if [[ ! -f "$vault_file" ]]; then
-            touch "$vault_file"
+            # Bug C prevention: write an empty YAML map (`{}`) rather than a
+            # zero-byte file. A zero-byte or null-content YAML file causes
+            # `yq 'keys | .[]'` to crash with "cannot get keys of !!null".
+            # An empty map (`{}`) has type !!map and returns zero keys cleanly.
+            printf '{}' > "$vault_file"
         fi
     done
 
@@ -125,6 +129,16 @@ SOPS_EOF
     log "Public key: ${public_key}"
     log "Secret key stored in: ${session_key_file} (mode 600)"
     echo "" >&2
+
+    # Bug A fix: when init is invoked FROM `coffer onboard` (via the
+    # COFFER_FROM_ONBOARD env var), the manual next-steps below are actively
+    # misleading — the user should NOT run `coffer add-recipient` by hand or
+    # import a CSV; those are the exact steps that onboard is replacing. Suppress
+    # them here and let onboard print its own contextual instructions instead.
+    if [[ -n "${COFFER_FROM_ONBOARD:-}" ]]; then
+        return 0
+    fi
+
     log "Next steps:"
     log "  1. On the OTHER machine, run: coffer add-recipient ${public_key}"
     log "  2. Import secrets: coffer import keychain-backup.csv"
