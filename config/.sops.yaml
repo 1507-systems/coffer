@@ -1,4 +1,4 @@
 creation_rules:
   - path_regex: vault/.*\.yaml$
     age: >-
-      age1tqg0x4t6967c6hwnu0nplxsve0mxmkqaft3vtrf2andq3sj0vfgsj0gaj0,age16mgjhvgyypt25ne8wsw5ggke7ah852n0hn3zdgq7s4ugywyvhdssv0x402
+      age1tqg0x4t6967c6hwnu0nplxsve0mxmkqaft3vtrf2andq3sj0vfgsj0gaj0,age16mgjhvgyypt25ne8wsw5ggke7ah852n0hn3zdgq7s4ugywyvhdssv0x402,age1d4tcfdt9fhkcuc05wtsw5gnvxljn9eu2x9l2c0ndx2q6h2vzx32s92jx53
