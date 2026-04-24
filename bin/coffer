@@ -3,7 +3,10 @@
 # Dispatches subcommands to lib/ scripts using SOPS + age for encryption.
 set -euo pipefail
 
-# Resolve the coffer root directory (parent of bin/)
+# Resolve the coffer root directory (parent of bin/). This is the TOOL repo,
+# not the vault repo. The two are intentionally separated since April 2026:
+# the tool is public (1507-systems/coffer), the vault is private
+# (bryce-shashinka/coffer-vault). COFFER_ROOT is only needed to find lib/ files.
 COFFER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export COFFER_ROOT
 
@@ -24,18 +27,75 @@ source "${COFFER_ROOT}/lib/git-sync.sh"
 # shellcheck source=../lib/doctor.sh
 source "${COFFER_ROOT}/lib/doctor.sh"
 
+# --- Vault location resolution ---
+#
+# COFFER_VAULT_ROOT is the top-level directory of the private vault repo
+# (bryce-shashinka/coffer-vault). It defaults to ~/dev/coffer-vault but can
+# be overridden via the environment to point at any directory. This separation
+# keeps the public tool code in one git repo and the private encrypted data
+# in another, allowing the tool to be open-source without leaking vault files
+# into a public git history.
+#
+# Backward-compat fallback (DEPRECATED):
+# If COFFER_VAULT_ROOT does not exist on disk but the old in-repo vault/
+# directory does, coffer falls back to the old layout with a deprecation
+# warning. This prevents a hard break on machines that haven't migrated yet,
+# but the old layout should be considered unsupported. Set COFFER_VAULT_ROOT
+# in your shell config and clone bryce-shashinka/coffer-vault to migrate.
+_resolve_vault_root() {
+    local default_root="${HOME}/dev/coffer-vault"
+    local requested_root="${COFFER_VAULT_ROOT:-${default_root}}"
+
+    if [[ -d "$requested_root" ]]; then
+        # Preferred path: vault exists at the requested location.
+        printf '%s' "$requested_root"
+        return 0
+    fi
+
+    # Backward compat: if the caller explicitly set COFFER_VAULT_ROOT to a
+    # path that doesn't exist, that is likely a misconfiguration. Die rather
+    # than silently falling back, to avoid silently using the wrong vault.
+    if [[ -n "${COFFER_VAULT_ROOT:-}" ]]; then
+        echo "coffer: error: COFFER_VAULT_ROOT='${COFFER_VAULT_ROOT}' does not exist." >&2
+        echo "coffer:        Clone the vault repo: git clone git@github.com:bryce-shashinka/coffer-vault.git ~/dev/coffer-vault" >&2
+        exit 1
+    fi
+
+    # No explicit override and default doesn't exist: check the old in-repo layout.
+    local legacy_vault="${COFFER_ROOT}/vault"
+    if [[ -d "$legacy_vault" ]]; then
+        echo "coffer: warning: COFFER_VAULT_ROOT not set and ~/dev/coffer-vault not found." >&2
+        echo "coffer: warning: Falling back to legacy in-repo vault at ${COFFER_ROOT}." >&2
+        echo "coffer: warning: This layout is DEPRECATED. Migrate to the vault repo:" >&2
+        echo "coffer: warning:   git clone git@github.com:bryce-shashinka/coffer-vault.git ~/dev/coffer-vault" >&2
+        echo "coffer: warning:   export COFFER_VAULT_ROOT=\$HOME/dev/coffer-vault" >&2
+        printf '%s' "$COFFER_ROOT"
+        return 0
+    fi
+
+    # Neither location exists: no vault, nothing we can do.
+    echo "coffer: error: No vault found. Expected: ${default_root}" >&2
+    echo "coffer:        Clone the vault repo: git clone git@github.com:bryce-shashinka/coffer-vault.git ~/dev/coffer-vault" >&2
+    exit 1
+}
+
+# Resolve vault root once; export so lib/ scripts inherit it.
+COFFER_VAULT_ROOT="$(_resolve_vault_root)"
+export COFFER_VAULT_ROOT
+
 # Coffer configuration paths.
-# These default to the usual per-user locations but respect pre-set values
-# so tests, sandboxes, and alternative configs can override them. Using the
-# ${VAR:-default} idiom instead of unconditional assignment is critical:
-# unconditional exports used to clobber COFFER_SESSION_KEY mid-flight, which
-# meant tests that passed COFFER_SESSION_KEY in the environment were
-# actually reading the caller's real ~/.config/coffer/.session-key. That
-# produced false-positive passes and made the session-key override useless
-# outside the dispatcher.
+# COFFER_CONFIG_DIR is machine-specific (identity, session key) and stays in
+# ~/.config/coffer regardless of vault location. The vault-adjacent paths
+# (COFFER_VAULT, COFFER_SOPS_CONFIG) are derived from COFFER_VAULT_ROOT.
+#
+# Using the ${VAR:-default} idiom is critical: unconditional exports used to
+# clobber COFFER_SESSION_KEY mid-flight, which meant tests that passed
+# COFFER_SESSION_KEY in the environment were actually reading the caller's
+# real ~/.config/coffer/.session-key. That produced false-positive passes and
+# made the session-key override useless outside the dispatcher.
 export COFFER_CONFIG_DIR="${COFFER_CONFIG_DIR:-${HOME}/.config/coffer}"
-export COFFER_VAULT="${COFFER_VAULT:-${COFFER_ROOT}/vault}"
-export COFFER_SOPS_CONFIG="${COFFER_SOPS_CONFIG:-${COFFER_ROOT}/config/.sops.yaml}"
+export COFFER_VAULT="${COFFER_VAULT:-${COFFER_VAULT_ROOT}/vault}"
+export COFFER_SOPS_CONFIG="${COFFER_SOPS_CONFIG:-${COFFER_VAULT_ROOT}/config/.sops.yaml}"
 export COFFER_SESSION_KEY="${COFFER_SESSION_KEY:-${COFFER_CONFIG_DIR}/.session-key}"
 
 usage() {
@@ -59,17 +119,22 @@ Commands:
                                 persistent identity store; see lock.sh).
   add-recipient <age-pubkey>    Add an age public key and re-encrypt vault
   onboard                       Bootstrap this machine: generate identity (if
-                                needed) and drop pubkey into vault/ for
-                                Mutagen transport. Run on the NEW machine.
+                                needed) and drop pubkey into vault/ for the
+                                vault repo to carry to the trusted machine.
+                                Run on the NEW machine.
   finalize-onboard              Consume pending-recipient files from
                                 vault/.pending-recipient-*.pub, call
                                 add-recipient for each, delete handled files.
                                 Run on an ALREADY-TRUSTED machine (Wiles).
+  sync-pull                     Pull latest vault changes from origin/main
+                                (git pull --ff-only). Use in SessionStart hooks
+                                to keep the vault current. Safe to run when
+                                the vault is already up to date.
   doctor                        Read-only vault state audit. Checks that every
                                 encrypted vault file's recipient list matches
                                 config/.sops.yaml, that this machine's identity
-                                appears in the list, and that the git repo is
-                                clean and up to date with origin/main.
+                                appears in the list, and that the vault git
+                                repo is clean and up to date with origin/main.
                                 Exit 0 = all clear. Exit 1 = drift found.
 
 Options:
@@ -77,6 +142,10 @@ Options:
   -v, --version Show version
 
 Environment:
+  COFFER_VAULT_ROOT    Path to the private vault repo root. Defaults to
+                       ~/dev/coffer-vault. Set this in ~/.zshrc.local so every
+                       session finds the vault without the deprecated in-repo
+                       fallback. Example: export COFFER_VAULT_ROOT=$HOME/dev/coffer-vault
   COFFER_AUTO_SYNC=0   Disable the automatic git commit+push that runs after
                        every state-modifying command (set, edit, import,
                        add-recipient, finalize-onboard, init). Useful for CI
@@ -88,6 +157,46 @@ EOF
 
 version() {
     echo "coffer 1.0.0"
+}
+
+# sync_pull -- Pull latest vault changes from the vault repo origin/main.
+# Used by SessionStart hooks to ensure each session begins with a fresh vault.
+# Runs git pull --ff-only to avoid silent merge commits on the vault data.
+cmd_sync_pull() {
+    if ! command -v git >/dev/null 2>&1; then
+        die "git not found on PATH: cannot sync vault"
+    fi
+
+    # Refuse to pull if the working tree has uncommitted coffer-managed changes.
+    # This prevents a pull from being silently blocked by a dirty tree, which
+    # would leave the session running on stale vault data without any error.
+    local dirty
+    dirty=$(git -C "$COFFER_VAULT_ROOT" status --porcelain \
+        -- config/.sops.yaml vault/ 2>/dev/null || echo "")
+    if [[ -n "$dirty" ]]; then
+        warn "sync-pull: vault has uncommitted local changes; skipping pull"
+        warn "  commit or stash changes first, then re-run: coffer sync-pull"
+        return 0
+    fi
+
+    # Check whether the upstream is configured before trying to pull.
+    local upstream
+    upstream=$(git -C "$COFFER_VAULT_ROOT" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo "")
+    if [[ -z "$upstream" ]]; then
+        warn "sync-pull: no upstream configured for vault repo; skipping pull"
+        warn "  run: git -C ${COFFER_VAULT_ROOT} push -u origin main"
+        return 0
+    fi
+
+    if git -C "$COFFER_VAULT_ROOT" pull --ff-only origin main 2>/dev/null; then
+        log "sync-pull: vault is up to date with origin/main"
+    else
+        # --ff-only refuses if the local branch has diverged from origin/main.
+        # This should not happen on the vault repo (no one edits it outside of
+        # coffer commands), but surface it loudly instead of silently skipping.
+        warn "sync-pull: pull --ff-only failed; vault may have diverged from origin/main"
+        warn "  inspect manually: git -C ${COFFER_VAULT_ROOT} status"
+    fi
 }
 
 # Require at least one argument
@@ -150,7 +259,7 @@ case "$command" in
         source "${COFFER_ROOT}/lib/init.sh"
         cmd_init "$@"
         # Commit .sops.yaml if init wrote it. init is usually the very first
-        # git operation on the repo, so there may be no remote yet — auto_sync_push
+        # git operation on the repo, so there may be no remote yet -- auto_sync_push
         # handles that gracefully (logs warning, returns 0).
         auto_sync_push "init vault"
         ;;
@@ -169,7 +278,7 @@ case "$command" in
         source "${COFFER_ROOT}/lib/add-recipient.sh"
         cmd_add_recipient "$@"
         # Commit .sops.yaml + re-encrypted vault files. Include a prefix of the
-        # pubkey in the message for traceability (full key is fine too, it's not secret).
+        # pubkey in the message for traceability (full key is fine too, it is not secret).
         auto_sync_push "add recipient ${1:-unknown}"
         ;;
     onboard)
@@ -182,6 +291,9 @@ case "$command" in
         source "${COFFER_ROOT}/lib/onboard.sh"
         cmd_finalize_onboard "$@"
         auto_sync_push "finalize-onboard"
+        ;;
+    sync-pull)
+        cmd_sync_pull "$@"
         ;;
     doctor)
         cmd_doctor "$@"

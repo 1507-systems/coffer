@@ -11,6 +11,12 @@
 # pushes. Origin/main becomes the authoritative truth that both machines can
 # pull from, independent of Mutagen's eventual-consistency timing.
 #
+# VAULT REPO vs TOOL REPO:
+# After the April 2026 vault/tool split, all git operations target COFFER_VAULT_ROOT
+# (bryce-shashinka/coffer-vault) rather than COFFER_ROOT (1507-systems/coffer).
+# COFFER_ROOT is only the tool code; COFFER_VAULT_ROOT is the data. Staging is
+# restricted to vault/ and config/.sops.yaml -- never the whole working tree.
+#
 # ESCAPE HATCH:
 # Set COFFER_AUTO_SYNC=0 in the environment to skip git operations entirely.
 # This is designed for CI runs, test sandboxes, and one-shot automation where
@@ -27,8 +33,9 @@ set -euo pipefail
 
 # auto_sync_push <commit-message>
 #
-# Stages ONLY config/.sops.yaml and vault/ (never the whole working tree),
-# commits if anything changed, and pushes to the current upstream.
+# Stages ONLY config/.sops.yaml and vault/ in the VAULT REPO (never the whole
+# working tree or any tool-repo files), commits if anything changed, and pushes
+# to the current upstream.
 #
 # Arguments:
 #   $1  -- short description of what changed; prepended with "coffer: " to
@@ -44,21 +51,29 @@ auto_sync_push() {
 
     # Escape hatch: operator or test harness wants no git ops.
     if [[ "${COFFER_AUTO_SYNC:-1}" == "0" ]]; then
-        log "auto-sync: COFFER_AUTO_SYNC=0 — skipping git commit+push"
+        log "auto-sync: COFFER_AUTO_SYNC=0 -- skipping git commit+push"
         return 0
     fi
 
     # We need git to be available (it nearly always is on supported machines,
     # but better to check than to produce a cryptic error).
     if ! command -v git >/dev/null 2>&1; then
-        warn "auto-sync: git not found on PATH — skipping commit+push"
-        warn "  resolve manually: cd ${COFFER_ROOT} && git status && git push"
+        warn "auto-sync: git not found on PATH -- skipping commit+push"
+        warn "  resolve manually: cd ${COFFER_VAULT_ROOT} && git status && git push"
         return 0
     fi
 
-    # Resolve the coffer repo root. COFFER_ROOT is set by bin/coffer; fall back
-    # to deriving it from this file's location for robustness.
-    local repo_root="${COFFER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    # All git operations target the vault repo, NOT the tool repo. The vault
+    # repo is what changes when secrets are written; the tool repo changes only
+    # when the tool code is updated via a normal PR workflow.
+    local repo_root="${COFFER_VAULT_ROOT:-}"
+    if [[ -z "$repo_root" ]]; then
+        # COFFER_VAULT_ROOT is set by bin/coffer before sourcing this file.
+        # If it is somehow absent (e.g., this file was sourced directly), fall
+        # back to deriving it from COFFER_ROOT for backward compat.
+        repo_root="${COFFER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+        warn "auto-sync: COFFER_VAULT_ROOT not set, falling back to ${repo_root}"
+    fi
 
     # Check branch: auto-push only on main. Any other branch commits locally
     # only (preserves history without polluting unintended remote branches).
@@ -66,15 +81,15 @@ auto_sync_push() {
     current_branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 
     if [[ "$current_branch" != "main" ]]; then
-        warn "auto-sync: current branch is '${current_branch}', not 'main' — committing locally but NOT pushing"
+        warn "auto-sync: current branch is '${current_branch}', not 'main' -- committing locally but NOT pushing"
         warn "  switch to main and push manually when ready: git push origin main"
     fi
 
-    # Stage ONLY the files that coffer manages. Deliberately NOT `git add -A`:
-    # that would pick up unrelated working-tree changes (e.g., a half-edited
-    # SPEC.md) and pollute the auto-commit with unintended content.
+    # Stage ONLY the files that coffer manages in the vault repo. Deliberately
+    # NOT `git add -A`: that would pick up unrelated working-tree changes and
+    # pollute the auto-commit with unintended content.
 
-    # Stage .sops.yaml (recipient list changes from add-recipient / finalize-onboard)
+    # Stage config/.sops.yaml (recipient list changes from add-recipient / finalize-onboard)
     local sops_config="${repo_root}/config/.sops.yaml"
     if [[ -f "$sops_config" ]]; then
         git -C "$repo_root" add "$sops_config" 2>/dev/null || true
@@ -102,14 +117,14 @@ auto_sync_push() {
         return 1
     fi
 
-    log "auto-sync: committed — ${commit_message}"
+    log "auto-sync: committed -- ${commit_message}"
 
     # Push only when on main.
     if [[ "$current_branch" == "main" ]]; then
         local upstream
         upstream=$(git -C "$repo_root" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo "")
         if [[ -z "$upstream" ]]; then
-            warn "auto-sync: no upstream configured — commit saved locally but not pushed"
+            warn "auto-sync: no upstream configured -- commit saved locally but not pushed"
             warn "  resolve manually: cd ${repo_root} && git push -u origin main"
             return 0
         fi

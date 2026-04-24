@@ -136,7 +136,11 @@ cmd_doctor() {
     local sops_config="${COFFER_SOPS_CONFIG}"
     local vault_dir="${COFFER_VAULT}"
     local config_dir="${COFFER_CONFIG_DIR}"
-    local repo_root="${COFFER_ROOT}"
+    # Git state check uses the VAULT repo (COFFER_VAULT_ROOT), not the tool
+    # repo (COFFER_ROOT). The tool repo is public code that changes via PRs;
+    # the vault repo is the git-tracked encrypted data that auto-commits on
+    # every write. Checking the wrong repo would produce misleading results.
+    local repo_root="${COFFER_VAULT_ROOT:-${COFFER_ROOT}}"
 
     local issues=0  # count of DRIFT lines emitted
 
@@ -232,7 +236,9 @@ cmd_doctor() {
         behind=$(git -C "$repo_root" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
 
         # Uncommitted changes to coffer-managed files specifically (not ALL files,
-        # because unrelated changes shouldn't alarm the doctor).
+        # because unrelated changes shouldn't alarm the doctor). These paths
+        # are relative to the vault repo root (COFFER_VAULT_ROOT), not the
+        # tool repo root.
         local dirty_lines
         dirty_lines=$(git -C "$repo_root" status --porcelain \
             -- config/.sops.yaml vault/ 2>/dev/null || echo "")
