@@ -11,6 +11,19 @@ export COFFER_ROOT
 # shellcheck source=../lib/common.sh
 source "${COFFER_ROOT}/lib/common.sh"
 
+# Source the auto-commit-and-push helper. This defines auto_sync_push(), which
+# is called at the end of every state-modifying command so that origin/main
+# always reflects the latest vault/recipient state. See lib/git-sync.sh for
+# the escape hatch (COFFER_AUTO_SYNC=0) and branch-safety behavior.
+# shellcheck source=../lib/git-sync.sh
+source "${COFFER_ROOT}/lib/git-sync.sh"
+
+# Source the doctor/preflight helpers. This defines cmd_doctor() (the audit
+# subcommand) and preflight_recipient_check() (called before writes). See
+# lib/doctor.sh for the drift-detection logic.
+# shellcheck source=../lib/doctor.sh
+source "${COFFER_ROOT}/lib/doctor.sh"
+
 # Coffer configuration paths.
 # These default to the usual per-user locations but respect pre-set values
 # so tests, sandboxes, and alternative configs can override them. Using the
@@ -52,10 +65,23 @@ Commands:
                                 vault/.pending-recipient-*.pub, call
                                 add-recipient for each, delete handled files.
                                 Run on an ALREADY-TRUSTED machine (Wiles).
+  doctor                        Read-only vault state audit. Checks that every
+                                encrypted vault file's recipient list matches
+                                config/.sops.yaml, that this machine's identity
+                                appears in the list, and that the git repo is
+                                clean and up to date with origin/main.
+                                Exit 0 = all clear. Exit 1 = drift found.
 
 Options:
   -h, --help    Show this help message
   -v, --version Show version
+
+Environment:
+  COFFER_AUTO_SYNC=0   Disable the automatic git commit+push that runs after
+                       every state-modifying command (set, edit, import,
+                       add-recipient, finalize-onboard, init). Useful for CI
+                       runs, test sandboxes, and one-shot automation.
+                       Default: enabled (auto-sync on).
 
 EOF
 }
@@ -82,7 +108,16 @@ case "$command" in
     set)
         # shellcheck source=../lib/set.sh
         source "${COFFER_ROOT}/lib/set.sh"
+        # Run preflight drift check before any write. If .sops.yaml and vault
+        # file recipients are out of sync, the write is aborted with a clear
+        # error pointing to `coffer doctor`. This prevents accumulating new
+        # secrets on top of an already-drifted vault.
+        preflight_recipient_check
         cmd_set "$@"
+        # Commit the vault change. The first positional arg is always the path
+        # (category/key); extracting just that keeps the commit message safe
+        # even if the value was passed on the command line.
+        auto_sync_push "set ${1:-unknown}"
         ;;
     list)
         # shellcheck source=../lib/list.sh
@@ -92,17 +127,32 @@ case "$command" in
     edit)
         # shellcheck source=../lib/edit.sh
         source "${COFFER_ROOT}/lib/edit.sh"
+        # Run preflight drift check before opening the editor. If recipients
+        # are drifted, the edit is aborted before SOPS tries to decrypt.
+        preflight_recipient_check
         cmd_edit "$@"
+        # Commit using the category name (first arg).
+        auto_sync_push "edit ${1:-unknown}"
         ;;
     import)
         # shellcheck source=../lib/import.sh
         source "${COFFER_ROOT}/lib/import.sh"
         cmd_import "$@"
+        # Commit using the CSV basename so the history shows which file was imported.
+        # `local` is not valid at top-level script scope (only inside functions),
+        # so we use a plain variable with an underscore prefix to signal it is
+        # short-lived and not part of the exported environment.
+        _coffer_import_csv_basename=$(basename "${1:-unknown.csv}")
+        auto_sync_push "import secrets from ${_coffer_import_csv_basename}"
         ;;
     init)
         # shellcheck source=../lib/init.sh
         source "${COFFER_ROOT}/lib/init.sh"
         cmd_init "$@"
+        # Commit .sops.yaml if init wrote it. init is usually the very first
+        # git operation on the repo, so there may be no remote yet — auto_sync_push
+        # handles that gracefully (logs warning, returns 0).
+        auto_sync_push "init vault"
         ;;
     unlock)
         # shellcheck source=../lib/unlock.sh
@@ -118,6 +168,9 @@ case "$command" in
         # shellcheck source=../lib/add-recipient.sh
         source "${COFFER_ROOT}/lib/add-recipient.sh"
         cmd_add_recipient "$@"
+        # Commit .sops.yaml + re-encrypted vault files. Include a prefix of the
+        # pubkey in the message for traceability (full key is fine too, it's not secret).
+        auto_sync_push "add recipient ${1:-unknown}"
         ;;
     onboard)
         # shellcheck source=../lib/onboard.sh
@@ -128,6 +181,10 @@ case "$command" in
         # shellcheck source=../lib/onboard.sh
         source "${COFFER_ROOT}/lib/onboard.sh"
         cmd_finalize_onboard "$@"
+        auto_sync_push "finalize-onboard"
+        ;;
+    doctor)
+        cmd_doctor "$@"
         ;;
     -h|--help|help)
         usage

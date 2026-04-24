@@ -148,3 +148,26 @@ mechanism to make that happen out-of-band.
 `test_finalize_onboard_rejects_unknown_args` to `tests/run-tests.sh`.
 32/32 tests passing (was 28). Shellcheck clean on all files.
 
+### 2026-04-24 - Vault drift prevention: doctor + auto-sync (feat/doctor-and-auto-sync)
+
+**Root cause of the April 22 SNAFU.** Verve ran `coffer add-recipient <wiles-pubkey>` redundantly (key was already present). The add-recipient code path skipped the `.sops.yaml` write but still ran `sops updatekeys` on all 14 vault files using Verve's local 3-recipient `.sops.yaml`. That re-encrypted ciphertext propagated to Wiles via Mutagen, but Wiles's git-tracked `.sops.yaml` still said 2 recipients. Subsequent `coffer set` calls on Wiles encrypted new entries with only 2 keys, locking Verve out of them.
+
+**Second drift source.** Mutagen syncs file content between machines but does NOT sync git state. A file can be identical in both working trees while each machine's git repo shows wildly different state (staged, untracked, committed-to-different-refs). Auto-pushing on writes means origin/main is always the truth either machine can pull.
+
+**Changes:**
+
+- **`lib/doctor.sh`** (NEW): `cmd_doctor` read-only audit command. Checks: (a) `.sops.yaml` recipient list vs every encrypted vault file's embedded recipient list, (b) this machine's pubkey is in the canonical list, (c) git branch/ahead/behind/dirty-tree state for coffer-managed paths. Exits 0 (clean) or 1 (drift found). Color-coded for TTY, plain ASCII for scripts. Also provides `preflight_recipient_check()` used by write commands.
+
+- **`lib/git-sync.sh`** (NEW): `auto_sync_push <message>` helper. Stages ONLY `config/.sops.yaml` and `vault/` (never the whole working tree), commits if anything changed, pushes when on `main`. Branch != main: commits locally only, logs a warning. `COFFER_AUTO_SYNC=0` disables all git ops (for CI / tests). Never rolls back an on-disk write on git failure.
+
+- **`bin/coffer`**: sourced `git-sync.sh` and `doctor.sh` at startup. Added `doctor` case. Added `preflight_recipient_check` calls before writes in `set` and `edit`. Added `auto_sync_push` calls at end of `set`, `edit`, `import`, `init`, `add-recipient`, `finalize-onboard`. Updated help/usage with `doctor` entry and `COFFER_AUTO_SYNC` env var documentation.
+
+**Auto-sync note:** vault YAML files are gitignored (encrypted bytes travel via Mutagen). `auto_sync_push` is primarily useful for `add-recipient` / `finalize-onboard` which modify `config/.sops.yaml` (git-tracked). The `set`/`edit`/`import` calls log "nothing to sync" for vault file changes, which is correct and expected behavior.
+
+**Tests.** Added 5 new tests covering doctor (clean vault, drifted vault), auto_sync_push (COFFER_AUTO_SYNC=0 skip, non-main branch local-only commit), and preflight blocking on drift. 42/42 tests passing (was 37). Shellcheck clean at warning level on all files.
+
+**Bugs found and fixed during implementation:**
+- BSD `paste -s` on macOS requires a file argument (not stdin); replaced with pure-bash join loops.
+- `while IFS= read -r` loop over `printf '%s' | tr ',' '\n'` only processed the first token because the last line lacked a trailing newline. Fixed by using `printf '%s\n'` and adding `|| [[ -n "$key" ]]` fallback.
+- `git rev-parse --abbrev-ref HEAD` on an empty repo outputs `HEAD` to stdout AND exits 128, causing `HEAD\nunknown` in the branch variable. Fixed with separate assignment: `branch=$(...) || branch="unknown"`.
+
