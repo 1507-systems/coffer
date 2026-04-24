@@ -1,6 +1,3 @@
-# Encrypted vault files are synced via Mutagen, not git
-vault/*.yaml
-
 # macOS
 .DS_Store
 
@@ -9,13 +6,15 @@ vault/*.yaml
 *.swo
 *~
 
-# Keep vault directory in git (but not its contents)
-!vault/.gitkeep
-
-# Allow pending-recipient files — these are plaintext pubkeys (not secrets)
-# that coffer onboard writes so Mutagen + git carry them to the trusted machine.
-# They MUST be tracked so finalize-onboard on Wiles can consume them.
-!vault/.pending-recipient-*.pub
-
 # Claude Code local files
 .claude/
+
+# The vault/ and config/ directories no longer live in this repo.
+# They have moved to the private bryce-shashinka/coffer-vault repo.
+# If you see a vault/ or config/ directory here, it is a leftover from
+# the old layout and can be safely removed (the vault data is in its new home).
+vault/
+config/
+
+# Wrangler (Cloudflare Workers dev server) local state
+.wrangler/

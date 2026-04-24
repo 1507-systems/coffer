@@ -148,6 +148,22 @@ mechanism to make that happen out-of-band.
 `test_finalize_onboard_rejects_unknown_args` to `tests/run-tests.sh`.
 32/32 tests passing (was 28). Shellcheck clean on all files.
 
+### 2026-04-24 - Vault/tool repo split (feat/coffer-vault-root-env-var + chore/remove-vault-from-tool-repo)
+
+**Why the split.** The tool repo (1507-systems/coffer) is public. Committing encrypted vault files to a public repo is structurally wrong even if they are SOPS-encrypted: git history is permanent and public key material is sensitive metadata. The clean solution is to move vault data into a dedicated private repo (bryce-shashinka/coffer-vault) so the tool can be open-source without leaking anything.
+
+**Changes in this session:**
+
+- **PR #15 (feat/coffer-vault-root-env-var):** Added `COFFER_VAULT_ROOT` env var support to `bin/coffer`. COFFER_VAULT, COFFER_SOPS_CONFIG now derived from COFFER_VAULT_ROOT. Backward-compat fallback to legacy in-repo vault with deprecation warning. Added `coffer sync-pull` subcommand for SessionStart hooks. Updated `lib/git-sync.sh` to commit/push in COFFER_VAULT_ROOT instead of COFFER_ROOT. Updated `lib/doctor.sh` to check git state of the vault repo. All 42 tests updated and passing.
+
+- **PR #16 (chore/remove-vault-from-tool-repo):** Removed `config/` and `vault/.gitkeep` from the tool repo. Updated `.gitignore` to drop vault-specific lines. Added top-level `README.md` with setup instructions for new users. Removed the backward-compat in-repo fallback (now COFFER_VAULT_ROOT is required with sensible default).
+
+- **New private repo:** bryce-shashinka/coffer-vault created with initial commit of all vault content. Both Wiles and Verve cloned the repo. COFFER_VAULT_ROOT set in `~/.zshrc.local` on both machines.
+
+- **Auto-sync behavior:** `coffer set/edit/import/add-recipient` now auto-commit-push to the vault repo (bryce-shashinka/coffer-vault), not the tool repo. `coffer sync-pull` does `git pull --ff-only` on the vault repo for SessionStart hooks.
+
+**Mutagen note:** Mutagen currently syncs coffer-vault/ between machines (fighting with git). A `.mutagenignore` file was added at `~/dev/.mutagenignore` with `coffer-vault/` excluded, but the running session requires termination + recreation to pick up new CLI ignores. Until then, if a `git pull` fails due to Mutagen-pre-delivered content, run `git checkout -- vault/<file>.yaml` then `git pull`. The Mutagen session recreation is documented in the follow-up plan doc.
+
 ### 2026-04-24 - Vault drift prevention: doctor + auto-sync (feat/doctor-and-auto-sync)
 
 **Root cause of the April 22 SNAFU.** Verve ran `coffer add-recipient <wiles-pubkey>` redundantly (key was already present). The add-recipient code path skipped the `.sops.yaml` write but still ran `sops updatekeys` on all 14 vault files using Verve's local 3-recipient `.sops.yaml`. That re-encrypted ciphertext propagated to Wiles via Mutagen, but Wiles's git-tracked `.sops.yaml` still said 2 recipients. Subsequent `coffer set` calls on Wiles encrypted new entries with only 2 keys, locking Verve out of them.
