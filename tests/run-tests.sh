@@ -87,11 +87,23 @@ setup_test_env() {
 
     mkdir -p "${COFFER_ROOT}/lib" "${COFFER_VAULT_ROOT}/config" "${COFFER_VAULT}" "${COFFER_CONFIG_DIR}"
 
-    # Copy lib files from the real project
+    # Copy lib files from the real project (these live in the tool repo)
     local real_root
     real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
     cp "${real_root}"/lib/*.sh "${COFFER_ROOT}/lib/"
-    cp "${real_root}"/config/*.yaml "${COFFER_VAULT_ROOT}/config/"
+
+    # Create a minimal .sops.yaml in the vault config dir. The real config lives in
+    # the private vault repo (bryce-shashinka/coffer-vault), not the tool repo.
+    # Tests that need a specific .sops.yaml (e.g., multi-recipient tests) create
+    # their own in a separate sandbox and do not go through setup_test_env.
+    # This placeholder is enough to make list/get/set tests that check for the
+    # file's existence pass without importing real vault data into CI.
+    cat > "${COFFER_VAULT_ROOT}/config/.sops.yaml" <<'SOPSEOF'
+creation_rules:
+  - path_regex: vault/.*\.yaml$
+    age: >-
+      age1placeholder000000000000000000000000000000000000000000000000
+SOPSEOF
 
     # Source common helpers
     # shellcheck source=../lib/common.sh

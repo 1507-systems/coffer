@@ -30,52 +30,37 @@ source "${COFFER_ROOT}/lib/doctor.sh"
 # --- Vault location resolution ---
 #
 # COFFER_VAULT_ROOT is the top-level directory of the private vault repo
-# (bryce-shashinka/coffer-vault). It defaults to ~/dev/coffer-vault but can
-# be overridden via the environment to point at any directory. This separation
-# keeps the public tool code in one git repo and the private encrypted data
-# in another, allowing the tool to be open-source without leaking vault files
-# into a public git history.
+# (e.g., bryce-shashinka/coffer-vault). It defaults to ~/dev/coffer-vault
+# but can be overridden via the environment to point at any directory.
+# This separation keeps the open-source tool code in one git repo and
+# the private encrypted data in another.
 #
-# Backward-compat fallback (DEPRECATED):
-# If COFFER_VAULT_ROOT does not exist on disk but the old in-repo vault/
-# directory does, coffer falls back to the old layout with a deprecation
-# warning. This prevents a hard break on machines that haven't migrated yet,
-# but the old layout should be considered unsupported. Set COFFER_VAULT_ROOT
-# in your shell config and clone bryce-shashinka/coffer-vault to migrate.
+# How to set up the vault repo: see README.md.
 _resolve_vault_root() {
     local default_root="${HOME}/dev/coffer-vault"
     local requested_root="${COFFER_VAULT_ROOT:-${default_root}}"
 
     if [[ -d "$requested_root" ]]; then
-        # Preferred path: vault exists at the requested location.
+        # Vault exists at the requested location.
         printf '%s' "$requested_root"
         return 0
     fi
 
-    # Backward compat: if the caller explicitly set COFFER_VAULT_ROOT to a
-    # path that doesn't exist, that is likely a misconfiguration. Die rather
-    # than silently falling back, to avoid silently using the wrong vault.
+    # If the caller explicitly set COFFER_VAULT_ROOT to a path that doesn't
+    # exist, that is a misconfiguration. Die rather than silently using a
+    # different vault.
     if [[ -n "${COFFER_VAULT_ROOT:-}" ]]; then
         echo "coffer: error: COFFER_VAULT_ROOT='${COFFER_VAULT_ROOT}' does not exist." >&2
-        echo "coffer:        Clone the vault repo: git clone git@github.com:bryce-shashinka/coffer-vault.git ~/dev/coffer-vault" >&2
+        echo "coffer:        Clone or create your vault repo and point COFFER_VAULT_ROOT at it." >&2
+        echo "coffer:        See README.md for setup instructions." >&2
         exit 1
     fi
 
-    # No explicit override and default doesn't exist: check the old in-repo layout.
-    local legacy_vault="${COFFER_ROOT}/vault"
-    if [[ -d "$legacy_vault" ]]; then
-        echo "coffer: warning: COFFER_VAULT_ROOT not set and ~/dev/coffer-vault not found." >&2
-        echo "coffer: warning: Falling back to legacy in-repo vault at ${COFFER_ROOT}." >&2
-        echo "coffer: warning: This layout is DEPRECATED. Migrate to the vault repo:" >&2
-        echo "coffer: warning:   git clone git@github.com:bryce-shashinka/coffer-vault.git ~/dev/coffer-vault" >&2
-        echo "coffer: warning:   export COFFER_VAULT_ROOT=\$HOME/dev/coffer-vault" >&2
-        printf '%s' "$COFFER_ROOT"
-        return 0
-    fi
-
-    # Neither location exists: no vault, nothing we can do.
-    echo "coffer: error: No vault found. Expected: ${default_root}" >&2
-    echo "coffer:        Clone the vault repo: git clone git@github.com:bryce-shashinka/coffer-vault.git ~/dev/coffer-vault" >&2
+    # Default location does not exist. Guide the user to set up a vault repo.
+    echo "coffer: error: No vault found at default location: ${default_root}" >&2
+    echo "coffer:        Create a private git repo for your vault, clone it to ~/dev/coffer-vault," >&2
+    echo "coffer:        and set: export COFFER_VAULT_ROOT=\$HOME/dev/coffer-vault" >&2
+    echo "coffer:        See README.md for full setup instructions." >&2
     exit 1
 }
 
