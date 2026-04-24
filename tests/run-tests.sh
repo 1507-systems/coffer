@@ -963,6 +963,342 @@ test_lock_does_not_delete_file() {
     fi
 }
 
+# =============================================================================
+# --- Doctor and auto-sync tests ---
+#
+# These tests cover the drift-detection and auto-commit infrastructure added
+# in feat/doctor-and-auto-sync (April 2026) to prevent a recurrence of the
+# .sops.yaml/vault-file recipient mismatch bug.
+# =============================================================================
+
+# Helper: build a minimal test git repo with age keypairs and a .sops.yaml
+# so doctor and preflight tests have something realistic to work with.
+# Usage:  _setup_doctor_sandbox <sandbox_path>
+# Sets:   DOCTOR_SANDBOX_VAULT, DOCTOR_SANDBOX_CONFIG, DOCTOR_SANDBOX_SOPS
+#         DOCTOR_SANDBOX_PUBA, DOCTOR_SANDBOX_PRIK_A (for signing)
+_setup_doctor_sandbox() {
+    local sandbox="$1"
+    local config_dir="${sandbox}/config"
+    local vault_dir="${sandbox}/vault"
+    local git_dir="${sandbox}/repo"
+
+    mkdir -p "$config_dir" "$vault_dir" "$git_dir"
+
+    # Generate two age keypairs so we can simulate multi-recipient scenarios
+    age-keygen -o "${sandbox}/keyA.txt" 2>/dev/null
+    age-keygen -o "${sandbox}/keyB.txt" 2>/dev/null
+
+    local pub_a pub_b
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    pub_b=$(grep "public key" "${sandbox}/keyB.txt" | awk '{print $4}')
+
+    # Write .sops.yaml with BOTH keys as canonical recipients
+    local sops_config="${config_dir}/.sops.yaml"
+    cat > "$sops_config" <<EOF
+creation_rules:
+  - path_regex: vault/.*\\.yaml\$
+    age: >-
+      ${pub_a},${pub_b}
+EOF
+
+    # Write the machine identity as key A (simulating "this machine")
+    printf '%s\n' "$pub_a" > "${config_dir}/public-key"
+    printf 'test-machine\n' > "${config_dir}/machine-name"
+    printf '%s\n' "$(grep AGE-SECRET "${sandbox}/keyA.txt")" > "${config_dir}/.session-key"
+    chmod 600 "${config_dir}/.session-key"
+
+    # NOTE: We do NOT initialize a git repo here. The doctor's git checks
+    # are skipped when COFFER_ROOT has no .git directory. Vault-drift tests
+    # focus on recipient set comparison, not git state. The auto_sync_push
+    # tests create their own git sandboxes independently.
+
+    # Export the three paths that callers need. Key files are accessed via
+    # the `sandbox` variable in each test function body (no export needed since
+    # the helper runs in the same shell scope, not a subshell).
+    DOCTOR_SANDBOX_VAULT="$vault_dir"
+    DOCTOR_SANDBOX_CONFIG="$config_dir"
+    DOCTOR_SANDBOX_SOPS="$sops_config"
+}
+
+# a. coffer doctor on a clean vault exits 0 with correct output.
+test_doctor_clean_vault_exits_zero() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_doctor_sandbox "$sandbox"
+
+    # Encrypt one vault file with BOTH keys so doctor has something to check
+    local sops_age_key
+    sops_age_key=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+
+    jq -n '{"test-key": "test-value"}' \
+        | SOPS_AGE_KEY="$sops_age_key" \
+          SOPS_CONFIG="$DOCTOR_SANDBOX_SOPS" \
+          sops encrypt \
+            --filename-override "${DOCTOR_SANDBOX_VAULT}/testcat.yaml" \
+            --input-type json --output-type yaml \
+            /dev/stdin > "${DOCTOR_SANDBOX_VAULT}/testcat.yaml" 2>/dev/null \
+        || { rm -rf "$sandbox"; echo "  SKIP (sops encrypt failed)"; return 0; }
+
+    local output rc=0
+    output=$(
+        COFFER_ROOT="${sandbox}" \
+        COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
+        COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
+        COFFER_CONFIG_DIR="${DOCTOR_SANDBOX_CONFIG}" \
+        COFFER_SESSION_KEY="${DOCTOR_SANDBOX_CONFIG}/.session-key" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/doctor.sh"'"
+            cmd_doctor
+        ' 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    # All vault files match .sops.yaml: should exit 0
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: doctor exited ${rc} on a clean vault (expected 0)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_contains "$output" "[OK]" "doctor should print at least one [OK] line" && \
+    assert_contains "$output" "all checks passed" "doctor should report all checks passed"
+}
+
+# b. coffer doctor on a drifted vault exits 1 with specific drift output.
+test_doctor_drifted_vault_exits_one() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_doctor_sandbox "$sandbox"
+
+    # Encrypt a vault file with ONLY key A — simulating a write that happened
+    # before key B was added (i.e., the vault file has fewer recipients than .sops.yaml)
+    local sops_age_key
+    sops_age_key=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+    local pub_a
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+
+    # Write a temporary single-recipient .sops.yaml just for the encrypt step
+    local single_sops="${sandbox}/single.sops.yaml"
+    cat > "$single_sops" <<EOF
+creation_rules:
+  - path_regex: vault/.*\\.yaml\$
+    age: >-
+      ${pub_a}
+EOF
+
+    jq -n '{"test-key": "test-value"}' \
+        | SOPS_AGE_KEY="$sops_age_key" \
+          SOPS_CONFIG="$single_sops" \
+          sops encrypt \
+            --filename-override "${DOCTOR_SANDBOX_VAULT}/testcat.yaml" \
+            --input-type json --output-type yaml \
+            /dev/stdin > "${DOCTOR_SANDBOX_VAULT}/testcat.yaml" 2>/dev/null \
+        || { rm -rf "$sandbox"; echo "  SKIP (sops encrypt failed)"; return 0; }
+
+    # Now the vault file has 1 recipient (key A) but .sops.yaml lists 2 (A + B)
+    # This is exactly the drift condition doctor must catch.
+    local output rc=0
+    output=$(
+        COFFER_ROOT="${sandbox}" \
+        COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
+        COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
+        COFFER_CONFIG_DIR="${DOCTOR_SANDBOX_CONFIG}" \
+        COFFER_SESSION_KEY="${DOCTOR_SANDBOX_CONFIG}/.session-key" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/doctor.sh"'"
+            cmd_doctor
+        ' 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    # Must exit 1 (drift found)
+    if [[ $rc -ne 1 ]]; then
+        echo "  FAIL: doctor exited ${rc} on a drifted vault (expected 1)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_contains "$output" "[DRIFT]" "doctor should print at least one [DRIFT] line" && \
+    assert_contains "$output" "issue(s) found" "doctor should report issues found"
+}
+
+# c. auto_sync_push with COFFER_AUTO_SYNC=0 skips all git ops.
+test_auto_sync_push_disabled_by_env() {
+    local sandbox
+    sandbox=$(mktemp -d)
+
+    # Init a git repo (needs to be a repo to test auto_sync_push behavior)
+    git -C "$sandbox" init -q
+    git -C "$sandbox" config user.email "test@test.local"
+    git -C "$sandbox" config user.name "Test"
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    touch "${sandbox}/vault/test.yaml"
+    git -C "$sandbox" add . 2>/dev/null
+    git -C "$sandbox" commit -m "initial" -q
+
+    # Modify a file so there would be something to stage
+    echo "change" > "${sandbox}/vault/test.yaml"
+
+    local output rc=0
+    output=$(
+        COFFER_AUTO_SYNC=0 \
+        COFFER_ROOT="$sandbox" \
+        COFFER_VAULT="${sandbox}/vault" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/git-sync.sh"'"
+            auto_sync_push "test commit"
+        ' 2>&1
+    ) || rc=$?
+
+    # Verify no new commit was made
+    local commit_count
+    commit_count=$(git -C "$sandbox" rev-list --count HEAD 2>/dev/null || echo 0)
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: auto_sync_push exited ${rc} with COFFER_AUTO_SYNC=0 (expected 0)"
+        return 1
+    fi
+    assert_contains "$output" "COFFER_AUTO_SYNC=0" "should log that auto-sync is disabled" && \
+    assert_eq "1" "$commit_count" "should not have committed anything (still just initial commit)"
+}
+
+# d. auto_sync_push on a non-main branch commits locally but does NOT push.
+test_auto_sync_push_non_main_commits_only() {
+    local sandbox
+    sandbox=$(mktemp -d)
+
+    # Set up a git repo on a non-main branch
+    git -C "$sandbox" init -q
+    git -C "$sandbox" config user.email "test@test.local"
+    git -C "$sandbox" config user.name "Test"
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    echo "initial" > "${sandbox}/vault/test.yaml"
+    cat > "${sandbox}/config/.sops.yaml" <<'SOPSEOF'
+creation_rules:
+  - path_regex: vault/.*\.yaml$
+    age: >-
+      age1test123
+SOPSEOF
+    git -C "$sandbox" add . 2>/dev/null
+    git -C "$sandbox" commit -m "initial" -q
+    git -C "$sandbox" checkout -b feat/not-main -q
+
+    # Make a change to vault/
+    echo "modified" > "${sandbox}/vault/test.yaml"
+
+    local output rc=0
+    output=$(
+        COFFER_AUTO_SYNC=1 \
+        COFFER_ROOT="$sandbox" \
+        COFFER_VAULT="${sandbox}/vault" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/git-sync.sh"'"
+            auto_sync_push "test change"
+        ' 2>&1
+    ) || rc=$?
+
+    local commit_count
+    commit_count=$(git -C "$sandbox" rev-list --count HEAD 2>/dev/null || echo 0)
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: auto_sync_push exited ${rc} on non-main branch (expected 0)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    # Must have committed (commit_count should be 2: initial + the auto-commit)
+    if [[ "$commit_count" -lt 2 ]]; then
+        echo "  FAIL: expected at least 2 commits (initial + auto), got ${commit_count}"
+        return 1
+    fi
+    assert_contains "$output" "not 'main'" "should warn about non-main branch" && \
+    # Push must NOT have been attempted (no remote configured, so we just
+    # verify the warning appears — if push were attempted, it would error out
+    # loudly since there's no remote, and rc would be non-zero)
+    return 0
+}
+
+# e. preflight_recipient_check refuses write when drift is detected.
+test_preflight_blocks_write_on_drift() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_doctor_sandbox "$sandbox"
+
+    # Encrypt a vault file with ONLY key A (drifted: .sops.yaml has A + B)
+    local sops_age_key
+    sops_age_key=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+    local pub_a
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+
+    local single_sops="${sandbox}/single.sops.yaml"
+    cat > "$single_sops" <<EOF
+creation_rules:
+  - path_regex: vault/.*\\.yaml\$
+    age: >-
+      ${pub_a}
+EOF
+
+    jq -n '{"test-key": "test-value"}' \
+        | SOPS_AGE_KEY="$sops_age_key" \
+          SOPS_CONFIG="$single_sops" \
+          sops encrypt \
+            --filename-override "${DOCTOR_SANDBOX_VAULT}/testcat.yaml" \
+            --input-type json --output-type yaml \
+            /dev/stdin > "${DOCTOR_SANDBOX_VAULT}/testcat.yaml" 2>/dev/null \
+        || { rm -rf "$sandbox"; echo "  SKIP (sops encrypt failed)"; return 0; }
+
+    # preflight_recipient_check should detect the drift and call die()
+    local output rc=0
+    output=$(
+        COFFER_ROOT="${sandbox}" \
+        COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
+        COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
+        COFFER_CONFIG_DIR="${DOCTOR_SANDBOX_CONFIG}" \
+        COFFER_SESSION_KEY="${DOCTOR_SANDBOX_CONFIG}/.session-key" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/doctor.sh"'"
+            # Override die so we can capture the error without sending ntfy
+            die() { echo "die: $*" >&2; exit 1; }
+            preflight_recipient_check
+        ' 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    if [[ $rc -eq 0 ]]; then
+        echo "  FAIL: preflight_recipient_check should have exited non-zero on a drifted vault"
+        return 1
+    fi
+    assert_contains "$output" "inconsistent" "error should mention inconsistency" && \
+    assert_contains "$output" "coffer doctor" "error should point the user to coffer doctor"
+}
+
 # --- Main ---
 
 main() {
@@ -1023,6 +1359,13 @@ main() {
     # Bug B regression: machine-name whitespace trimming must preserve internal spaces
     run_test test_onboard_whitespace_machine_name_internal_space
     run_test test_onboard_whitespace_machine_name_leading_trailing
+
+    # Doctor and auto-sync tests (feat/doctor-and-auto-sync, April 2026)
+    run_test test_doctor_clean_vault_exits_zero
+    run_test test_doctor_drifted_vault_exits_one
+    run_test test_auto_sync_push_disabled_by_env
+    run_test test_auto_sync_push_non_main_commits_only
+    run_test test_preflight_blocks_write_on_drift
 
     teardown_test_env
 

@@ -4,7 +4,7 @@
 
 Version: 1.0.0-draft
 Created: 2026-04-07
-Last significant revision: 2026-04-19 (single-source identity refactor)
+Last significant revision: 2026-04-24 (vault drift prevention: doctor + auto-sync)
 Status: Design
 
 ---
@@ -1078,6 +1078,66 @@ coffer add-recipient age1<paste-pubkey-here>
 
 Use the `onboard` / `finalize-onboard` flow for all other situations — it
 removes the SSH/Tailscale dependency from the bootstrap path.
+
+---
+
+## Vault Drift Prevention
+
+### The Problem
+
+Mutagen syncs file *content* between machines but does NOT sync git state. After the April 2026 SNAFU, it became clear that a vault can be "correct bytes on disk" on both machines while their git histories (and therefore their views of what `.sops.yaml` says) are diverged. Specifically:
+
+1. `sops updatekeys` can re-encrypt vault files with a different recipient list than what is currently committed in `config/.sops.yaml` on either machine.
+2. A subsequent `coffer set` or `add-recipient` on a machine with a stale view of `.sops.yaml` will use that stale list for all new encryptions, silently locking other machines out of the newly written entries.
+
+### The Fix: Two Complementary Mechanisms
+
+#### 1. `coffer doctor` (proactive audit)
+
+A read-only audit command that every operator should run before and after major vault operations. Exit 0 = all clear. Exit 1 = drift found.
+
+**Checks performed:**
+
+a. **Recipient list in `.sops.yaml`** - parses `config/.sops.yaml` and extracts the canonical age key list.
+
+b. **Identity consistency** - verifies this machine's `~/.config/coffer/public-key` appears in the canonical list. If not, this machine's `set` calls would be encrypting with keys it cannot decrypt.
+
+c. **Git state** - reports branch (auto-push is disabled off `main`), ahead/behind origin/main count, and uncommitted changes in `config/.sops.yaml` and `vault/` paths.
+
+d. **Vault file recipient drift** - for each SOPS-encrypted vault file, compares the recipient list embedded in the SOPS metadata block to the canonical `.sops.yaml` list. Any mismatch is reported as `[DRIFT]`.
+
+**Output format:**
+
+- Machine-parseable one-status-per-line format: `[OK]` or `[DRIFT]` prefix on every line.
+- ANSI color when stdout is a TTY; plain ASCII otherwise (safe for scripts and CI).
+- Summary footer: total files checked, drifted count, git state summary.
+
+#### 2. Auto-commit-and-push (reactive sync)
+
+Every state-modifying command (`set`, `edit`, `import`, `add-recipient`, `finalize-onboard`, `init`) calls `auto_sync_push` on success. This function:
+
+- Stages ONLY `config/.sops.yaml` and `vault/` (never the whole working tree).
+- Commits if anything changed, with a `coffer: <operation>` message.
+- Pushes to origin/main when on the `main` branch.
+- Logs a warning and commits locally only when on a non-main branch (no auto-push to feature branches).
+- Returns 0 on all non-fatal conditions (nothing to sync, git not found, not a git repo).
+- Returns 1 on push/commit failure with a remediation hint. The on-disk write is NOT rolled back — the secret is already stored locally, and rolling it back would be worse than the sync inconsistency.
+
+**Note on vault file git-tracking:** Encrypted vault YAML files are gitignored (they travel via Mutagen). `auto_sync_push` is primarily useful for `add-recipient` / `finalize-onboard` operations that modify `config/.sops.yaml` (which IS git-tracked). The `set`/`edit`/`import` calls will log "nothing to sync" for the vault file changes; this is correct and expected.
+
+**Escape hatch:** Set `COFFER_AUTO_SYNC=0` to disable all git operations (useful for CI runs, test sandboxes, and one-shot automation).
+
+#### 3. Preflight check on writes
+
+Before `coffer set` or `coffer edit` executes the write, a lightweight recipient consistency check samples one encrypted vault file and compares its embedded recipient list to `.sops.yaml`. If they differ, the write is aborted with:
+
+```
+coffer: error: vault state is inconsistent (.sops.yaml does not match vault file metadata in <file>)
+coffer:        Run 'coffer doctor' to see details and 'coffer add-recipient <key>' or
+coffer:        'coffer finalize-onboard' to reconcile before writing.
+```
+
+This prevents accumulating new secrets on top of an already-drifted vault.
 
 ---
 
