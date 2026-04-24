@@ -74,18 +74,24 @@ run_test() {
 setup_test_env() {
     TEST_DIR=$(mktemp -d)
     export COFFER_ROOT="${TEST_DIR}/coffer"
-    export COFFER_VAULT="${COFFER_ROOT}/vault"
+    # COFFER_VAULT_ROOT mimics the private vault repo (bryce-shashinka/coffer-vault)
+    # in tests. Both the vault data (vault/*.yaml) and the SOPS config live under
+    # COFFER_VAULT_ROOT, while COFFER_ROOT is only the tool code directory.
+    # Setting COFFER_VAULT_ROOT here prevents bin/coffer from falling back to the
+    # legacy in-repo layout or attempting to resolve ~/dev/coffer-vault on disk.
+    export COFFER_VAULT_ROOT="${TEST_DIR}/coffer-vault"
+    export COFFER_VAULT="${COFFER_VAULT_ROOT}/vault"
     export COFFER_CONFIG_DIR="${TEST_DIR}/config"
-    export COFFER_SOPS_CONFIG="${COFFER_ROOT}/config/.sops.yaml"
+    export COFFER_SOPS_CONFIG="${COFFER_VAULT_ROOT}/config/.sops.yaml"
     export COFFER_SESSION_KEY="${COFFER_CONFIG_DIR}/.session-key"
 
-    mkdir -p "${COFFER_ROOT}/lib" "${COFFER_ROOT}/config" "${COFFER_VAULT}" "${COFFER_CONFIG_DIR}"
+    mkdir -p "${COFFER_ROOT}/lib" "${COFFER_VAULT_ROOT}/config" "${COFFER_VAULT}" "${COFFER_CONFIG_DIR}"
 
     # Copy lib files from the real project
     local real_root
     real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
     cp "${real_root}"/lib/*.sh "${COFFER_ROOT}/lib/"
-    cp "${real_root}"/config/*.yaml "${COFFER_ROOT}/config/"
+    cp "${real_root}"/config/*.yaml "${COFFER_VAULT_ROOT}/config/"
 
     # Source common helpers
     # shellcheck source=../lib/common.sh
@@ -1008,16 +1014,20 @@ EOF
     chmod 600 "${config_dir}/.session-key"
 
     # NOTE: We do NOT initialize a git repo here. The doctor's git checks
-    # are skipped when COFFER_ROOT has no .git directory. Vault-drift tests
-    # focus on recipient set comparison, not git state. The auto_sync_push
+    # are skipped when COFFER_VAULT_ROOT has no .git directory. Vault-drift
+    # tests focus on recipient set comparison, not git state. The auto_sync_push
     # tests create their own git sandboxes independently.
 
-    # Export the three paths that callers need. Key files are accessed via
+    # Export the paths that callers need. Key files are accessed via
     # the `sandbox` variable in each test function body (no export needed since
     # the helper runs in the same shell scope, not a subshell).
     DOCTOR_SANDBOX_VAULT="$vault_dir"
     DOCTOR_SANDBOX_CONFIG="$config_dir"
     DOCTOR_SANDBOX_SOPS="$sops_config"
+    # DOCTOR_SANDBOX_ROOT is the directory that COFFER_VAULT_ROOT should point at
+    # in test subshells. The sandbox dir contains config/ and vault/ at the
+    # expected relative positions.
+    DOCTOR_SANDBOX_ROOT="$sandbox"
 }
 
 # a. coffer doctor on a clean vault exits 0 with correct output.
@@ -1046,6 +1056,7 @@ test_doctor_clean_vault_exits_zero() {
 
     local output rc=0
     output=$(
+        COFFER_VAULT_ROOT="${DOCTOR_SANDBOX_ROOT}" \
         COFFER_ROOT="${sandbox}" \
         COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
         COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
@@ -1111,6 +1122,7 @@ EOF
     # This is exactly the drift condition doctor must catch.
     local output rc=0
     output=$(
+        COFFER_VAULT_ROOT="${DOCTOR_SANDBOX_ROOT}" \
         COFFER_ROOT="${sandbox}" \
         COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
         COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
@@ -1141,7 +1153,9 @@ test_auto_sync_push_disabled_by_env() {
     local sandbox
     sandbox=$(mktemp -d)
 
-    # Init a git repo (needs to be a repo to test auto_sync_push behavior)
+    # Init a git repo (needs to be a repo to test auto_sync_push behavior).
+    # The sandbox acts as COFFER_VAULT_ROOT (the vault data repo), not COFFER_ROOT
+    # (the tool code repo). auto_sync_push now targets COFFER_VAULT_ROOT.
     git -C "$sandbox" init -q
     git -C "$sandbox" config user.email "test@test.local"
     git -C "$sandbox" config user.name "Test"
@@ -1156,6 +1170,7 @@ test_auto_sync_push_disabled_by_env() {
     local output rc=0
     output=$(
         COFFER_AUTO_SYNC=0 \
+        COFFER_VAULT_ROOT="$sandbox" \
         COFFER_ROOT="$sandbox" \
         COFFER_VAULT="${sandbox}/vault" \
         COFFER_NTFY_TOPIC="http://localhost:1/fake" \
@@ -1184,7 +1199,8 @@ test_auto_sync_push_non_main_commits_only() {
     local sandbox
     sandbox=$(mktemp -d)
 
-    # Set up a git repo on a non-main branch
+    # Set up a git repo on a non-main branch. The sandbox is COFFER_VAULT_ROOT
+    # (the vault data repo) -- auto_sync_push now targets COFFER_VAULT_ROOT.
     git -C "$sandbox" init -q
     git -C "$sandbox" config user.email "test@test.local"
     git -C "$sandbox" config user.name "Test"
@@ -1206,6 +1222,7 @@ SOPSEOF
     local output rc=0
     output=$(
         COFFER_AUTO_SYNC=1 \
+        COFFER_VAULT_ROOT="$sandbox" \
         COFFER_ROOT="$sandbox" \
         COFFER_VAULT="${sandbox}/vault" \
         COFFER_NTFY_TOPIC="http://localhost:1/fake" \
@@ -1274,6 +1291,7 @@ EOF
     # preflight_recipient_check should detect the drift and call die()
     local output rc=0
     output=$(
+        COFFER_VAULT_ROOT="${DOCTOR_SANDBOX_ROOT}" \
         COFFER_ROOT="${sandbox}" \
         COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
         COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
