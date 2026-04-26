@@ -111,10 +111,15 @@ Commands:
                                 vault/.pending-recipient-*.pub, call
                                 add-recipient for each, delete handled files.
                                 Run on an ALREADY-TRUSTED machine (Wiles).
-  sync-pull                     Pull latest vault changes from origin/main
-                                (git pull --ff-only). Use in SessionStart hooks
-                                to keep the vault current. Safe to run when
-                                the vault is already up to date.
+  refresh                       Pull latest vault changes from origin/main
+                                (git fetch + push any local-only commits, then
+                                pull --rebase). Pushes unpushed local commits
+                                before rebasing so diverged branches are never
+                                left in a deadlocked state. Use in SessionStart
+                                hooks to keep the vault current. Safe to run
+                                when the vault is already up to date.
+                                (alias: sync-pull — deprecated, prints a
+                                warning; existing scripts continue to work)
   doctor                        Read-only vault state audit. Checks that every
                                 encrypted vault file's recipient list matches
                                 config/.sops.yaml, that this machine's identity
@@ -144,8 +149,11 @@ version() {
     echo "coffer 1.0.0"
 }
 
-# sync_pull -- Pull latest vault changes from the vault repo origin/main.
-# Used by SessionStart hooks to ensure each session begins with a fresh vault.
+# cmd_refresh -- Pull latest vault changes from the vault repo origin/main.
+# This is the canonical user-facing name (primary alias: `coffer refresh`).
+# `coffer sync-pull` is a deprecated alias that prints a deprecation warning
+# and then calls this function so existing scripts and SessionStart hooks
+# continue to work without modification during the rollout period.
 #
 # Strategy (hardened April 2026):
 #   - Detects local commits not yet pushed (from a prior session that ended
@@ -155,9 +163,9 @@ version() {
 #     rather than causing a diverged-branch deadlock.
 #   - Rebase conflicts in encrypted vault files are NOT auto-resolvable.
 #     If the rebase fails, we abort it and die() loudly. The hook calling
-#     sync-pull will surface the error so the user sees it at session start
+#     refresh will surface the error so the user sees it at session start
 #     (far better than a silent stale vault).
-cmd_sync_pull() {
+cmd_refresh() {
     if ! command -v git >/dev/null 2>&1; then
         die "git not found on PATH: cannot sync vault"
     fi
@@ -169,8 +177,8 @@ cmd_sync_pull() {
     dirty=$(git -C "$COFFER_VAULT_ROOT" status --porcelain \
         -- config/.sops.yaml vault/ 2>/dev/null || echo "")
     if [[ -n "$dirty" ]]; then
-        warn "sync-pull: vault has uncommitted local changes; skipping pull"
-        warn "  commit or stash changes first, then re-run: coffer sync-pull"
+        warn "refresh: vault has uncommitted local changes; skipping pull"
+        warn "  commit or stash changes first, then re-run: coffer refresh"
         return 0
     fi
 
@@ -178,14 +186,14 @@ cmd_sync_pull() {
     local upstream
     upstream=$(git -C "$COFFER_VAULT_ROOT" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo "")
     if [[ -z "$upstream" ]]; then
-        warn "sync-pull: no upstream configured for vault repo; skipping pull"
+        warn "refresh: no upstream configured for vault repo; skipping pull"
         warn "  run: git -C ${COFFER_VAULT_ROOT} push -u origin main"
         return 0
     fi
 
     # Fetch first to get an accurate ahead/behind picture.
     git -C "$COFFER_VAULT_ROOT" fetch origin 2>/dev/null || {
-        warn "sync-pull: fetch from origin failed (offline?); using cached state"
+        warn "refresh: fetch from origin failed (offline?); using cached state"
     }
 
     # If there are local commits not yet on origin (prior session ended before
@@ -194,9 +202,9 @@ cmd_sync_pull() {
     local ahead
     ahead=$(git -C "$COFFER_VAULT_ROOT" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
     if [[ "$ahead" -gt 0 ]]; then
-        log "sync-pull: ${ahead} local commit(s) not yet pushed; pushing before pull"
+        log "refresh: ${ahead} local commit(s) not yet pushed; pushing before pull"
         if ! git -C "$COFFER_VAULT_ROOT" push 2>/dev/null; then
-            warn "sync-pull: push of ${ahead} local commit(s) failed"
+            warn "refresh: push of ${ahead} local commit(s) failed"
             warn "  resolve manually: git -C ${COFFER_VAULT_ROOT} push"
         fi
     fi
@@ -204,7 +212,7 @@ cmd_sync_pull() {
     local behind
     behind=$(git -C "$COFFER_VAULT_ROOT" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
     if [[ "$behind" -eq 0 ]]; then
-        log "sync-pull: vault is up to date with origin"
+        log "refresh: vault is up to date with origin"
         return 0
     fi
 
@@ -216,25 +224,34 @@ cmd_sync_pull() {
         | sed 's|^[^/]*/||')
     remote_branch="${remote_branch:-main}"
 
-    log "sync-pull: ${behind} commit(s) behind origin/${remote_branch} -- pulling"
+    log "refresh: ${behind} commit(s) behind origin/${remote_branch} -- pulling"
 
     # Use --rebase so that if a local commit somehow exists alongside remote
     # commits (unusual but possible), it rides on top cleanly instead of
     # producing a merge commit or a ff-only refusal.
     local pull_output
     if pull_output=$(git -C "$COFFER_VAULT_ROOT" pull --rebase origin "$remote_branch" 2>&1); then
-        log "sync-pull: synced ${behind} commit(s) from origin/${remote_branch}"
+        log "refresh: synced ${behind} commit(s) from origin/${remote_branch}"
     else
         # Rebase conflict in an encrypted vault file: auto-resolution is
         # dangerous (conflict markers inside SOPS YAML corrupt the file).
         # Abort the rebase and surface the error loudly.
         git -C "$COFFER_VAULT_ROOT" rebase --abort 2>/dev/null || true
-        die "sync-pull: pull --rebase failed (conflict in encrypted vault?):
+        die "refresh: pull --rebase failed (conflict in encrypted vault?):
 ${pull_output}
 coffer:  Manual resolution required. Run:
 coffer:    git -C ${COFFER_VAULT_ROOT} status
 coffer:  Then inspect and resolve conflicting files before retrying."
     fi
+}
+
+# cmd_sync_pull -- Deprecated alias for cmd_refresh.
+# Prints a one-line deprecation notice on stderr so users know to update
+# scripts, then delegates to cmd_refresh unchanged. `sync-pull` will continue
+# to work indefinitely; removal requires a separate explicit decision.
+cmd_sync_pull() {
+    echo "coffer: 'sync-pull' is deprecated; use 'coffer refresh' instead" >&2
+    cmd_refresh "$@"
 }
 
 # Require at least one argument
@@ -341,7 +358,11 @@ case "$command" in
         cmd_finalize_onboard "$@"
         auto_sync_push "finalize-onboard"
         ;;
+    refresh)
+        cmd_refresh "$@"
+        ;;
     sync-pull)
+        # Deprecated alias for `refresh`. Prints a warning and delegates.
         cmd_sync_pull "$@"
         ;;
     doctor)
