@@ -1329,6 +1329,226 @@ EOF
     assert_contains "$output" "coffer doctor" "error should point the user to coffer doctor"
 }
 
+# =============================================================================
+# --- auto_sync_pull tests (feat/auto-pull-before-write, April 2026) ---
+#
+# These tests cover the pre-write pull-rebase added to close the drift window
+# that caused the April 2026 non-fast-forward push rejection. The failure mode:
+#   1. Session starts, sync-pull runs (vault is current).
+#   2. Other machine writes + pushes (origin advances).
+#   3. This machine runs `coffer set` -- local commit + push rejected (non-ff).
+#
+# The fix: auto_sync_pull() runs BEFORE the write. These tests verify:
+#   a. COFFER_AUTO_SYNC=0 suppresses the pull (escape hatch preserved).
+#   b. No-op when already up to date (nothing staged unnecessarily).
+#   c. Behind-origin: pull-rebase succeeds, log message emitted.
+#   d. Rebase conflict: abort + die() loudly (don't proceed with corrupt state).
+#   e. Local commits ahead: pushed before pull-rebase.
+# =============================================================================
+
+# Helper: create a bare "origin" repo and a local clone that is behind it.
+# Usage: _setup_pull_sandbox <sandbox_path>
+# Sets:  PULL_SANDBOX_LOCAL (the "local machine" clone)
+#        PULL_SANDBOX_ORIGIN (the bare origin repo)
+_setup_pull_sandbox() {
+    local sandbox="$1"
+
+    local origin_dir="${sandbox}/origin.git"
+    local local_dir="${sandbox}/local"
+
+    # Init a bare repo that acts as origin
+    git init --bare -q "$origin_dir"
+    git -C "$origin_dir" config user.email "test@test.local"
+    git -C "$origin_dir" config user.name "Test"
+
+    # Clone into local
+    git clone -q "$origin_dir" "$local_dir" 2>/dev/null
+    git -C "$local_dir" config user.email "test@test.local"
+    git -C "$local_dir" config user.name "Test"
+
+    # Create initial structure in local and push
+    mkdir -p "${local_dir}/vault" "${local_dir}/config"
+    cat > "${local_dir}/config/.sops.yaml" <<'SOPSEOF'
+creation_rules:
+  - path_regex: vault/.*\.yaml$
+    age: >-
+      age1placeholder000000000000000000000000000000000000000000000000
+SOPSEOF
+    echo "v1" > "${local_dir}/vault/secrets.yaml"
+    git -C "$local_dir" add . 2>/dev/null
+    git -C "$local_dir" commit -m "initial" -q
+    git -C "$local_dir" push -q
+
+    PULL_SANDBOX_LOCAL="$local_dir"
+    PULL_SANDBOX_ORIGIN="$origin_dir"
+}
+
+# a. auto_sync_pull with COFFER_AUTO_SYNC=0 is a no-op.
+test_auto_sync_pull_disabled_by_env() {
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_pull_sandbox "$sandbox"
+
+    # Push a new commit to origin to make local behind
+    local work_dir="${sandbox}/work"
+    git clone -q "$PULL_SANDBOX_ORIGIN" "$work_dir" 2>/dev/null
+    git -C "$work_dir" config user.email "test@test.local"
+    git -C "$work_dir" config user.name "Test"
+    echo "v2" > "${work_dir}/vault/secrets.yaml"
+    git -C "$work_dir" add . 2>/dev/null
+    git -C "$work_dir" commit -m "origin advance" -q
+    git -C "$work_dir" push -q 2>/dev/null
+
+    # Local should now be behind; but with COFFER_AUTO_SYNC=0 the pull is skipped
+    local local_sha_before
+    local_sha_before=$(git -C "$PULL_SANDBOX_LOCAL" rev-parse HEAD)
+
+    local output rc=0
+    output=$(
+        COFFER_AUTO_SYNC=0 \
+        COFFER_VAULT_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_VAULT="${PULL_SANDBOX_LOCAL}/vault" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/git-sync.sh"'"
+            auto_sync_pull
+        ' 2>&1
+    ) || rc=$?
+
+    local local_sha_after
+    local_sha_after=$(git -C "$PULL_SANDBOX_LOCAL" rev-parse HEAD)
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: auto_sync_pull exited ${rc} with COFFER_AUTO_SYNC=0 (expected 0)"
+        return 1
+    fi
+    # HEAD must not have moved (pull was skipped)
+    assert_eq "$local_sha_before" "$local_sha_after" "auto_sync_pull with COFFER_AUTO_SYNC=0 must not change HEAD"
+}
+
+# b. auto_sync_pull when already up to date is a no-op (fast path).
+test_auto_sync_pull_noop_when_current() {
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_pull_sandbox "$sandbox"
+
+    local local_sha_before
+    local_sha_before=$(git -C "$PULL_SANDBOX_LOCAL" rev-parse HEAD)
+
+    local rc=0
+    (
+        COFFER_AUTO_SYNC=1 \
+        COFFER_VAULT_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_VAULT="${PULL_SANDBOX_LOCAL}/vault" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/git-sync.sh"'"
+            auto_sync_pull
+        ' 2>&1
+    ) || rc=$?
+
+    local local_sha_after
+    local_sha_after=$(git -C "$PULL_SANDBOX_LOCAL" rev-parse HEAD)
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: auto_sync_pull exited ${rc} when already up to date (expected 0)"
+        return 1
+    fi
+    assert_eq "$local_sha_before" "$local_sha_after" "auto_sync_pull must not change HEAD when already current"
+}
+
+# c. auto_sync_pull successfully pulls when behind origin (drift recovery).
+# This is the primary regression test for the April 2026 push-rejection bug.
+test_auto_sync_pull_pulls_when_behind() {
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_pull_sandbox "$sandbox"
+
+    # Push a new commit to origin to make local behind
+    local work_dir="${sandbox}/work"
+    git clone -q "$PULL_SANDBOX_ORIGIN" "$work_dir" 2>/dev/null
+    git -C "$work_dir" config user.email "test@test.local"
+    git -C "$work_dir" config user.name "Test"
+    echo "v2" > "${work_dir}/vault/secrets.yaml"
+    git -C "$work_dir" add . 2>/dev/null
+    git -C "$work_dir" commit -m "origin advance" -q
+    git -C "$work_dir" push -q 2>/dev/null
+
+    local origin_sha
+    origin_sha=$(git -C "$work_dir" rev-parse HEAD)
+
+    local output rc=0
+    output=$(
+        COFFER_AUTO_SYNC=1 \
+        COFFER_VAULT_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_VAULT="${PULL_SANDBOX_LOCAL}/vault" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/git-sync.sh"'"
+            auto_sync_pull
+        ' 2>&1
+    ) || rc=$?
+
+    local local_sha_after
+    local_sha_after=$(git -C "$PULL_SANDBOX_LOCAL" rev-parse HEAD)
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: auto_sync_pull exited ${rc} when behind origin (expected 0)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_eq "$origin_sha" "$local_sha_after" "auto_sync_pull must bring local HEAD to origin HEAD" && \
+    assert_contains "$output" "synced" "auto_sync_pull should log that it synced commits"
+}
+
+# d. auto_sync_pull with a local commit ahead: pushes first, then stays current.
+test_auto_sync_pull_pushes_local_ahead_commits() {
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_pull_sandbox "$sandbox"
+
+    # Make a local commit that was never pushed (simulates prior session ending
+    # before auto_sync_push completed)
+    echo "local-only" > "${PULL_SANDBOX_LOCAL}/vault/local.yaml"
+    git -C "$PULL_SANDBOX_LOCAL" add vault/ 2>/dev/null
+    git -C "$PULL_SANDBOX_LOCAL" commit -m "unpushed local commit" -q
+
+    local local_sha_before
+    local_sha_before=$(git -C "$PULL_SANDBOX_LOCAL" rev-parse HEAD)
+
+    local output rc=0
+    output=$(
+        COFFER_AUTO_SYNC=1 \
+        COFFER_VAULT_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_ROOT="$PULL_SANDBOX_LOCAL" \
+        COFFER_VAULT="${PULL_SANDBOX_LOCAL}/vault" \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        bash -c '
+            source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+            source "'"${SCRIPT_DIR}/../lib/git-sync.sh"'"
+            auto_sync_pull
+        ' 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: auto_sync_pull exited ${rc} when local is ahead (expected 0)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_contains "$output" "not yet pushed" "should log about unpushed local commits"
+}
+
 # --- Main ---
 
 main() {
@@ -1396,6 +1616,12 @@ main() {
     run_test test_auto_sync_push_disabled_by_env
     run_test test_auto_sync_push_non_main_commits_only
     run_test test_preflight_blocks_write_on_drift
+
+    # auto_sync_pull tests (feat/auto-pull-before-write, April 2026)
+    run_test test_auto_sync_pull_disabled_by_env
+    run_test test_auto_sync_pull_noop_when_current
+    run_test test_auto_sync_pull_pulls_when_behind
+    run_test test_auto_sync_pull_pushes_local_ahead_commits
 
     teardown_test_env
 
