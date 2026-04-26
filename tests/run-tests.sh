@@ -1623,6 +1623,10 @@ main() {
     run_test test_auto_sync_pull_pulls_when_behind
     run_test test_auto_sync_pull_pushes_local_ahead_commits
 
+    # refresh command + sync-pull alias tests (feat/coffer-refresh-command, April 2026)
+    run_test test_refresh_command_works
+    run_test test_sync_pull_alias_prints_deprecation
+
     teardown_test_env
 
     echo ""
@@ -1639,6 +1643,59 @@ main() {
         echo "ALL TESTS PASSED"
         exit 0
     fi
+}
+
+# --- refresh command and sync-pull alias tests ---
+#
+# These tests drive the real `bin/coffer` dispatcher (not lib functions directly)
+# so they verify the routing layer, not just the underlying cmd_refresh logic.
+# The heavy sync-pull behavioural tests (dirty tree, ahead/behind, rebase) are
+# already covered by the auto_sync_pull test group above.
+
+# e. `coffer refresh` routes correctly and exits 0 when vault is up to date.
+test_refresh_command_works() {
+    # Use SCRIPT_DIR to find the real bin/coffer regardless of COFFER_ROOT
+    # overrides set by setup_test_env. SCRIPT_DIR points at tests/, so ../bin/coffer
+    # is the real binary.
+    local real_coffer="${SCRIPT_DIR}/../bin/coffer"
+    local sandbox
+    sandbox=$(mktemp -d)
+    # Create a minimal bare origin and a local clone to satisfy the vault resolver.
+    git init --bare "${sandbox}/origin.git" -q
+    git -C "${sandbox}/origin.git" symbolic-ref HEAD refs/heads/main
+    git clone "${sandbox}/origin.git" "${sandbox}/local" -q 2>/dev/null
+
+    local output rc=0
+    output=$(
+        COFFER_VAULT_ROOT="${sandbox}/local" \
+        "$real_coffer" refresh 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    assert_eq 0 "$rc" "coffer refresh should exit 0 when vault is up to date" && \
+    assert_contains "$output" "up to date" "coffer refresh should report vault is up to date"
+}
+
+# f. `coffer sync-pull` still works (deprecated alias) and prints a warning.
+test_sync_pull_alias_prints_deprecation() {
+    local real_coffer="${SCRIPT_DIR}/../bin/coffer"
+    local sandbox
+    sandbox=$(mktemp -d)
+    git init --bare "${sandbox}/origin.git" -q
+    git -C "${sandbox}/origin.git" symbolic-ref HEAD refs/heads/main
+    git clone "${sandbox}/origin.git" "${sandbox}/local" -q 2>/dev/null
+
+    local output rc=0
+    output=$(
+        COFFER_VAULT_ROOT="${sandbox}/local" \
+        "$real_coffer" sync-pull 2>&1
+    ) || rc=$?
+
+    rm -rf "$sandbox"
+
+    assert_eq 0 "$rc" "coffer sync-pull (alias) should exit 0 when vault is up to date" && \
+    assert_contains "$output" "deprecated" "coffer sync-pull should print a deprecation warning"
 }
 
 main "$@"
