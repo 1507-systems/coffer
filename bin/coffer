@@ -146,7 +146,17 @@ version() {
 
 # sync_pull -- Pull latest vault changes from the vault repo origin/main.
 # Used by SessionStart hooks to ensure each session begins with a fresh vault.
-# Runs git pull --ff-only to avoid silent merge commits on the vault data.
+#
+# Strategy (hardened April 2026):
+#   - Detects local commits not yet pushed (from a prior session that ended
+#     before auto_sync_push completed) and pushes them first.
+#   - Uses --rebase instead of --ff-only so that if the vault somehow has a
+#     local-only commit AND origin has advanced, the local commit rides on top
+#     rather than causing a diverged-branch deadlock.
+#   - Rebase conflicts in encrypted vault files are NOT auto-resolvable.
+#     If the rebase fails, we abort it and die() loudly. The hook calling
+#     sync-pull will surface the error so the user sees it at session start
+#     (far better than a silent stale vault).
 cmd_sync_pull() {
     if ! command -v git >/dev/null 2>&1; then
         die "git not found on PATH: cannot sync vault"
@@ -173,14 +183,57 @@ cmd_sync_pull() {
         return 0
     fi
 
-    if git -C "$COFFER_VAULT_ROOT" pull --ff-only origin main 2>/dev/null; then
-        log "sync-pull: vault is up to date with origin/main"
+    # Fetch first to get an accurate ahead/behind picture.
+    git -C "$COFFER_VAULT_ROOT" fetch origin 2>/dev/null || {
+        warn "sync-pull: fetch from origin failed (offline?); using cached state"
+    }
+
+    # If there are local commits not yet on origin (prior session ended before
+    # push completed), push them now before the pull-rebase so origin/main
+    # includes our previous work before we integrate new remote commits.
+    local ahead
+    ahead=$(git -C "$COFFER_VAULT_ROOT" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+    if [[ "$ahead" -gt 0 ]]; then
+        log "sync-pull: ${ahead} local commit(s) not yet pushed; pushing before pull"
+        if ! git -C "$COFFER_VAULT_ROOT" push 2>/dev/null; then
+            warn "sync-pull: push of ${ahead} local commit(s) failed"
+            warn "  resolve manually: git -C ${COFFER_VAULT_ROOT} push"
+        fi
+    fi
+
+    local behind
+    behind=$(git -C "$COFFER_VAULT_ROOT" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+    if [[ "$behind" -eq 0 ]]; then
+        log "sync-pull: vault is up to date with origin"
+        return 0
+    fi
+
+    # Resolve the remote branch name from the tracked upstream (e.g., origin/main
+    # -> "main"). Avoids hardcoding "main" in case the vault repo uses a
+    # different default branch name.
+    local remote_branch
+    remote_branch=$(git -C "$COFFER_VAULT_ROOT" rev-parse --abbrev-ref '@{u}' 2>/dev/null \
+        | sed 's|^[^/]*/||')
+    remote_branch="${remote_branch:-main}"
+
+    log "sync-pull: ${behind} commit(s) behind origin/${remote_branch} -- pulling"
+
+    # Use --rebase so that if a local commit somehow exists alongside remote
+    # commits (unusual but possible), it rides on top cleanly instead of
+    # producing a merge commit or a ff-only refusal.
+    local pull_output
+    if pull_output=$(git -C "$COFFER_VAULT_ROOT" pull --rebase origin "$remote_branch" 2>&1); then
+        log "sync-pull: synced ${behind} commit(s) from origin/${remote_branch}"
     else
-        # --ff-only refuses if the local branch has diverged from origin/main.
-        # This should not happen on the vault repo (no one edits it outside of
-        # coffer commands), but surface it loudly instead of silently skipping.
-        warn "sync-pull: pull --ff-only failed; vault may have diverged from origin/main"
-        warn "  inspect manually: git -C ${COFFER_VAULT_ROOT} status"
+        # Rebase conflict in an encrypted vault file: auto-resolution is
+        # dangerous (conflict markers inside SOPS YAML corrupt the file).
+        # Abort the rebase and surface the error loudly.
+        git -C "$COFFER_VAULT_ROOT" rebase --abort 2>/dev/null || true
+        die "sync-pull: pull --rebase failed (conflict in encrypted vault?):
+${pull_output}
+coffer:  Manual resolution required. Run:
+coffer:    git -C ${COFFER_VAULT_ROOT} status
+coffer:  Then inspect and resolve conflicting files before retrying."
     fi
 }
 
@@ -202,6 +255,11 @@ case "$command" in
     set)
         # shellcheck source=../lib/set.sh
         source "${COFFER_ROOT}/lib/set.sh"
+        # Pull-rebase from origin BEFORE the write so that if origin advanced
+        # since SessionStart (the other machine pushed in the interim), we
+        # incorporate those commits first. This eliminates the drift window
+        # that caused the April 2026 non-fast-forward push rejection on Verve.
+        auto_sync_pull
         # Run preflight drift check before any write. If .sops.yaml and vault
         # file recipients are out of sync, the write is aborted with a clear
         # error pointing to `coffer doctor`. This prevents accumulating new
@@ -221,6 +279,10 @@ case "$command" in
     edit)
         # shellcheck source=../lib/edit.sh
         source "${COFFER_ROOT}/lib/edit.sh"
+        # Pull-rebase before opening the editor for the same reason as `set`:
+        # if origin advanced since SessionStart, get those commits before we
+        # write to avoid a post-edit push rejection.
+        auto_sync_pull
         # Run preflight drift check before opening the editor. If recipients
         # are drifted, the edit is aborted before SOPS tries to decrypt.
         preflight_recipient_check
@@ -231,6 +293,8 @@ case "$command" in
     import)
         # shellcheck source=../lib/import.sh
         source "${COFFER_ROOT}/lib/import.sh"
+        # Pull-rebase before a bulk import for the same reason as `set`.
+        auto_sync_pull
         cmd_import "$@"
         # Commit using the CSV basename so the history shows which file was imported.
         # `local` is not valid at top-level script scope (only inside functions),

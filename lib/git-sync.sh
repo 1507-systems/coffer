@@ -31,6 +31,137 @@
 # command. Never executed directly.
 set -euo pipefail
 
+# auto_sync_pull
+#
+# Fetches and rebases the vault repo from origin/main BEFORE a vault write.
+# This closes the drift window that caused the April 2026 push-rejection bug:
+# if origin advanced between SessionStart and the current write (because the
+# other machine pushed in the interim), a plain `coffer set` would commit
+# locally and then fail with "non-fast-forward" on push.
+#
+# Walk:
+#   1. Skip entirely if COFFER_AUTO_SYNC=0 (test / CI escape hatch).
+#   2. Skip if the vault root is not a git repo (non-git vault setups).
+#   3. Skip if no upstream is configured (fresh vault, no remote yet).
+#   4. git fetch origin (quiet).
+#   5. Check if behind: if local == origin, nothing to do.
+#   6. Check for LOCAL commits not yet pushed (ahead of origin). Push them
+#      first so the rebase has a clean base. This handles "prior session ended
+#      before push completed" gracefully.
+#   7. git pull --rebase origin main.
+#      If the rebase produces conflicts (extremely rare on an encrypted vault —
+#      conflicts in binary-style SOPS YAML are not auto-resolvable), we ABORT
+#      and die() loudly. The write must not proceed on top of a broken state.
+#   8. Log how many new commits arrived, if any.
+#
+# Returns:
+#   0   -- success (vault is at or ahead of origin after the operation)
+#   non-zero -- rebase conflict or unexpected git error (die() called)
+auto_sync_pull() {
+    # Escape hatch: operator or test harness wants no git ops.
+    if [[ "${COFFER_AUTO_SYNC:-1}" == "0" ]]; then
+        return 0
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        # git unavailable: let the write proceed without a pre-pull. The push
+        # step will catch the divergence later (and warn loudly).
+        return 0
+    fi
+
+    local repo_root="${COFFER_VAULT_ROOT:-}"
+    if [[ -z "$repo_root" ]]; then
+        repo_root="${COFFER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    fi
+
+    # Not a git repo: skip silently (preserves behavior for non-git vault setups).
+    if [[ ! -d "${repo_root}/.git" ]]; then
+        return 0
+    fi
+
+    # No upstream configured: nothing to pull from. This is normal for a
+    # fresh vault before the first push, so warn rather than die.
+    local upstream
+    upstream=$(git -C "$repo_root" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo "")
+    if [[ -z "$upstream" ]]; then
+        return 0
+    fi
+
+    # Fetch quietly. Network errors are non-fatal: a transient outage should
+    # not block a write. We log a warning so the user knows origin wasn't reached.
+    if ! git -C "$repo_root" fetch origin 2>/dev/null; then
+        warn "auto-sync: fetch from origin failed (offline?) -- skipping pre-write pull"
+        warn "  if origin has advanced, the push after write may be rejected"
+        return 0
+    fi
+
+    # Check if there are local commits not yet on origin. If so, push them
+    # first so that the rebase base (origin/main) includes our previous work.
+    # This handles the "prior session ended before push completed" case.
+    local ahead
+    ahead=$(git -C "$repo_root" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+    if [[ "$ahead" -gt 0 ]]; then
+        log "auto-sync: ${ahead} local commit(s) not yet pushed; pushing before pull-rebase"
+        local current_branch
+        current_branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+        if [[ "$current_branch" == "main" ]]; then
+            if ! git -C "$repo_root" push 2>/dev/null; then
+                warn "auto-sync: push of unpushed local commits failed"
+                warn "  continuing with pull-rebase; manual push may be needed"
+            fi
+        fi
+    fi
+
+    # Check how many commits we are behind origin after the fetch.
+    local behind
+    behind=$(git -C "$repo_root" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+    if [[ "$behind" -eq 0 ]]; then
+        # Already up to date -- no rebase needed.
+        return 0
+    fi
+
+    log "auto-sync: ${behind} commit(s) behind origin -- pulling before write"
+
+    # Pull with rebase. --autostash is NOT used here intentionally: vault files
+    # are SOPS-encrypted and any autostash pop that hits a conflict would produce
+    # a corrupt or partially-merged encrypted file. Instead, we check for a dirty
+    # working tree first and abort if one exists.
+    local dirty
+    dirty=$(git -C "$repo_root" status --porcelain -- config/.sops.yaml vault/ 2>/dev/null || echo "")
+    if [[ -n "$dirty" ]]; then
+        die "auto-sync: cannot pull before write -- vault has uncommitted local changes:
+${dirty}
+coffer:  Commit or reset these changes first (e.g., run 'coffer doctor' to inspect).
+coffer:  Then retry your command."
+    fi
+
+    # Resolve which remote branch to pull from. We use the tracked upstream
+    # (e.g., origin/main) and strip the remote prefix to get just the branch
+    # name (e.g., "main"). This avoids hardcoding "main" and works correctly
+    # even when the repo uses "master" or a custom default branch name.
+    local remote_branch
+    remote_branch=$(git -C "$repo_root" rev-parse --abbrev-ref '@{u}' 2>/dev/null \
+        | sed 's|^[^/]*/||')
+    # Fallback to "main" if we somehow can't derive it (belt-and-suspenders).
+    remote_branch="${remote_branch:-main}"
+
+    # Run the rebase. Capture output so we can surface it on failure.
+    local pull_output
+    if ! pull_output=$(git -C "$repo_root" pull --rebase origin "$remote_branch" 2>&1); then
+        # Abort the in-progress rebase to leave the repo in a clean state.
+        git -C "$repo_root" rebase --abort 2>/dev/null || true
+        die "auto-sync: pull --rebase failed (conflict in encrypted vault?):
+${pull_output}
+coffer:  This requires manual resolution. Run:
+coffer:    git -C ${repo_root} status
+coffer:    git -C ${repo_root} rebase --abort   (if not already done)
+coffer:  Then inspect the conflicting files and re-run your command."
+    fi
+
+    log "auto-sync: synced ${behind} commit(s) from origin before write"
+    return 0
+}
+
 # auto_sync_push <commit-message>
 #
 # Stages ONLY config/.sops.yaml and vault/ in the VAULT REPO (never the whole
