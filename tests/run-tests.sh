@@ -1551,6 +1551,654 @@ test_auto_sync_pull_pushes_local_ahead_commits() {
 
 # --- Main ---
 
+# --- Delete command tests (feat/delete-command, May 2026) ---
+#
+# cmd_delete is tested via real age/sops when both tools are installed, and with
+# a set of error-path unit tests that stub out the heavy crypto helpers (same
+# pattern as the set/get error-path tests above). The SKIP guard mirrors the
+# set recipient-preservation tests.
+
+test_delete_removes_key() {
+    # Happy path: set a key, then delete it; confirm the key is gone but other
+    # keys in the same category survive.
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/key.txt" 2>/dev/null
+    local pub_key
+    pub_key=$(grep "public key" "${sandbox}/key.txt" | awk '{print $4}')
+    local secret_key
+    secret_key=$(grep "^AGE-SECRET-KEY-" "${sandbox}/key.txt")
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_key}
+EOF
+
+    # Create an initial vault file with two keys using cmd_set.
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/testcat.yaml"
+        export COFFER_CATEGORY="testcat"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set testcat/to-delete "gone"
+        cmd_set testcat/to-keep   "stays"
+    ) || { rm -rf "$sandbox"; echo "  FAIL: setup step failed"; return 1; }
+
+    # Now delete one key, keeping the other.
+    local rc=0
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/testcat.yaml"
+        export COFFER_CATEGORY="testcat"
+        export COFFER_KEY="to-delete"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/delete.sh"
+        cmd_delete testcat/to-delete --yes
+    ) || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        rm -rf "$sandbox"
+        echo "  FAIL: cmd_delete returned exit code ${rc}"
+        return 1
+    fi
+
+    # Verify the deleted key is absent and the surviving key still decrypts.
+    local has_to_delete has_to_keep
+    has_to_delete=$(SOPS_AGE_KEY="$secret_key" sops decrypt --output-type json \
+        "${sandbox}/vault/testcat.yaml" 2>/dev/null | jq 'has("to-delete")')
+    has_to_keep=$(SOPS_AGE_KEY="$secret_key" sops decrypt --output-type json \
+        "${sandbox}/vault/testcat.yaml" 2>/dev/null | jq 'has("to-keep")')
+    rm -rf "$sandbox"
+
+    assert_eq "false" "$has_to_delete" "deleted key must not exist after delete" && \
+    assert_eq "true"  "$has_to_keep"   "surviving key must still be present after delete"
+}
+
+test_delete_preserves_recipients() {
+    # Regression guard: deleting a key must re-encrypt with ALL recipients from
+    # .sops.yaml, not just the writing machine's key (same class of bug that
+    # caused the April 2026 lockout in cmd_set).
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/keyA.txt" 2>/dev/null
+    age-keygen -o "${sandbox}/keyB.txt" 2>/dev/null
+    local pub_a pub_b
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    pub_b=$(grep "public key" "${sandbox}/keyB.txt" | awk '{print $4}')
+    local secret_a secret_b
+    secret_a=$(grep "^AGE-SECRET-KEY-" "${sandbox}/keyA.txt")
+    secret_b=$(grep "^AGE-SECRET-KEY-" "${sandbox}/keyB.txt")
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_a},${pub_b}
+EOF
+
+    # Seed the vault with two keys using key A.
+    (
+        export SOPS_AGE_KEY="$secret_a"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/multi.yaml"
+        export COFFER_CATEGORY="multi"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set multi/keep-me "value"
+        cmd_set multi/drop-me "old"
+    ) || { rm -rf "$sandbox"; echo "  FAIL: setup step failed"; return 1; }
+
+    # Delete one key using key A. The surviving file must still be decryptable
+    # by key B (proving the recipient list was not stripped).
+    (
+        export SOPS_AGE_KEY="$secret_a"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/multi.yaml"
+        export COFFER_CATEGORY="multi"
+        export COFFER_KEY="drop-me"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/delete.sh"
+        cmd_delete multi/drop-me --yes
+    ) || { rm -rf "$sandbox"; echo "  FAIL: delete step failed"; return 1; }
+
+    # Key B must still be able to decrypt the surviving key.
+    local rc=0
+    SOPS_AGE_KEY="$secret_b" sops decrypt --extract '["keep-me"]' \
+        "${sandbox}/vault/multi.yaml" >/dev/null 2>&1 || rc=$?
+
+    local recipient_count
+    recipient_count=$(grep -c "recipient:" "${sandbox}/vault/multi.yaml" 2>/dev/null || echo 0)
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: key B locked out after delete (recipient stripped)"
+        return 1
+    fi
+    assert_eq "2" "$recipient_count" "delete must preserve both recipients in the re-encrypted file"
+}
+
+test_delete_missing_key_fails() {
+    # Attempting to delete a key that does not exist must exit non-zero with a
+    # clear error message. Silent success on a no-op delete is a footgun for
+    # automation scripts that expect deletion to be idempotent.
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/key.txt" 2>/dev/null
+    local pub_key secret_key
+    pub_key=$(grep "public key" "${sandbox}/key.txt" | awk '{print $4}')
+    secret_key=$(grep "^AGE-SECRET-KEY-" "${sandbox}/key.txt")
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_key}
+EOF
+
+    # Create a category with one key so the category file exists.
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/cat.yaml"
+        export COFFER_CATEGORY="cat"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set cat/existing "value"
+    ) || { rm -rf "$sandbox"; echo "  FAIL: setup step failed"; return 1; }
+
+    local output rc=0
+    output=$(
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/cat.yaml"
+        export COFFER_CATEGORY="cat"
+        export COFFER_KEY="nonexistent"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/delete.sh"
+        cmd_delete cat/nonexistent --yes 2>&1
+    ) || rc=$?
+    rm -rf "$sandbox"
+
+    if [[ $rc -eq 0 ]]; then
+        echo "  FAIL: expected non-zero exit when key is absent, got 0"
+        return 1
+    fi
+    assert_contains "$output" "not found" "error must mention 'not found' when key is absent"
+}
+
+test_delete_missing_category_fails() {
+    # A missing category file must produce a non-zero exit and a clear error
+    # (not a sops decrypt crash). This test does not need real crypto.
+    setup_test_env
+    seed_fake_identity
+    # shellcheck source=../lib/delete.sh
+    source "${COFFER_ROOT}/lib/delete.sh"
+
+    local output rc=0
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+             SOPS_AGE_KEY="AGE-SECRET-KEY-fake" \
+             cmd_delete "nocat/somekey" --yes 2>&1) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        echo "  FAIL: expected non-zero exit for missing category, got 0"
+        return 1
+    fi
+    assert_contains "$output" "not found" "error must mention category 'not found'"
+}
+
+test_delete_no_args_fails() {
+    # Calling cmd_delete with no arguments must exit non-zero with usage text.
+    setup_test_env
+    # shellcheck source=../lib/delete.sh
+    source "${COFFER_ROOT}/lib/delete.sh"
+    local output rc=0
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+             cmd_delete 2>&1) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        echo "  FAIL: expected non-zero exit when called with no args, got 0"
+        return 1
+    fi
+    assert_contains "$output" "Usage" "no-args error must show usage"
+}
+
+test_delete_unknown_flag_fails() {
+    setup_test_env
+    # shellcheck source=../lib/delete.sh
+    source "${COFFER_ROOT}/lib/delete.sh"
+    local output rc=0
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+             cmd_delete "cat/key" --no-such-flag 2>&1) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        echo "  FAIL: expected non-zero exit for unknown flag, got 0"
+        return 1
+    fi
+    assert_contains "$output" "Unknown flag" "unknown-flag error must name the bad flag"
+}
+
+test_delete_routed_by_dispatcher() {
+    # Structural test: the bin/coffer dispatcher must route `coffer delete` to
+    # cmd_delete (i.e., not fall through to "Unknown command"). We verify by
+    # calling the real binary with a missing category -- the error from
+    # cmd_delete ("not found") differs from the dispatcher's "Unknown command"
+    # error, proving the route was found.
+    local real_coffer
+    real_coffer="$(cd "${SCRIPT_DIR}/.." && pwd)/bin/coffer"
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    # A minimal vault root with no vault files -- cmd_delete will die with
+    # "Category ... not found" before it ever touches sops.
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<'SOPSEOF'
+creation_rules:
+  - path_regex: vault/.*\.yaml$
+    age: >-
+      age1placeholder000000000000000000000000000000000000000000000000
+SOPSEOF
+
+    local config_dir="${sandbox}/.coffer-config"
+    mkdir -p "$config_dir"
+    printf 'AGE-SECRET-KEY-FAKETESTFAKETESTFAKETESTFAKETESTFAKETEST\n' \
+        > "${config_dir}/.session-key"
+    chmod 600 "${config_dir}/.session-key"
+
+    local output rc=0
+    output=$(
+        COFFER_VAULT_ROOT="$sandbox" \
+        COFFER_CONFIG_DIR="$config_dir" \
+        COFFER_SESSION_KEY="${config_dir}/.session-key" \
+        COFFER_AUTO_SYNC=0 \
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+        SOPS_AGE_KEY="AGE-SECRET-KEY-fake" \
+        bash "$real_coffer" delete nocat/nokey --yes 2>&1
+    ) || rc=$?
+    rm -rf "$sandbox"
+
+    # Exit code must be non-zero (key/category not found), NOT because of an
+    # "Unknown command" fallthrough (which would also be non-zero but with
+    # different text). We verify the error is from cmd_delete, not the dispatcher.
+    if echo "$output" | grep -q "Unknown command"; then
+        echo "  FAIL: dispatcher did not route 'delete' -- got 'Unknown command'"
+        return 1
+    fi
+    assert_contains "$output" "not found" \
+        "dispatcher must route 'delete' to cmd_delete (category not found error expected)"
+}
+
+test_delete_round_trip_set_delete_get_fails() {
+    # End-to-end round-trip: set a secret, delete it, then verify cmd_get
+    # exits non-zero (i.e., the key really is gone from the user's perspective,
+    # not just from the on-disk YAML). This is the canonical check from the
+    # 2026-05-07 Apple SSO decommission ticket.
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/key.txt" 2>/dev/null
+    local pub_key secret_key
+    pub_key=$(grep "public key" "${sandbox}/key.txt" | awk '{print $4}')
+    secret_key=$(grep "^AGE-SECRET-KEY-" "${sandbox}/key.txt")
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_key}
+EOF
+
+    # set
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/apple.yaml"
+        export COFFER_CATEGORY="apple"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set apple/sso-token "secret-value-xyz"
+    ) || { rm -rf "$sandbox"; echo "  FAIL: set step failed"; return 1; }
+
+    # delete
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/delete.sh"
+        cmd_delete apple/sso-token --yes
+    ) || { rm -rf "$sandbox"; echo "  FAIL: delete step failed"; return 1; }
+
+    # get must now fail
+    local rc=0
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+
+        die()   { echo "die: $*" >&2; exit 1; }
+        log()   { :; }
+        warn()  { :; }
+        require_cmd()    { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked()  { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/get.sh"
+        cmd_get apple/sso-token >/dev/null 2>&1
+    ) || rc=$?
+    rm -rf "$sandbox"
+
+    if [[ $rc -eq 0 ]]; then
+        echo "  FAIL: cmd_get unexpectedly succeeded after delete"
+        return 1
+    fi
+    return 0
+}
+
+test_delete_retype_confirm_proceeds_on_match() {
+    # When the user retypes the path correctly at the prompt, delete proceeds.
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/key.txt" 2>/dev/null
+    local pub_key secret_key
+    pub_key=$(grep "public key" "${sandbox}/key.txt" | awk '{print $4}')
+    secret_key=$(grep "^AGE-SECRET-KEY-" "${sandbox}/key.txt")
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_key}
+EOF
+
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }; warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }; ensure_unlocked() { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set retype/key "value"
+    ) || { rm -rf "$sandbox"; echo "  FAIL: setup failed"; return 1; }
+
+    local rc=0
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }; warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }; ensure_unlocked() { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/delete.sh"
+        # Pipe the matching path string into the retype prompt.
+        printf 'retype/key\n' | cmd_delete retype/key
+    ) || rc=$?
+
+    local has_key
+    has_key=$(SOPS_AGE_KEY="$secret_key" sops decrypt --output-type json \
+        "${sandbox}/vault/retype.yaml" 2>/dev/null | jq 'has("key")')
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: cmd_delete returned non-zero after correct retype"
+        return 1
+    fi
+    assert_eq "false" "$has_key" "key must be removed when user retypes path correctly"
+}
+
+test_delete_retype_confirm_aborts_on_mismatch() {
+    # When the user retypes anything other than the exact path, the delete
+    # must abort and the key must remain intact.
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    age-keygen -o "${sandbox}/key.txt" 2>/dev/null
+    local pub_key secret_key
+    pub_key=$(grep "public key" "${sandbox}/key.txt" | awk '{print $4}')
+    secret_key=$(grep "^AGE-SECRET-KEY-" "${sandbox}/key.txt")
+
+    mkdir -p "${sandbox}/vault" "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_key}
+EOF
+
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }; warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }; ensure_unlocked() { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        cmd_set safe/key "value"
+    ) || { rm -rf "$sandbox"; echo "  FAIL: setup failed"; return 1; }
+
+    local rc=0
+    (
+        export SOPS_AGE_KEY="$secret_key"
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        export COFFER_AUTO_SYNC=0
+        export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }; warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }; ensure_unlocked() { :; }
+        parse_path() {
+            COFFER_CATEGORY="${1%%/*}"; COFFER_KEY="${1#*/}"
+            COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"
+            export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
+        }
+        list_categories() { ls "${COFFER_VAULT}"; }
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/delete.sh"
+        # User typed a yes-ish answer instead of the actual path -- must abort.
+        printf 'y\n' | cmd_delete safe/key
+    ) || rc=$?
+
+    local has_key
+    has_key=$(SOPS_AGE_KEY="$secret_key" sops decrypt --output-type json \
+        "${sandbox}/vault/safe.yaml" 2>/dev/null | jq 'has("key")')
+    rm -rf "$sandbox"
+
+    # cmd_delete returns 0 on user-aborted (no error, just no-op).
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: cmd_delete must exit 0 on user abort (returned ${rc})"
+        return 1
+    fi
+    assert_eq "true" "$has_key" "key must remain when user does not retype path"
+}
+
 main() {
     echo "=== Coffer Test Suite ==="
     echo ""
@@ -1587,6 +2235,18 @@ main() {
     # Set: recipient preservation regression tests
     run_test test_set_preserves_all_recipients_on_create
     run_test test_set_preserves_all_recipients_on_update
+
+    # Delete command tests (feat/delete-command, May 2026)
+    run_test test_delete_removes_key
+    run_test test_delete_preserves_recipients
+    run_test test_delete_missing_key_fails
+    run_test test_delete_missing_category_fails
+    run_test test_delete_no_args_fails
+    run_test test_delete_unknown_flag_fails
+    run_test test_delete_routed_by_dispatcher
+    run_test test_delete_round_trip_set_delete_get_fails
+    run_test test_delete_retype_confirm_proceeds_on_match
+    run_test test_delete_retype_confirm_aborts_on_mismatch
 
     # Identity: Option 2 (file-only, no Keychain) tests
     run_test test_require_identity_passes_with_file
