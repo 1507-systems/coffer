@@ -187,3 +187,17 @@ mechanism to make that happen out-of-band.
 - `while IFS= read -r` loop over `printf '%s' | tr ',' '\n'` only processed the first token because the last line lacked a trailing newline. Fixed by using `printf '%s\n'` and adding `|| [[ -n "$key" ]]` fallback.
 - `git rev-parse --abbrev-ref HEAD` on an empty repo outputs `HEAD` to stdout AND exits 128, causing `HEAD\nunknown` in the branch variable. Fixed with separate assignment: `branch=$(...) || branch="unknown"`.
 
+### 2026-05-12 - Add coffer delete command (feat/delete-command, PR #19)
+
+**Problem.** Coffer lacked a native delete subcommand. The only deletion paths were interactive `coffer edit` or a scripted `EDITOR` override (a Python helper that loaded YAML, popped the key, and dumped back). This gap surfaced during the 2026-05-07 Apple SSO decommission.
+
+**Changes:**
+
+- **`lib/delete.sh`** (NEW): `cmd_delete <category/key> [-y|--yes]`. Decrypts the category file to JSON via sops, checks key existence (exits 1 if absent before prompting), removes the key via `jq del`, re-encrypts back to YAML with `--filename-override` to preserve all recipients (same pattern as `set.sh`). Default confirmation flow requires the user to retype the full `category/key` path; `-y / --yes` bypasses for scripted use. Uses `return 0` on abort (not `exit`) since `delete.sh` is sourced.
+
+- **`bin/coffer`**: added `delete` case to dispatcher. Calls `auto_sync_pull` + `preflight_recipient_check` before mutation, `auto_sync_push "delete <path>"` after (flags stripped from commit message). Updated `--help` usage block.
+
+- **`README.md`**: usage block updated with two delete examples.
+
+**Tests.** 10 new delete tests added to `tests/run-tests.sh`: round-trip set/delete/get, recipient preservation (regression guard), missing-key error, missing-category error, no-args, unknown-flag, dispatcher routing, retype-match proceeds, retype-mismatch aborts with key intact. 58/58 tests passing (was 48). Shellcheck clean.
+
