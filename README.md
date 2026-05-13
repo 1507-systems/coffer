@@ -67,14 +67,16 @@ You can have multiple recipients (multiple machines, team members). See `coffer 
 ## Usage
 
 ```bash
-coffer get  cloudflare/dns-token        # Retrieve a secret
-coffer set  cloudflare/dns-token        # Set a secret (prompts for value)
-coffer set  cloudflare/dns-token VALUE  # Set a secret inline
-coffer list                             # List all categories and keys
-coffer list cloudflare                  # List keys in one category
-coffer edit cloudflare                  # Open category in $EDITOR
-coffer doctor                           # Audit vault state (recipient drift, git sync)
-coffer sync-pull                        # Pull latest vault changes from git
+coffer get    cloudflare/dns-token        # Retrieve a secret
+coffer set    cloudflare/dns-token        # Set a secret (prompts for value)
+coffer set    cloudflare/dns-token VALUE  # Set a secret inline
+coffer delete cloudflare/old-token        # Remove a key (prompts to retype path)
+coffer delete cloudflare/old-token -y     # Remove a key without prompting
+coffer list                               # List all categories and keys
+coffer list   cloudflare                  # List keys in one category
+coffer edit   cloudflare                  # Open category in $EDITOR
+coffer doctor                             # Audit vault state (recipient drift, git sync)
+coffer refresh                            # Pull latest vault changes from git
 ```
 
 After every write (`set`, `edit`, `import`, `add-recipient`), coffer automatically commits and pushes the encrypted change to `$COFFER_VAULT_ROOT` origin/main. This keeps the vault in sync across machines via git rather than relying on file-level sync tools.
