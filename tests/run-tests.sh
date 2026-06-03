@@ -2287,6 +2287,15 @@ main() {
     run_test test_refresh_command_works
     run_test test_sync_pull_alias_prints_deprecation
 
+    # SOPS merge driver tests (feat/sops-merge-driver, June 2026)
+    run_test test_merge_driver_diverged_add_unions
+    run_test test_merge_driver_true_conflict_fails_loudly
+    run_test test_merge_driver_heals_recipient_drift
+    run_test test_merge_driver_delete_vs_modify_conflicts
+    run_test test_merge_driver_no_plaintext_leak
+    run_test test_install_merge_driver_registers_and_routes
+    run_test test_merge_driver_real_git_rebase_auto_unions
+
     teardown_test_env
 
     echo ""
@@ -2356,6 +2365,331 @@ test_sync_pull_alias_prints_deprecation() {
 
     assert_eq 0 "$rc" "coffer sync-pull (alias) should exit 0 when vault is up to date" && \
     assert_contains "$output" "deprecated" "coffer sync-pull should print a deprecation warning"
+}
+
+# =============================================================================
+# --- SOPS merge driver tests (feat/sops-merge-driver, June 2026) ---
+#
+# These cover lib/merge-driver.sh (the coffer-aware union merge driver) and
+# lib/install-merge-driver.sh. They generate EPHEMERAL age keypairs and dummy
+# secrets at runtime (age-keygen) -- NO secret values are committed to the repo.
+# The driver is exercised both directly (cmd_merge_driver with crafted sides)
+# and through a real `git rebase` to prove the auto_sync_pull integration.
+# =============================================================================
+
+# _md_sandbox <sandbox>
+#   Generate two ephemeral age keypairs and a current .sops.yaml listing BOTH as
+#   recipients. Sets, in the CALLER's scope (no subshell):
+#     MD_PUBA MD_PUBB MD_SECA  (key A is "this machine")
+#     MD_VAULT MD_SOPS MD_CFG  (vault dir, current sops config, config dir)
+#     MD_STALE_SOPS            (a single-recipient [A only] sops config)
+#   Also exports the COFFER_* env the driver needs and SOPS_AGE_KEY (=A's secret).
+_md_sandbox() {
+    local sandbox="$1"
+    mkdir -p "${sandbox}/vault" "${sandbox}/config" "${sandbox}/cfg"
+
+    age-keygen -o "${sandbox}/keyA.txt" 2>/dev/null
+    age-keygen -o "${sandbox}/keyB.txt" 2>/dev/null
+    MD_PUBA=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    MD_PUBB=$(grep "public key" "${sandbox}/keyB.txt" | awk '{print $4}')
+    MD_SECA=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+
+    MD_VAULT="${sandbox}/vault"
+    MD_SOPS="${sandbox}/config/.sops.yaml"
+    MD_CFG="${sandbox}/cfg"
+    MD_STALE_SOPS="${sandbox}/config/.sops.stale.yaml"
+
+    cat > "$MD_SOPS" <<EOF
+creation_rules:
+  - path_regex: vault/.*\\.yaml\$
+    age: >-
+      ${MD_PUBA},${MD_PUBB}
+EOF
+    cat > "$MD_STALE_SOPS" <<EOF
+creation_rules:
+  - path_regex: vault/.*\\.yaml\$
+    age: >-
+      ${MD_PUBA}
+EOF
+
+    printf '%s\n' "$MD_SECA" > "${MD_CFG}/.session-key"
+    chmod 600 "${MD_CFG}/.session-key"
+
+    export COFFER_VAULT_ROOT="$sandbox"
+    export COFFER_VAULT="$MD_VAULT"
+    export COFFER_SOPS_CONFIG="$MD_SOPS"
+    export COFFER_CONFIG_DIR="$MD_CFG"
+    export COFFER_SESSION_KEY="${MD_CFG}/.session-key"
+    export COFFER_NTFY_TOPIC="http://localhost:1/fake"
+    export SOPS_AGE_KEY="$MD_SECA"
+}
+
+# _md_enc <json> <outfile> [sops_config]
+#   Encrypt a dummy JSON map to a SOPS YAML file using the given (or current)
+#   .sops.yaml. Uses a vault-relative --filename-override so the creation_rule
+#   path_regex matches.
+_md_enc() {
+    local json="$1" out="$2" cfg="${3:-$MD_SOPS}"
+    printf '%s' "$json" \
+        | SOPS_AGE_KEY="$MD_SECA" SOPS_CONFIG="$cfg" sops encrypt \
+            --filename-override "vault/$(basename "$out")" \
+            --input-type json --output-type yaml /dev/stdin > "$out"
+}
+
+# _md_run <base> <ours> <theirs> <path>
+#   Invoke the real bin/coffer merge-driver dispatcher path on three crafted
+#   side files. Captures combined stderr in MD_STDERR and returns the rc.
+_md_run() {
+    local base="$1" ours="$2" theirs="$3" path="$4"
+    local rc=0
+    MD_STDERR=$(bash "${SCRIPT_DIR}/../bin/coffer" merge-driver \
+        "$base" "$ours" "$theirs" 7 "$path" 2>&1 >/dev/null) || rc=$?
+    return $rc
+}
+
+# (a) diverged-add: branchA adds keyA, branchB adds keyB -> BOTH present,
+#     re-encrypted to current recipients.
+test_merge_driver_diverged_add_unions() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"; return 0
+    fi
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+
+    _md_enc '{"seed":"s"}'               "${sb}/base.yaml"
+    _md_enc '{"seed":"s","keyA":"valA"}' "${sb}/ours.yaml"
+    _md_enc '{"seed":"s","keyB":"valB"}' "${sb}/theirs.yaml"
+
+    local rc=0
+    _md_run "${sb}/base.yaml" "${sb}/ours.yaml" "${sb}/theirs.yaml" "vault/test.yaml" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: clean different-key merge exited ${rc} (expected 0); stderr: ${MD_STDERR}"
+        rm -rf "$sb"; return 1
+    fi
+
+    local merged
+    merged=$(SOPS_AGE_KEY="$MD_SECA" sops decrypt --input-type yaml --output-type json "${sb}/ours.yaml" 2>/dev/null)
+    local union_ok=0
+    printf '%s' "$merged" | jq -e '.keyA=="valA" and .keyB=="valB" and .seed=="s"' >/dev/null 2>&1 && union_ok=1
+
+    # Recipient heal/parity: key B (the "other machine") must be able to decrypt.
+    local b_ok=0
+    SOPS_AGE_KEY=$(grep AGE-SECRET "${sb}/keyB.txt") sops decrypt --input-type yaml "${sb}/ours.yaml" >/dev/null 2>&1 && b_ok=1
+
+    rm -rf "$sb"
+    if [[ $union_ok -eq 0 ]]; then echo "  FAIL: merged map missing keyA/keyB/seed"; return 1; fi
+    if [[ $b_ok -eq 0 ]]; then echo "  FAIL: merged file not encrypted to current recipient set (key B locked out)"; return 1; fi
+    return 0
+}
+
+# (b) true-conflict: both set same key to different values -> FAILS loudly
+#     (non-zero) and leaks NO values.
+test_merge_driver_true_conflict_fails_loudly() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"; return 0
+    fi
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+
+    _md_enc '{"seed":"s"}'                    "${sb}/base.yaml"
+    _md_enc '{"seed":"s","keyX":"SECRETOURS"}'   "${sb}/ours.yaml"
+    _md_enc '{"seed":"s","keyX":"SECRETTHEIRS"}' "${sb}/theirs.yaml"
+
+    # Snapshot ours BEFORE merge: on conflict the driver must NOT overwrite %A.
+    local before; before=$(cat "${sb}/ours.yaml")
+
+    local rc=0
+    _md_run "${sb}/base.yaml" "${sb}/ours.yaml" "${sb}/theirs.yaml" "vault/test.yaml" || rc=$?
+
+    local after; after=$(cat "${sb}/ours.yaml")
+    local leaked=0
+    printf '%s' "$MD_STDERR" | grep -qE 'SECRETOURS|SECRETTHEIRS' && leaked=1
+
+    rm -rf "$sb"
+    if [[ $rc -eq 0 ]]; then echo "  FAIL: same-key/different-value merge exited 0 (expected non-zero conflict)"; return 1; fi
+    if [[ "$before" != "$after" ]]; then echo "  FAIL: driver overwrote %A on a true conflict (must leave it for git)"; return 1; fi
+    assert_contains "$MD_STDERR" "keyX" "conflict message should name the conflicting key" || return 1
+    if [[ $leaked -eq 1 ]]; then echo "  FAIL: SECRET VALUE LEAKED in conflict output"; return 1; fi
+    return 0
+}
+
+# (c) recipient-drift: ours encrypted to a STALE (A-only) .sops.yaml, theirs to
+#     current (A+B). A clean different-key union must re-encrypt to the CURRENT
+#     recipient set (B can decrypt the merged result).
+test_merge_driver_heals_recipient_drift() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"; return 0
+    fi
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+
+    _md_enc '{"seed":"s"}'              "${sb}/base.yaml"
+    # ours: stale single-recipient (A only)
+    _md_enc '{"seed":"s","onlyA":"v"}' "${sb}/ours.yaml" "$MD_STALE_SOPS"
+    _md_enc '{"seed":"s","onlyB":"w"}' "${sb}/theirs.yaml"
+
+    # Sanity: ours must NOT be decryptable by B before the merge.
+    if SOPS_AGE_KEY=$(grep AGE-SECRET "${sb}/keyB.txt") sops decrypt --input-type yaml "${sb}/ours.yaml" >/dev/null 2>&1; then
+        rm -rf "$sb"; echo "  FAIL: test setup wrong -- stale 'ours' already decryptable by B"; return 1
+    fi
+
+    local rc=0
+    _md_run "${sb}/base.yaml" "${sb}/ours.yaml" "${sb}/theirs.yaml" "vault/test.yaml" || rc=$?
+    if [[ $rc -ne 0 ]]; then echo "  FAIL: drift-heal merge exited ${rc} (expected 0); stderr: ${MD_STDERR}"; rm -rf "$sb"; return 1; fi
+
+    local healed=0
+    SOPS_AGE_KEY=$(grep AGE-SECRET "${sb}/keyB.txt") sops decrypt --input-type yaml "${sb}/ours.yaml" >/dev/null 2>&1 && healed=1
+    rm -rf "$sb"
+    if [[ $healed -eq 0 ]]; then echo "  FAIL: merged file still encrypted to stale recipients (drift not healed)"; return 1; fi
+    return 0
+}
+
+# (d) delete-vs-modify: ours deletes key, theirs modifies it -> conflict.
+test_merge_driver_delete_vs_modify_conflicts() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"; return 0
+    fi
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+
+    _md_enc '{"seed":"s","k":"orig"}'    "${sb}/base.yaml"
+    _md_enc '{"seed":"s"}'               "${sb}/ours.yaml"     # deleted k
+    _md_enc '{"seed":"s","k":"changed"}' "${sb}/theirs.yaml"   # modified k
+
+    local rc=0
+    _md_run "${sb}/base.yaml" "${sb}/ours.yaml" "${sb}/theirs.yaml" "vault/test.yaml" || rc=$?
+    local leaked=0
+    printf '%s' "$MD_STDERR" | grep -q 'changed' && leaked=1
+    rm -rf "$sb"
+    if [[ $rc -eq 0 ]]; then echo "  FAIL: delete-vs-modify merged cleanly (expected conflict)"; return 1; fi
+    assert_contains "$MD_STDERR" "k" "conflict message should name the deleted/modified key" || return 1
+    if [[ $leaked -eq 1 ]]; then echo "  FAIL: value 'changed' leaked in conflict output"; return 1; fi
+    return 0
+}
+
+# (e) no-plaintext-leak guard: static source check + runtime stdout/stderr check.
+test_merge_driver_no_plaintext_leak() {
+    local real_root; real_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+    # Static: the driver must never enable `set -x` or echo a decrypted *_json var.
+    local hits
+    hits=$(grep -nE 'set -x|echo[[:space:]]+"?\$(base_json|ours_json|theirs_json|merge_out|merged|decrypted)' \
+        "${real_root}/lib/merge-driver.sh" 2>/dev/null || true)
+    if [[ -n "$hits" ]]; then
+        echo "  FAIL: merge-driver.sh contains a potential plaintext-leak pattern:"
+        echo "$hits"
+        return 1
+    fi
+
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  (static check passed; SKIP runtime portion -- age-keygen/sops missing)"
+        return 0
+    fi
+
+    # Runtime: a clean merge must not print the plaintext value anywhere on
+    # stdout or stderr (the only durable output is the ciphertext written to %A).
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+    _md_enc '{"seed":"s"}'                       "${sb}/base.yaml"
+    _md_enc '{"seed":"s","kA":"PLAINTOKENAAA"}'  "${sb}/ours.yaml"
+    _md_enc '{"seed":"s","kB":"PLAINTOKENBBB"}'  "${sb}/theirs.yaml"
+
+    local combined
+    combined=$(bash "${SCRIPT_DIR}/../bin/coffer" merge-driver \
+        "${sb}/base.yaml" "${sb}/ours.yaml" "${sb}/theirs.yaml" 7 "vault/test.yaml" 2>&1) || true
+    rm -rf "$sb"
+
+    if printf '%s' "$combined" | grep -qE 'PLAINTOKENAAA|PLAINTOKENBBB'; then
+        echo "  FAIL: decrypted plaintext token appeared in merge-driver stdout/stderr"
+        return 1
+    fi
+    return 0
+}
+
+# install-merge-driver: registers the per-clone driver and writes routing lines,
+# including the config/.sops.yaml exclusion (it must NOT use the union driver).
+test_install_merge_driver_registers_and_routes() {
+    if ! command -v age-keygen >/dev/null 2>&1; then echo "  SKIP (age-keygen not installed)"; return 0; fi
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+
+    # Make the sandbox a git repo so install-merge-driver has somewhere to write.
+    git -C "$sb" init -q
+    git -C "$sb" config user.email t@t.local; git -C "$sb" config user.name T
+
+    # Run with auto-sync off so the test does no commit/push (just config + file).
+    local rc=0
+    COFFER_AUTO_SYNC=0 bash "${SCRIPT_DIR}/../bin/coffer" install-merge-driver >/dev/null 2>&1 || rc=$?
+    if [[ $rc -ne 0 ]]; then echo "  FAIL: install-merge-driver exited ${rc}"; rm -rf "$sb"; return 1; fi
+
+    local driver; driver=$(git -C "$sb" config --get merge.coffer-sops.driver 2>/dev/null || echo "")
+    local attrs; attrs=$(cat "${sb}/.gitattributes" 2>/dev/null || echo "")
+    rm -rf "$sb"
+
+    assert_contains "$driver" "merge-driver" "merge.coffer-sops.driver should invoke coffer merge-driver" || return 1
+    assert_contains "$attrs" "vault/** merge=coffer-sops" "gitattributes should route vault/** to the union driver" || return 1
+    assert_contains "$attrs" "config/.sops.yaml -merge" "gitattributes must EXCLUDE config/.sops.yaml from the union driver" || return 1
+    return 0
+}
+
+# Full integration: install the driver in a real repo, create two divergent
+# different-key commits, `git rebase`, and assert it auto-unions (proving the
+# auto_sync_pull pull --rebase path resolves cleanly) AND that a same-key
+# collision instead leaves the path conflicted.
+test_merge_driver_real_git_rebase_auto_unions() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"; return 0
+    fi
+    local sb; sb=$(mktemp -d); _md_sandbox "$sb"
+    local real_coffer="${SCRIPT_DIR}/../bin/coffer"
+
+    git -C "$sb" init -q
+    git -C "$sb" config user.email t@t.local; git -C "$sb" config user.name T
+
+    # Register the driver (auto-sync off: no push, just config + .gitattributes).
+    COFFER_AUTO_SYNC=0 bash "$real_coffer" install-merge-driver >/dev/null 2>&1
+
+    # Seed a base commit with one key.
+    COFFER_AUTO_SYNC=0 bash "$real_coffer" set test/seed sval >/dev/null 2>&1
+    git -C "$sb" add -A; git -C "$sb" commit -qm seed
+
+    # theirs branch: a different key.
+    git -C "$sb" checkout -qb theirs
+    COFFER_AUTO_SYNC=0 bash "$real_coffer" set test/fromTheirs tval >/dev/null 2>&1
+    git -C "$sb" add -A; git -C "$sb" commit -qm theirs
+
+    # Check out the commit that has only the seed (theirs' parent), then branch.
+    git -C "$sb" checkout -q "$(git -C "$sb" rev-parse theirs~1)" 2>/dev/null
+    git -C "$sb" checkout -qB work
+    COFFER_AUTO_SYNC=0 bash "$real_coffer" set test/fromOurs oval >/dev/null 2>&1
+    git -C "$sb" add -A; git -C "$sb" commit -qm ours
+
+    # Rebase the different-key commit onto theirs -> driver should auto-union.
+    local rebase_rc=0
+    git -C "$sb" rebase theirs >/dev/null 2>&1 || rebase_rc=$?
+    if [[ $rebase_rc -ne 0 ]]; then
+        git -C "$sb" rebase --abort 2>/dev/null || true
+        echo "  FAIL: rebase of a different-key write did not auto-merge (exit ${rebase_rc})"
+        rm -rf "$sb"; return 1
+    fi
+    local merged
+    merged=$(SOPS_AGE_KEY="$MD_SECA" sops decrypt --input-type yaml --output-type json "${sb}/vault/test.yaml" 2>/dev/null)
+    local union_ok=0
+    printf '%s' "$merged" | jq -e '.seed=="sval" and .fromOurs=="oval" and .fromTheirs=="tval"' >/dev/null 2>&1 && union_ok=1
+    if [[ $union_ok -eq 0 ]]; then echo "  FAIL: rebase did not union all three keys; got: ${merged}"; rm -rf "$sb"; return 1; fi
+
+    # Now a true same-key collision must leave the rebase conflicted.
+    git -C "$sb" checkout -qB tcol theirs
+    COFFER_AUTO_SYNC=0 bash "$real_coffer" set test/collide theirsval >/dev/null 2>&1
+    git -C "$sb" add -A; git -C "$sb" commit -qm tcol
+    git -C "$sb" checkout -q "$(git -C "$sb" rev-parse tcol~1)" 2>/dev/null
+    git -C "$sb" checkout -qB ocol
+    COFFER_AUTO_SYNC=0 bash "$real_coffer" set test/collide oursval >/dev/null 2>&1
+    git -C "$sb" add -A; git -C "$sb" commit -qm ocol
+    local col_rc=0
+    git -C "$sb" rebase tcol >/dev/null 2>&1 || col_rc=$?
+    local conflicted=0
+    git -C "$sb" status --porcelain 2>/dev/null | grep -qE '^(UU|AA|U|DD)' && conflicted=1
+    git -C "$sb" rebase --abort 2>/dev/null || true
+    rm -rf "$sb"
+
+    if [[ $col_rc -eq 0 ]]; then echo "  FAIL: rebase of a same-key collision succeeded (expected conflict)"; return 1; fi
+    if [[ $conflicted -eq 0 ]]; then echo "  FAIL: same-key collision did not leave the path conflicted"; return 1; fi
+    return 0
 }
 
 main "$@"

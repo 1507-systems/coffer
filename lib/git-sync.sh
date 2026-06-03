@@ -232,6 +232,17 @@ auto_sync_push() {
         git -C "$repo_root" add "$vault_dir" 2>/dev/null || true
     fi
 
+    # Stage .gitattributes (SOPS merge-driver routing from install-merge-driver).
+    # Without this, the routing that makes vault/** auto-merge would never reach
+    # origin via the normal write path, and a fresh clone would silently fall
+    # back to the default text merge on the next concurrent write. install-merge-
+    # driver commits it directly too; staging it here is the belt-and-suspenders
+    # so a manual edit or a partial install still propagates on the next write.
+    local gitattributes="${repo_root}/.gitattributes"
+    if [[ -f "$gitattributes" ]]; then
+        git -C "$repo_root" add "$gitattributes" 2>/dev/null || true
+    fi
+
     # Check if staging actually produced any diff vs HEAD. `git diff --cached
     # --quiet` exits 0 when there's nothing staged, 1 when there are changes.
     if git -C "$repo_root" diff --cached --quiet 2>/dev/null; then
