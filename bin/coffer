@@ -128,6 +128,16 @@ Commands:
                                 appears in the list, and that the vault git
                                 repo is clean and up to date with origin/main.
                                 Exit 0 = all clear. Exit 1 = drift found.
+  install-merge-driver          Register the coffer-aware SOPS git merge driver
+                                in THIS clone's .git/config and ensure the vault
+                                repo's .gitattributes routes vault/** through it.
+                                Run ONCE per machine (the driver definition lives
+                                in .git/config, which is never cloned/fetched).
+                                After install, concurrent writes that touch
+                                different keys in the same category file
+                                auto-merge on pull --rebase instead of dying;
+                                only true same-key/different-value collisions
+                                surface as conflicts.
 
 Options:
   -h, --help    Show this help message
@@ -393,6 +403,22 @@ case "$command" in
         ;;
     doctor)
         cmd_doctor "$@"
+        ;;
+    merge-driver)
+        # Hidden subcommand invoked by git as the custom merge driver, NOT by
+        # users directly. git calls: coffer merge-driver %O %A %B %L %P
+        # (base ours theirs marker-size pathname). It decrypts all three sides
+        # in memory, unions the decrypted key maps, re-encrypts a clean merge to
+        # %A using current recipients, and exits non-zero on a true conflict so
+        # git surfaces it. No auto_sync_* here: this runs INSIDE a git operation.
+        # shellcheck source=../lib/merge-driver.sh
+        source "${COFFER_ROOT}/lib/merge-driver.sh"
+        cmd_merge_driver "$@"
+        ;;
+    install-merge-driver)
+        # shellcheck source=../lib/install-merge-driver.sh
+        source "${COFFER_ROOT}/lib/install-merge-driver.sh"
+        cmd_install_merge_driver "$@"
         ;;
     -h|--help|help)
         usage
