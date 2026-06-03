@@ -91,6 +91,8 @@ Commands:
   get    <category/key>         Retrieve a secret (prints to stdout)
   set    <category/key> [value] Store or update a secret
   list   [category]             List categories and keys
+  delete <category/key> [-y]    Remove a key from the vault (prompts to retype
+                                the path; -y/--yes bypasses the prompt)
   edit   <category>             Edit a category file interactively
   import <csv-file>             Import secrets from a keychain CSV dump
   init   [--force]              First-time setup (generate age keypair; writes
@@ -292,6 +294,30 @@ case "$command" in
         # shellcheck source=../lib/list.sh
         source "${COFFER_ROOT}/lib/list.sh"
         cmd_list "$@"
+        ;;
+    delete)
+        # shellcheck source=../lib/delete.sh
+        source "${COFFER_ROOT}/lib/delete.sh"
+        # Pull-rebase before delete for the same reason as `set`: incorporate
+        # any remote commits first so the re-encrypted file and push are based
+        # on the latest vault state, not a stale snapshot.
+        auto_sync_pull
+        # Block on drifted recipients. Deleting a key then re-encrypting with
+        # a stale recipient set would silently lock out machines -- same risk
+        # as any other write operation.
+        preflight_recipient_check
+        cmd_delete "$@"
+        # Commit the deletion. First positional arg is always category/key;
+        # strip flags so the commit message is never "delete -y".
+        _coffer_delete_path=""
+        for _coffer_delete_arg in "$@"; do
+            case "$_coffer_delete_arg" in
+                -y|--yes) ;;
+                -*) ;;
+                *) [[ -n "$_coffer_delete_path" ]] || _coffer_delete_path="$_coffer_delete_arg" ;;
+            esac
+        done
+        auto_sync_push "delete ${_coffer_delete_path:-unknown}"
         ;;
     edit)
         # shellcheck source=../lib/edit.sh
