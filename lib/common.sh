@@ -174,11 +174,32 @@ parse_path() {
     fi
     COFFER_CATEGORY="${path%%/*}"
     COFFER_KEY="${path#*/}"
-    COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"  # exported for use by callers
-    export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
 
     [[ -n "$COFFER_CATEGORY" ]] || die "Empty category in path: '${path}'"
     [[ -n "$COFFER_KEY" ]] || die "Empty key in path: '${path}'"
+
+    # Path-traversal defense (mirrors onboard.sh's machine-name sanitization).
+    # COFFER_CATEGORY becomes a vault filename (vault/<category>.yaml), so a
+    # category of "..", "../foo", or a leading-dot/slash value could make
+    # COFFER_VAULT_FILE escape the vault directory -- letting `coffer set` write
+    # an encrypted blob outside vault/ or `coffer get`/`delete` touch an
+    # arbitrary *.yaml on disk. Reject anything that isn't a plain, safe
+    # category name. (Category can't contain '/' by construction -- it's the
+    # first slash-delimited segment -- but it can still be '..' or '.hidden'.)
+    if [[ "$COFFER_CATEGORY" == *".."* || "$COFFER_CATEGORY" == .* ]]; then
+        die "Invalid category '${COFFER_CATEGORY}': must not contain '..' or a leading '.'"
+    fi
+    if [[ ! "$COFFER_CATEGORY" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        die "Invalid category '${COFFER_CATEGORY}': only letters, digits, '-' and '_' are allowed."
+    fi
+    # The key is a SOPS map key, not a filesystem path, but reject the obvious
+    # traversal tokens too for defense in depth and a clearer error.
+    if [[ "$COFFER_KEY" == "." || "$COFFER_KEY" == ".." || "$COFFER_KEY" == *".."* ]]; then
+        die "Invalid key '${COFFER_KEY}': must not contain '..'."
+    fi
+
+    COFFER_VAULT_FILE="${COFFER_VAULT}/${COFFER_CATEGORY}.yaml"  # exported for use by callers
+    export COFFER_CATEGORY COFFER_KEY COFFER_VAULT_FILE
 }
 
 # List available categories (vault YAML filenames without extension).
