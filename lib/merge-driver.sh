@@ -17,9 +17,12 @@
 #     recipients (which also heals recipient drift on every merge).
 #
 # SECURITY (non-negotiable): decrypted plaintext exists ONLY in shell variables
-# and in a mode-0700 per-invocation temp dir under $TMPDIR. It is NEVER written
-# to the working tree, git objects, stdout, or logs. Conflict diagnostics print
-# KEY NAMES ONLY, never values. A trap shreds/overwrites temp files on exit.
+# and in mode-0600 files inside a mode-0700 per-invocation temp dir under
+# $TMPDIR. It is NEVER written to the working tree, git objects, stdout, or
+# logs, and is NEVER placed on a process argv (jq inputs are fed via
+# --slurpfile, not --argjson, to keep them off /proc/<pid>/cmdline). Conflict
+# diagnostics print KEY NAMES ONLY, never values. A trap shreds/overwrites all
+# temp files on exit.
 #
 # Sourced by bin/coffer; never executed directly.
 set -euo pipefail
@@ -116,9 +119,10 @@ cmd_merge_driver() {
         return 1
     fi
 
-    # Per-invocation mode-0700 temp dir under $TMPDIR for any plaintext we must
-    # materialize (the re-encrypt input). Created BEFORE any plaintext is written,
-    # with the cleanup trap registered immediately. umask 077 belt-and-suspenders.
+    # Per-invocation mode-0700 temp dir under $TMPDIR for all plaintext we must
+    # materialize (the three decrypted-JSON inputs for jq, and the re-encrypt
+    # input). Created BEFORE any plaintext is written, with umask 077 held until
+    # AFTER the last plaintext file write so every file inside gets mode 0600.
     local prev_umask
     prev_umask=$(umask)
     umask 077
@@ -128,13 +132,18 @@ cmd_merge_driver() {
         echo "coffer merge-driver: could not create secure temp dir -- leaving '${path}' conflicted" >&2
         return 1
     }
-    umask "$prev_umask"
+    # belt-and-suspenders: mktemp -d already used umask 077 (0700 dir), but
+    # chmod 700 makes intent explicit and survives unusual umask defaults.
     chmod 700 "$tmpdir" 2>/dev/null || true
+    # NOTE: umask 077 stays active until after merged_plain is written (below).
 
+    local base_plain="${tmpdir}/base.json"
+    local ours_plain="${tmpdir}/ours.json"
+    local theirs_plain="${tmpdir}/theirs.json"
     local merged_plain="${tmpdir}/merged.json"
     # Shred plaintext temp files and remove the dir on ANY exit path.
-    # shellcheck disable=SC2064  # expand tmpdir/merged_plain now, intentionally
-    trap "_md_secure_wipe '${merged_plain}'; rm -rf '${tmpdir}' 2>/dev/null || true" EXIT INT TERM
+    # shellcheck disable=SC2064  # expand vars now, intentionally
+    trap "_md_secure_wipe '${base_plain}' '${ours_plain}' '${theirs_plain}' '${merged_plain}'; rm -rf '${tmpdir}' 2>/dev/null || true" EXIT INT TERM
 
     # --- 1. Decrypt all three sides to JSON, in memory ---
     local base_json ours_json theirs_json
@@ -150,6 +159,17 @@ cmd_merge_driver() {
         echo "coffer merge-driver: failed to decrypt their side of '${path}' (missing age key?) -- leaving conflicted" >&2
         return 1
     fi
+
+    # Write the three decrypted-JSON blobs to 0600 files in the secure temp dir
+    # so jq can read them via --slurpfile (file-based, off the process argv).
+    # umask 077 is still active here, so these files are created at mode 0600.
+    # Passing large JSON via --argjson would put the plaintext on the process
+    # argv, visible to same-user processes via /proc/<pid>/cmdline or `ps`.
+    printf '%s' "$base_json"   > "$base_plain"
+    printf '%s' "$ours_json"   > "$ours_plain"
+    printf '%s' "$theirs_json" > "$theirs_plain"
+    # Shell vars no longer needed; unset to limit plaintext lifetime in memory.
+    unset base_json ours_json theirs_json
 
     # --- 2 & 3. Three-way map merge in jq. ---
     #
@@ -171,18 +191,23 @@ cmd_merge_driver() {
     #   - present both sides, DIFFERENT value, and
     #     at least one differs from base           -> CONFLICT
     local merge_program
-    # $base/$ours/$theirs are bound via --argjson below; jq -n input is null.
-    # SC2016: the $-vars in this string are jq variables, NOT shell expansions.
+    # $base/$ours/$theirs are loaded via --slurpfile (each becomes a 1-element
+    # array; access the object as $base[0] etc). This keeps plaintext off the
+    # process argv entirely. SC2016: the $-vars in this string are jq variables,
+    # NOT shell expansions.
     # shellcheck disable=SC2016
     merge_program='
-      (($base|keys) + ($ours|keys) + ($theirs|keys) | unique) as $allkeys
+      ($base[0])   as $b
+      | ($ours[0])   as $o
+      | ($theirs[0]) as $t
+      | (($b|keys) + ($o|keys) + ($t|keys) | unique) as $allkeys
       | reduce $allkeys[] as $k ( {result:{}, conflicts:[]};
-          ($base|has($k))   as $hb
-        | ($ours|has($k))   as $ho
-        | ($theirs|has($k)) as $ht
-        | ($base[$k])   as $bv
-        | ($ours[$k])   as $ov
-        | ($theirs[$k]) as $tv
+          ($b|has($k))   as $hb
+        | ($o|has($k))   as $ho
+        | ($t|has($k))   as $ht
+        | ($b[$k])   as $bv
+        | ($o[$k])   as $ov
+        | ($t[$k])   as $tv
         | ($ho and $ht and ($ov == $tv)) as $same_both
         # ours-vs-base changed?
         | (if $ho then ($hb|not) or ($ov != $bv) else $hb end) as $ours_changed
@@ -227,9 +252,9 @@ cmd_merge_driver() {
 
     local envelope
     if ! envelope=$(jq -n \
-            --argjson base "$base_json" \
-            --argjson ours "$ours_json" \
-            --argjson theirs "$theirs_json" \
+            --slurpfile base   "$base_plain" \
+            --slurpfile ours   "$ours_plain" \
+            --slurpfile theirs "$theirs_plain" \
             "$merge_program" 2>/dev/null); then
         echo "coffer merge-driver: internal merge computation failed for '${path}' -- leaving conflicted" >&2
         return 1
@@ -262,7 +287,12 @@ cmd_merge_driver() {
     # plaintext or partial ciphertext in %A. --filename-override makes sops match
     # the vault/.*\.yaml$ creation_rule and pull the live recipient set, which is
     # what heals recipient drift on every merge.
+    #
+    # umask 077 is still active (deliberately kept since the mktemp call above)
+    # so merged_plain is created at mode 0600, not the user's default 0644.
     printf '%s' "$merge_out" > "$merged_plain"
+    # All plaintext file writes done; restore the caller's umask now.
+    umask "$prev_umask"
 
     local ciphertext
     if ! ciphertext=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" SOPS_CONFIG="$sops_config" \
