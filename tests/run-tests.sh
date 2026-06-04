@@ -202,6 +202,74 @@ test_parse_path_invalid_no_slash() {
     assert_contains "$output" "Invalid path format" "parse_path should reject paths without /"
 }
 
+# Path-traversal hardening (corpus audit, coffer/medlow): a category that is
+# "..", "../foo", a leading-dot, or contains non-[A-Za-z0-9_-] chars must be
+# rejected so COFFER_VAULT_FILE can never escape the vault directory.
+test_parse_path_rejects_dotdot_category() {
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_VAULT="'"${COFFER_VAULT}"'"
+        parse_path "../etc/passwd"
+    ' 2>&1) || true
+    assert_contains "$output" "Invalid category" "parse_path should reject a '..' category"
+}
+
+test_parse_path_rejects_traversal_in_category() {
+    # A multi-segment traversal where the first segment embeds ".." must die.
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_VAULT="'"${COFFER_VAULT}"'"
+        parse_path "a..b/key"
+    ' 2>&1) || true
+    assert_contains "$output" "Invalid category" "parse_path should reject a category containing '..'"
+}
+
+test_parse_path_rejects_leading_dot_category() {
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_VAULT="'"${COFFER_VAULT}"'"
+        parse_path ".hidden/key"
+    ' 2>&1) || true
+    assert_contains "$output" "Invalid category" "parse_path should reject a leading-dot category"
+}
+
+test_parse_path_rejects_bad_chars_category() {
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_VAULT="'"${COFFER_VAULT}"'"
+        parse_path "cloud flare/key"
+    ' 2>&1) || true
+    assert_contains "$output" "Invalid category" "parse_path should reject a category with disallowed characters"
+}
+
+test_parse_path_rejects_dotdot_key() {
+    local output
+    output=$(COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_VAULT="'"${COFFER_VAULT}"'"
+        parse_path "cloudflare/.."
+    ' 2>&1) || true
+    assert_contains "$output" "Invalid key" "parse_path should reject a '..' key"
+}
+
+test_parse_path_still_accepts_normal_category() {
+    # Regression guard: legitimate hyphen/underscore categories must keep working
+    # (the hardening must not break real usage like cloudflare/dns-token).
+    local output
+    output=$(bash -c '
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        export COFFER_VAULT="'"${COFFER_VAULT}"'"
+        parse_path "home-automation/api_token"
+        echo "cat=${COFFER_CATEGORY} key=${COFFER_KEY} file=${COFFER_VAULT_FILE}"
+    ' 2>&1)
+    assert_contains "$output" "cat=home-automation key=api_token" "parse_path should still accept hyphen/underscore names" && \
+    assert_contains "$output" "file=${COFFER_VAULT}/home-automation.yaml" "vault file path should resolve inside the vault dir"
+}
+
 # --- List tests ---
 
 test_list_with_test_vault() {
@@ -2213,6 +2281,12 @@ main() {
     run_test test_require_cmd_fails_for_missing
     run_test test_parse_path_valid
     run_test test_parse_path_invalid_no_slash
+    run_test test_parse_path_rejects_dotdot_category
+    run_test test_parse_path_rejects_traversal_in_category
+    run_test test_parse_path_rejects_leading_dot_category
+    run_test test_parse_path_rejects_bad_chars_category
+    run_test test_parse_path_rejects_dotdot_key
+    run_test test_parse_path_still_accepts_normal_category
 
     # List tests
     run_test test_list_with_test_vault
