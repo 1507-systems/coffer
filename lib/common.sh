@@ -31,7 +31,13 @@ coffer_ntfy_urgent() {
     local body="$2"
     local machine
     machine="$(coffer_machine_id)"
+    # Fetch the write-only ntfy token (scoped to this topic only). Isolated so a
+    # missing/failed lookup can't break or recurse into the alert path; the
+    # server is permissive today but will flip to deny-all, requiring this auth.
+    local ntfy_token=""
+    ntfy_token="$(coffer get ntfy/token-pub-coffer 2>/dev/null | tr -d '\n' || true)"
     curl -s \
+        -H "Authorization: Bearer ${ntfy_token}" \
         -H "Priority: urgent" \
         -H "Title: ${title} [${machine}]" \
         -H "Tags: lock,warning,${machine}" \
