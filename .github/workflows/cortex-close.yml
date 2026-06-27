@@ -1,4 +1,5 @@
 name: Close Cortex Issues
+# adopted 2026-06-27 (verify cross-repo access)
 on:
   push:
     branches: [main]
