@@ -143,6 +143,50 @@ test_die_exits_nonzero() {
     assert_contains "$output" "coffer: error: test error message" "die() should print error message"
 }
 
+test_alert_recursion_guard() {
+    # Regression: the nested `coffer get` that fetches the ntfy token runs with
+    # COFFER_IN_ALERT=1. If it dies (e.g. sops missing) it MUST NOT re-enter
+    # alerting, or one failure recurses into an unbounded ntfy storm. Assert
+    # that die() under COFFER_IN_ALERT sends zero alerts (curl never called).
+    local tmp count n
+    tmp="$(mktemp -d)"
+    count="$tmp/curl_calls"
+    : > "$count"
+    printf '#!/usr/bin/env bash\nprintf x >> "%s"\n' "$count" > "$tmp/curl"
+    chmod +x "$tmp/curl"
+    COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+        export PATH="'"$tmp"':$PATH"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        COFFER_IN_ALERT=1 die "guarded error"
+    ' >/dev/null 2>&1 || true
+    n="$(wc -c < "$count" | tr -d ' ')"
+    rm -rf "$tmp"
+    assert_eq "0" "$n" "die() under COFFER_IN_ALERT must not send an alert"
+}
+
+test_alert_cooldown_dedups() {
+    # Regression: identical alerts within the cooldown window collapse to a
+    # single ntfy send, so a burst of the same failure can't spam. curl should
+    # fire once across two identical coffer_ntfy_urgent calls.
+    local tmp count n
+    tmp="$(mktemp -d)"
+    count="$tmp/curl_calls"
+    : > "$count"
+    printf '#!/usr/bin/env bash\nprintf x >> "%s"\n' "$count" > "$tmp/curl"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/coffer"   # stub nested token fetch
+    chmod +x "$tmp/curl" "$tmp/coffer"
+    COFFER_NTFY_TOPIC="http://localhost:1/fake" HOME="$tmp/home" bash -c '
+        export PATH="'"$tmp"':$PATH"
+        mkdir -p "$HOME"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        coffer_ntfy_urgent "Coffer Error" "same body"
+        coffer_ntfy_urgent "Coffer Error" "same body"
+    ' >/dev/null 2>&1 || true
+    n="$(wc -c < "$count" | tr -d ' ')"
+    rm -rf "$tmp"
+    assert_eq "1" "$n" "identical alerts within cooldown should send only once"
+}
+
 test_warn_prints_to_stderr() {
     local output
     output=$(bash -c '
@@ -2275,6 +2319,8 @@ main() {
 
     # Common helper tests
     run_test test_die_exits_nonzero
+    run_test test_alert_recursion_guard
+    run_test test_alert_cooldown_dedups
     run_test test_warn_prints_to_stderr
     run_test test_log_prints_to_stderr
     run_test test_require_cmd_succeeds_for_existing

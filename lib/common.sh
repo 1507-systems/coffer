@@ -3,8 +3,9 @@
 # Sourced by bin/coffer and all lib/ scripts. Never executed directly.
 set -euo pipefail
 
-# ntfy topic for urgent failure notifications
-COFFER_NTFY_TOPIC="https://ntfy.1507.cloud/infra-alerts"
+# ntfy topic for urgent failure notifications. Overridable via env so tests
+# (and dry-runs) can redirect alerts away from the real infra topic.
+COFFER_NTFY_TOPIC="${COFFER_NTFY_TOPIC:-https://ntfy.1507.cloud/infra-alerts}"
 
 # --- Logging ---
 
@@ -29,13 +30,41 @@ coffer_machine_id() {
 coffer_ntfy_urgent() {
     local title="$1"
     local body="$2"
+
+    # --- de-dup / cooldown -------------------------------------------------
+    # Never send the SAME alert more than once per COFFER_ALERT_COOLDOWN
+    # seconds (default 900 = 15 min). A burst of identical failures (a broken
+    # environment hit repeatedly, several launchd runs in a row) collapses to a
+    # single alert instead of spamming; a genuinely persistent problem still
+    # re-surfaces once per window so it stays visible. Best-effort: if the
+    # state dir or hashing tools aren't available we fall through and send
+    # (visibility beats silence).
+    local cooldown="${COFFER_ALERT_COOLDOWN:-900}"
+    local state_dir="${HOME}/.cache/coffer/alerts"
+    local sig="" marker="" now="" last=""
+    now="$(date +%s 2>/dev/null || echo 0)"
+    sig="$(printf '%s\n%s' "$title" "$body" | shasum -a 256 2>/dev/null | awk '{print $1}')"
+    if [[ -n "$sig" ]]; then
+        marker="${state_dir}/${sig}"
+        if [[ -f "$marker" ]]; then
+            last="$(cat "$marker" 2>/dev/null || echo 0)"
+            if [[ "${now}" -gt 0 && "${last}" -gt 0 ]] && (( now - last < cooldown )); then
+                return 0   # identical alert within the cooldown window — suppress
+            fi
+        fi
+        mkdir -p "$state_dir" 2>/dev/null || true
+        printf '%s' "$now" > "$marker" 2>/dev/null || true
+    fi
+
     local machine
     machine="$(coffer_machine_id)"
-    # Fetch the write-only ntfy token (scoped to this topic only). Isolated so a
-    # missing/failed lookup can't break or recurse into the alert path; the
-    # server is permissive today but will flip to deny-all, requiring this auth.
+    # Fetch the write-only ntfy token (scoped to this topic only) in a GUARDED
+    # subprocess: COFFER_IN_ALERT=1 makes any die() it triggers skip alerting,
+    # so a failure here (e.g. sops missing) can't recurse back into this
+    # function. Without the guard, a broken environment turns one failure into
+    # an unbounded recursion of alerts + coffer subprocesses.
     local ntfy_token=""
-    ntfy_token="$(coffer get ntfy/token-pub-coffer 2>/dev/null | tr -d '\n' || true)"
+    ntfy_token="$(COFFER_IN_ALERT=1 coffer get ntfy/token-pub-coffer 2>/dev/null | tr -d '\n' || true)"
     curl -s \
         -H "Authorization: Bearer ${ntfy_token}" \
         -H "Priority: urgent" \
@@ -46,10 +75,14 @@ coffer_ntfy_urgent() {
 }
 
 # Print an error message, send an ntfy urgent notification, and exit 1.
-# Every failure in coffer is fatal and loud.
+# Every failure in coffer is fatal and loud — but NOT when we're already inside
+# the alert path (COFFER_IN_ALERT): the nested `coffer get` that fetches the
+# ntfy token must never re-enter alerting, or one failure recurses into a storm.
 die() {
     echo "coffer: error: $*" >&2
-    coffer_ntfy_urgent "Coffer Error" "$*"
+    if [[ -z "${COFFER_IN_ALERT:-}" ]]; then
+        coffer_ntfy_urgent "Coffer Error" "$*"
+    fi
     exit 1
 }
 
