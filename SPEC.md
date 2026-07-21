@@ -607,10 +607,22 @@ Every error is fatal and loud. No silent fallbacks. The user must know immediate
 
 **All failures must push to ntfy as urgent.** Any coffer operation that fails (decrypt error, file not found, SOPS error, sync conflict) must send an ntfy notification with priority "urgent" before exiting. This ensures the user is alerted immediately on any device (phone, watch, desktop).
 
+> **⚠️ OPERATOR ACTION REQUIRED:** ntfy.sh (the public hosted service) is
+> retired under fleet policy. `lib/common.sh` reads the topic URL from the
+> `COFFER_NTFY_TOPIC` environment variable at runtime — the code itself is
+> correct and already defaults to a self-hosted `ntfy.1507.cloud` topic when
+> the env var is unset. **What matters is the *deployed* value.** If any
+> machine, launchd job, shell profile, or secrets store still exports
+> `COFFER_NTFY_TOPIC` pointing at `ntfy.sh` (including the legacy
+> `https://ntfy.sh/wiles-watchdog-41aa3b5cea50` topic below), that deployed
+> value must be updated to the self-hosted equivalent
+> (`https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50`) — the running
+> environment overrides whatever default ships in code or docs.
+
 ```bash
 # ntfy notification pattern for all errors:
 curl -s -H "Priority: urgent" -H "Title: Coffer Error" -H "Tags: lock,warning" \
-  -d "Error description here" "https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
+  -d "Error description here" "https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50"
 ```
 
 This is integrated into the `die()` function so every fatal error automatically sends a push notification. Non-fatal warnings (`warn()`) do NOT send ntfy notifications.
@@ -621,7 +633,7 @@ This is integrated into the `die()` function so every fatal error automatically 
 # Every lib/*.sh script starts with:
 set -euo pipefail
 
-COFFER_NTFY_TOPIC="https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
+COFFER_NTFY_TOPIC="https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50"
 
 # Shared error handler in lib/common.sh:
 die() {
