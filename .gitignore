@@ -18,3 +18,6 @@ config/
 
 # Wrangler (Cloudflare Workers dev server) local state
 .wrangler/
+
+# npm dependencies (generated, never commit)
+node_modules/
