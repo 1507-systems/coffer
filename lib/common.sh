@@ -78,10 +78,22 @@ coffer_ntfy_urgent() {
 # Every failure in coffer is fatal and loud — but NOT when we're already inside
 # the alert path (COFFER_IN_ALERT): the nested `coffer get` that fetches the
 # ntfy token must never re-enter alerting, or one failure recurses into a storm.
+#
+# The alert body names the top-level invoking script (BASH_SOURCE[-1], falling
+# back to $0) so a recurring failure identifies its own source instead of
+# requiring a fleet-wide forensic hunt through every launchd/cron/hook log to
+# find which caller has an incomplete PATH (cost real time tracing a
+# "sops not found" storm back to its origin, 2026-09-01). This is stable per
+# caller, not per-PID, so the ntfy cooldown's dedup-by-message-hash still
+# collapses repeats from the same broken source into one alert per window.
 die() {
-    echo "coffer: error: $*" >&2
+    # BASH_SOURCE[-1] (negative indexing) needs bash 4.3+; macOS ships bash
+    # 3.2 as /bin/bash, and several callers invoke scripts with that exact
+    # shebang, so compute the last index manually for compatibility.
+    local caller="${BASH_SOURCE[$((${#BASH_SOURCE[@]} - 1))]:-$0}"
+    echo "coffer: error: $* (from: ${caller})" >&2
     if [[ -z "${COFFER_IN_ALERT:-}" ]]; then
-        coffer_ntfy_urgent "Coffer Error" "$*"
+        coffer_ntfy_urgent "Coffer Error" "$* (from: ${caller})"
     fi
     exit 1
 }
@@ -99,8 +111,25 @@ log() {
 # --- Dependency checks ---
 
 # Verify a command exists on PATH. Dies with install instructions if missing.
+#
+# Falls back to the two standard Homebrew bin dirs before giving up. Several
+# invocation contexts on this fleet (launchd jobs, wrapper daemons, agent
+# sandboxes) start from a minimal PATH that omits the Homebrew bin dir
+# entirely, which produced spurious "Coffer Error: sops not found" alerts
+# even though sops was correctly installed (traced 2026-09-01: the tool was
+# always present, only the caller's PATH was incomplete). On a hit, PATH is
+# exported so the tool resolves for the rest of this process too, not just
+# this check -- callers invoke `sops`/`yq`/`jq` bare afterward.
 require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "$1 not found. Install: brew install $1"
+    command -v "$1" >/dev/null 2>&1 && return 0
+    local dir
+    for dir in /usr/local/bin /opt/homebrew/bin; do
+        if [[ -x "${dir}/$1" ]]; then
+            export PATH="${dir}:${PATH}"
+            return 0
+        fi
+    done
+    die "$1 not found. Install: brew install $1"
 }
 
 # --- Identity and session key helpers ---
