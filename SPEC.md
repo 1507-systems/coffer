@@ -196,7 +196,8 @@ coffer/
 ### Files NOT in the repo / NOT synced
 - `~/.config/coffer/.session-key` -- age private key (cleartext, mode 600, machine-local). Single source of truth for coffer's identity; see [Identity and Unlock Model](#identity-and-unlock-model).
 - `~/.config/coffer/public-key` -- age public key for this machine (used when registering as a recipient on the other machine). Not secret.
-- `~/.config/coffer/machine-name` -- plaintext file containing "wiles" or "verve", used for ntfy alert tagging.
+- `~/.config/coffer/machine-name` -- plaintext file naming this machine, used for ntfy alert tagging.
+- `~/.config/coffer/ntfy-topic` -- optional plaintext file holding the ntfy topic URL for alerts. Machine-local and never committed; `COFFER_NTFY_TOPIC` overrides it.
 
 ---
 
@@ -607,22 +608,22 @@ Every error is fatal and loud. No silent fallbacks. The user must know immediate
 
 **All failures must push to ntfy as urgent.** Any coffer operation that fails (decrypt error, file not found, SOPS error, sync conflict) must send an ntfy notification with priority "urgent" before exiting. This ensures the user is alerted immediately on any device (phone, watch, desktop).
 
-> **⚠️ OPERATOR ACTION REQUIRED:** ntfy.sh (the public hosted service) is
-> retired under fleet policy. `lib/common.sh` reads the topic URL from the
-> `COFFER_NTFY_TOPIC` environment variable at runtime — the code itself is
-> correct and already defaults to a self-hosted `ntfy.1507.cloud` topic when
-> the env var is unset. **What matters is the *deployed* value.** If any
-> machine, launchd job, shell profile, or secrets store still exports
-> `COFFER_NTFY_TOPIC` pointing at `ntfy.sh` (including the legacy
-> `https://ntfy.sh/wiles-watchdog-41aa3b5cea50` topic below), that deployed
-> value must be updated to the self-hosted equivalent
-> (`https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50`) — the running
-> environment overrides whatever default ships in code or docs.
+**The topic URL is deployment configuration and MUST NOT appear in this repository.** An ntfy topic is a bearer-style capability: whoever knows the URL can subscribe to every alert, and on a server that permits anonymous writes can publish forged ones. Coffer therefore ships with no topic baked in.
+
+Resolution order, evaluated at alert time:
+
+| Source | Key | Precedence |
+|--------|-----|------------|
+| Environment | `COFFER_NTFY_TOPIC` | wins |
+| Machine-local file | `${COFFER_CONFIG_DIR}/ntfy-topic` | fallback |
+| Neither set | — | no notification; a line on stderr says so |
+
+The publish token is fetched from the vault at `ntfy/token-pub-coffer` and attached as `Authorization: Bearer`. Neither the token nor the topic is ever written to this repo.
 
 ```bash
-# ntfy notification pattern for all errors:
+# ntfy notification pattern for all errors (topic supplied at runtime):
 curl -s -H "Priority: urgent" -H "Title: Coffer Error" -H "Tags: lock,warning" \
-  -d "Error description here" "https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50"
+  -d "Error description here" "$COFFER_NTFY_TOPIC"
 ```
 
 This is integrated into the `die()` function so every fatal error automatically sends a push notification. Non-fatal warnings (`warn()`) do NOT send ntfy notifications.
@@ -633,7 +634,9 @@ This is integrated into the `die()` function so every fatal error automatically 
 # Every lib/*.sh script starts with:
 set -euo pipefail
 
-COFFER_NTFY_TOPIC="https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50"
+# Empty by default: the topic is deployment data, supplied by the environment
+# or ${COFFER_CONFIG_DIR}/ntfy-topic. Never a literal URL in this repo.
+COFFER_NTFY_TOPIC="${COFFER_NTFY_TOPIC:-}"
 
 # Shared error handler in lib/common.sh:
 die() {

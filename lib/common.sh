@@ -3,9 +3,13 @@
 # Sourced by bin/coffer and all lib/ scripts. Never executed directly.
 set -euo pipefail
 
-# ntfy topic for urgent failure notifications. Overridable via env so tests
-# (and dry-runs) can redirect alerts away from the real infra topic.
-COFFER_NTFY_TOPIC="${COFFER_NTFY_TOPIC:-https://ntfy.1507.cloud/infra-alerts}"
+# ntfy topic for urgent failure notifications. Deliberately EMPTY by default:
+# an ntfy topic URL is a bearer-style capability (whoever knows it reads every
+# alert, and can forge one on a server that allows anonymous writes), so it is
+# deployment data and never ships in this repository. Set it in the
+# environment, or write the URL to ${COFFER_CONFIG_DIR}/ntfy-topic. With
+# neither set, failures still print to stderr but push no notification.
+COFFER_NTFY_TOPIC="${COFFER_NTFY_TOPIC:-}"
 
 # --- Logging ---
 
@@ -23,6 +27,21 @@ coffer_machine_id() {
     printf '%s' "$machine_id"
 }
 
+# Resolve the ntfy topic URL: environment first, then the machine-local config
+# file. Resolved lazily rather than at source time because bin/coffer exports
+# COFFER_CONFIG_DIR *after* it sources this file. Prints nothing when no topic
+# is configured, which callers read as "notifications are off".
+coffer_ntfy_topic() {
+    if [[ -n "${COFFER_NTFY_TOPIC:-}" ]]; then
+        printf '%s' "${COFFER_NTFY_TOPIC}"
+        return 0
+    fi
+    local topic_file="${COFFER_CONFIG_DIR:-${HOME}/.config/coffer}/ntfy-topic"
+    if [[ -r "$topic_file" ]]; then
+        tr -d '[:space:]' < "$topic_file"
+    fi
+}
+
 # Send an urgent ntfy alert tagged with the machine identity so multi-host
 # vaults disclose which machine produced the error. The title carries the
 # identity (lock screens show it) and the tag list includes it for filtering;
@@ -30,6 +49,15 @@ coffer_machine_id() {
 coffer_ntfy_urgent() {
     local title="$1"
     local body="$2"
+
+    # No topic configured: say so on stderr rather than dropping the alert
+    # silently, so a misconfigured deployment is visible instead of quiet.
+    local topic
+    topic="$(coffer_ntfy_topic)"
+    if [[ -z "$topic" ]]; then
+        echo "coffer: no ntfy topic configured (set COFFER_NTFY_TOPIC or ${COFFER_CONFIG_DIR:-${HOME}/.config/coffer}/ntfy-topic); alert not sent" >&2
+        return 0
+    fi
 
     # --- de-dup / cooldown -------------------------------------------------
     # Never send the SAME alert more than once per COFFER_ALERT_COOLDOWN
@@ -71,7 +99,7 @@ coffer_ntfy_urgent() {
         -H "Title: ${title} [${machine}]" \
         -H "Tags: lock,warning,${machine}" \
         -d "${body}" \
-        "${COFFER_NTFY_TOPIC}" >/dev/null 2>&1 || true
+        "${topic}" >/dev/null 2>&1 || true
 }
 
 # Print an error message, send an ntfy urgent notification, and exit 1.
