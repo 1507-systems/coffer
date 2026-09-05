@@ -187,6 +187,51 @@ test_alert_cooldown_dedups() {
     assert_eq "1" "$n" "identical alerts within cooldown should send only once"
 }
 
+test_no_topic_configured_sends_nothing() {
+    # The ntfy topic URL is deployment data, not source. With no topic in the
+    # environment and none in the config dir, coffer must send NOTHING rather
+    # than fall back to a baked-in endpoint, and must say so on stderr.
+    local tmp count n output
+    tmp="$(mktemp -d)"
+    count="$tmp/curl_calls"
+    : > "$count"
+    printf '#!/usr/bin/env bash\nprintf x >> "%s"\n' "$count" > "$tmp/curl"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/coffer"   # stub nested token fetch
+    chmod +x "$tmp/curl" "$tmp/coffer"
+    mkdir -p "$tmp/home/.config/coffer"
+    output=$(COFFER_NTFY_TOPIC="" COFFER_CONFIG_DIR="$tmp/home/.config/coffer" HOME="$tmp/home" bash -c '
+        export PATH="'"$tmp"':$PATH"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        coffer_ntfy_urgent "Coffer Error" "no topic anywhere"
+    ' 2>&1) || true
+    n="$(wc -c < "$count" | tr -d ' ')"
+    rm -rf "$tmp"
+    assert_eq "0" "$n" "an unconfigured topic must send no ntfy request"
+    assert_contains "$output" "no ntfy topic configured" "unconfigured topic should warn on stderr"
+}
+
+test_topic_read_from_config_file() {
+    # The topic may live in a machine-local file so a deployment keeps alerting
+    # without the URL ever entering the repo or a shell profile.
+    local tmp args n
+    tmp="$(mktemp -d)"
+    args="$tmp/curl_args"
+    : > "$args"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >> "%s"\n' "$args" > "$tmp/curl"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/coffer"   # stub nested token fetch
+    chmod +x "$tmp/curl" "$tmp/coffer"
+    mkdir -p "$tmp/home/.config/coffer"
+    printf 'http://localhost:1/from-file\n' > "$tmp/home/.config/coffer/ntfy-topic"
+    COFFER_NTFY_TOPIC="" COFFER_CONFIG_DIR="$tmp/home/.config/coffer" HOME="$tmp/home" bash -c '
+        export PATH="'"$tmp"':$PATH"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        coffer_ntfy_urgent "Coffer Error" "topic from file"
+    ' >/dev/null 2>&1 || true
+    n="$(command grep -c "http://localhost:1/from-file" "$args" || true)"
+    rm -rf "$tmp"
+    assert_eq "1" "$n" "the config-file topic should be the curl target"
+}
+
 test_warn_prints_to_stderr() {
     local output
     output=$(bash -c '
@@ -2321,6 +2366,8 @@ main() {
     run_test test_die_exits_nonzero
     run_test test_alert_recursion_guard
     run_test test_alert_cooldown_dedups
+    run_test test_no_topic_configured_sends_nothing
+    run_test test_topic_read_from_config_file
     run_test test_warn_prints_to_stderr
     run_test test_log_prints_to_stderr
     run_test test_require_cmd_succeeds_for_existing
