@@ -10,7 +10,7 @@
 .claude/
 
 # The vault/ and config/ directories no longer live in this repo.
-# They have moved to the private bryce-shashinka/coffer-vault repo.
+# They have moved to the private coffer-vault repo.
 # If you see a vault/ or config/ directory here, it is a leftover from
 # the old layout and can be safely removed (the vault data is in its new home).
 vault/

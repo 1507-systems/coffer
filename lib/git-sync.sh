@@ -13,7 +13,7 @@
 #
 # VAULT REPO vs TOOL REPO:
 # After the April 2026 vault/tool split, all git operations target COFFER_VAULT_ROOT
-# (bryce-shashinka/coffer-vault) rather than COFFER_ROOT (1507-systems/coffer).
+# (coffer-vault) rather than COFFER_ROOT (1507-systems/coffer).
 # COFFER_ROOT is only the tool code; COFFER_VAULT_ROOT is the data. Staging is
 # restricted to vault/ and config/.sops.yaml -- never the whole working tree.
 #

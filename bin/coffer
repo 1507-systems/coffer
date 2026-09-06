@@ -6,7 +6,7 @@ set -euo pipefail
 # Resolve the coffer root directory (parent of bin/). This is the TOOL repo,
 # not the vault repo. The two are intentionally separated since April 2026:
 # the tool is public (1507-systems/coffer), the vault is private
-# (bryce-shashinka/coffer-vault). COFFER_ROOT is only needed to find lib/ files.
+# (coffer-vault). COFFER_ROOT is only needed to find lib/ files.
 COFFER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export COFFER_ROOT
 
@@ -30,7 +30,7 @@ source "${COFFER_ROOT}/lib/doctor.sh"
 # --- Vault location resolution ---
 #
 # COFFER_VAULT_ROOT is the top-level directory of the private vault repo
-# (e.g., bryce-shashinka/coffer-vault). It defaults to ~/dev/coffer-vault
+# (e.g., coffer-vault). It defaults to ~/dev/coffer-vault
 # but can be overridden via the environment to point at any directory.
 # This separation keeps the open-source tool code in one git repo and
 # the private encrypted data in another.
