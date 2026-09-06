@@ -2,7 +2,7 @@
 
 **Status:** PROPOSED (plan only — no implementation yet)
 **Date:** 2026-06-03
-**Scope:** `1507-systems/coffer` (tool) + `bryce-shashinka/coffer-vault` (private data)
+**Scope:** `1507-systems/coffer` (tool) + `coffer-vault` (private data)
 **Approval:** Merging/approving this PR = approval to implement.
 
 ---
@@ -64,7 +64,7 @@ git supports per-path custom merge drivers, configured in two halves:
 ### a) `.gitattributes` (committed in the vault repo)
 
 ```
-# bryce-shashinka/coffer-vault/.gitattributes
+# coffer-vault/.gitattributes
 vault/**         merge=coffer-sops
 config/.sops.yaml merge=coffer-sops-recipients
 ```

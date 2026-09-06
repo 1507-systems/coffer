@@ -150,7 +150,7 @@ mechanism to make that happen out-of-band.
 
 ### 2026-04-24 - Vault/tool repo split (feat/coffer-vault-root-env-var + chore/remove-vault-from-tool-repo)
 
-**Why the split.** The tool repo (1507-systems/coffer) is public. Committing encrypted vault files to a public repo is structurally wrong even if they are SOPS-encrypted: git history is permanent and public key material is sensitive metadata. The clean solution is to move vault data into a dedicated private repo (bryce-shashinka/coffer-vault) so the tool can be open-source without leaking anything.
+**Why the split.** The tool repo (1507-systems/coffer) is public. Committing encrypted vault files to a public repo is structurally wrong even if they are SOPS-encrypted: git history is permanent and public key material is sensitive metadata. The clean solution is to move vault data into a dedicated private repo (coffer-vault) so the tool can be open-source without leaking anything.
 
 **Changes in this session:**
 
@@ -158,9 +158,9 @@ mechanism to make that happen out-of-band.
 
 - **PR #16 (chore/remove-vault-from-tool-repo):** Removed `config/` and `vault/.gitkeep` from the tool repo. Updated `.gitignore` to drop vault-specific lines. Added top-level `README.md` with setup instructions for new users. Removed the backward-compat in-repo fallback (now COFFER_VAULT_ROOT is required with sensible default).
 
-- **New private repo:** bryce-shashinka/coffer-vault created with initial commit of all vault content. Both Wiles and Verve cloned the repo. COFFER_VAULT_ROOT set in `~/.zshrc.local` on both machines.
+- **New private repo:** coffer-vault created with initial commit of all vault content. Both Wiles and Verve cloned the repo. COFFER_VAULT_ROOT set in `~/.zshrc.local` on both machines.
 
-- **Auto-sync behavior:** `coffer set/edit/import/add-recipient` now auto-commit-push to the vault repo (bryce-shashinka/coffer-vault), not the tool repo. `coffer sync-pull` does `git pull --ff-only` on the vault repo for SessionStart hooks.
+- **Auto-sync behavior:** `coffer set/edit/import/add-recipient` now auto-commit-push to the vault repo (coffer-vault), not the tool repo. `coffer sync-pull` does `git pull --ff-only` on the vault repo for SessionStart hooks.
 
 **Mutagen note:** Mutagen currently syncs coffer-vault/ between machines (fighting with git). A `.mutagenignore` file was added at `~/dev/.mutagenignore` with `coffer-vault/` excluded, but the running session requires termination + recreation to pick up new CLI ignores. Until then, if a `git pull` fails due to Mutagen-pre-delivered content, run `git checkout -- vault/<file>.yaml` then `git pull`. The Mutagen session recreation is documented in the follow-up plan doc.
 

@@ -210,7 +210,7 @@ Each vault file is a standard YAML file encrypted by SOPS. Before encryption, a 
 dns-token: "the-actual-token-value"
 pages-token: "another-token-value"
 zone-mgmt-1507systems: "zone-token-here"
-zone-mgmt-shashinka: "zone-token-here"
+zone-mgmt-example: "zone-token-here"
 zone-mgmt-hellgaskitchen: "zone-token-here"
 ```
 
@@ -221,7 +221,7 @@ After SOPS encryption, the same file looks like:
 dns-token: ENC[AES256_GCM,data:abc123...,iv:...,tag:...,type:str]
 pages-token: ENC[AES256_GCM,data:def456...,iv:...,tag:...,type:str]
 zone-mgmt-1507systems: ENC[AES256_GCM,data:ghi789...,iv:...,tag:...,type:str]
-zone-mgmt-shashinka: ENC[AES256_GCM,data:jkl012...,iv:...,tag:...,type:str]
+zone-mgmt-example: ENC[AES256_GCM,data:jkl012...,iv:...,tag:...,type:str]
 zone-mgmt-hellgaskitchen: ENC[AES256_GCM,data:mno345...,iv:...,tag:...,type:str]
 sops:
     kms: []
@@ -323,7 +323,7 @@ coffer list cloudflare     # keys within cloudflare category
      dns-token
      pages-token
      zone-mgmt-1507systems
-     zone-mgmt-shashinka
+     zone-mgmt-example
      zone-mgmt-hellgaskitchen
    github/
      ...
@@ -540,8 +540,8 @@ shutdown).
 # ~/.mutagen/mutagen.yml (relevant section)
 sync:
   coffer:
-    alpha: "/Users/bryce/dev/coffer/vault"
-    beta: "wiles:/Users/rogue/dev/coffer/vault"
+    alpha: "/Users/<user>/dev/coffer/vault"
+    beta: "<host>:/Users/<user>/dev/coffer/vault"
     mode: "two-way-resolved"
     resolve:
       strategy: "alpha-wins"
@@ -843,7 +843,7 @@ Claude Code - Zoho CRM Client ID
 Claude Code - Zoho CRM Client Secret
 Claude Code - CRM Worker Auth
 Claude - 1507.systems - Zone Management
-Claude - shashinka.org - Zone Management
+Claude - example.org - Zone Management
 Claude - hellgaskitchen.com - Zone Management
 Claude Code - Resend HK
 Claude Code - HK Email Auth
@@ -882,7 +882,7 @@ mappings:
   "Claude Code - CF Tunnel SNaI": cloudflare/tunnel-snai
   "Claude Code - Access": cloudflare/access-token
   "Claude - 1507.systems - Zone Management": cloudflare/zone-mgmt-1507systems
-  "Claude - shashinka.org - Zone Management": cloudflare/zone-mgmt-shashinka
+  "Claude - example.org - Zone Management": cloudflare/zone-mgmt-example
   "Claude - hellgaskitchen.com - Zone Management": cloudflare/zone-mgmt-hellgaskitchen
 
   # === Home Automation ===

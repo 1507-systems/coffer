@@ -74,7 +74,7 @@ run_test() {
 setup_test_env() {
     TEST_DIR=$(mktemp -d)
     export COFFER_ROOT="${TEST_DIR}/coffer"
-    # COFFER_VAULT_ROOT mimics the private vault repo (bryce-shashinka/coffer-vault)
+    # COFFER_VAULT_ROOT mimics the private vault repo (coffer-vault)
     # in tests. Both the vault data (vault/*.yaml) and the SOPS config live under
     # COFFER_VAULT_ROOT, while COFFER_ROOT is only the tool code directory.
     # Setting COFFER_VAULT_ROOT here prevents bin/coffer from falling back to the
@@ -93,7 +93,7 @@ setup_test_env() {
     cp "${real_root}"/lib/*.sh "${COFFER_ROOT}/lib/"
 
     # Create a minimal .sops.yaml in the vault config dir. The real config lives in
-    # the private vault repo (bryce-shashinka/coffer-vault), not the tool repo.
+    # the private vault repo (coffer-vault), not the tool repo.
     # Tests that need a specific .sops.yaml (e.g., multi-recipient tests) create
     # their own in a separate sandbox and do not go through setup_test_env.
     # This placeholder is enough to make list/get/set tests that check for the
