@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS:
 # The April 2026 .sops.yaml/vault drift bug was caused by Mutagen syncing file
-# *content* between Wiles and Verve without syncing git state. A machine could
+# *content* between host A and host B without syncing git state. A machine could
 # have all the right bytes on disk but be N commits behind origin/main, so the
 # next `coffer set` on that machine re-encrypted with a stale recipient list.
 #

@@ -21,24 +21,24 @@ coffer has **no daemon**. It auto-syncs git state **only immediately before a
 write** (`auto_sync_pull` in `lib/git-sync.sh`, invoked from the `set` / `delete`
 / `edit` / `import` cases in `bin/coffer`). Reads (`coffer get`) never pull, so
 between writes a machine's vault can silently lag `origin/main`. This widens the
-divergence window between Wiles and Verve.
+divergence window between host A and host B.
 
 ### Today's incident (2026-06-03) — the motivating example
 
-1. On **Verve**, Bryce ran `coffer set <some/key>`. That re-encrypted a category
+1. On **host B**, Bryce ran `coffer set <some/key>`. That re-encrypted a category
    file, committed, and pushed to `origin/main` (`auto_sync_push`).
-2. Meanwhile on **Wiles**, a `coffer set` touched a **different key in the same
-   category file**, based on the same parent commit (before Verve's push).
+2. Meanwhile on **host A**, a `coffer set` touched a **different key in the same
+   category file**, based on the same parent commit (before host B's push).
 3. Both edits changed the same encrypted file. The ciphertext is opaque
    AES-GCM blobs plus a MAC over the whole document — there is no line-level
-   structure git can reconcile. When Wiles' `auto_sync_pull` ran
+   structure git can reconcile. When host A' `auto_sync_pull` ran
    `git pull --rebase origin main`, git tried a 3-way text merge of the
    encrypted blob, could not resolve it, and the rebase conflicted.
 4. `auto_sync_pull` does exactly what it is written to do on conflict: it runs
    `git rebase --abort` and `die()`s loudly (see the `pull --rebase failed
    (conflict in encrypted vault?)` branch in both `lib/git-sync.sh` and
    `cmd_refresh` in `bin/coffer`).
-5. Recovery was manual: `git reset --hard origin/main` on Wiles, then re-apply
+5. Recovery was manual: `git reset --hard origin/main` on host A, then re-apply
    the lost `set`.
 
 Two **logically non-conflicting writes** (different keys) produced a hard stop
@@ -284,7 +284,7 @@ It does, idempotently, in `COFFER_VAULT_ROOT`:
   `git config --get merge.coffer-sops.driver`), and/or
 - Add it to the **SessionStart** hook that already runs `coffer refresh`.
 
-**Must land on BOTH Wiles and Verve.** Rollout (§9) explicitly runs it on each
+**Must land on BOTH host A and host B.** Rollout (§9) explicitly runs it on each
 machine and verifies via `git config --get merge.coffer-sops.driver`.
 
 ---
@@ -352,10 +352,10 @@ smoke-test-on-target-machine-class gate before commit.
 1. Implement `lib/merge-driver.sh` (`cmd_merge_driver`), wire `merge-driver` and
    `install-merge-driver` into the `bin/coffer` dispatcher `case`, update
    `usage()`.
-2. Add tests (§8); pass locally on macOS (Verve **and** Wiles machine class).
+2. Add tests (§8); pass locally on macOS (host B **and** host A machine class).
 3. fresh-eyes-review + security review focused on §5.
 4. PR against `1507-systems/coffer`; merge.
-5. `git pull` the tool repo on **Wiles** and **Verve**.
+5. `git pull` the tool repo on **host A** and **host B**.
 6. On **each** machine: `coffer install-merge-driver`, then verify
    `git config --get merge.coffer-sops.driver` is set and `cat
    $COFFER_VAULT_ROOT/.gitattributes` shows the routing lines.

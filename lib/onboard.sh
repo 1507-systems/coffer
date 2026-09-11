@@ -50,7 +50,7 @@ Steps:
   4. Writes the public key to vault/.pending-recipient-<machine-name>.pub —
      a plaintext, unencrypted file that travels via Mutagen and git.
   5. Instructs you to wait for Mutagen to sync, then run
-     `coffer finalize-onboard` on the trusted machine (Wiles).
+     `coffer finalize-onboard` on the trusted machine (host A).
 
 The pending file is NOT a secret. Exposing a public key does not compromise
 vault security — it only allows someone to add you as a recipient (which
@@ -72,7 +72,7 @@ EOF
     # delegate to the bin/coffer dispatcher so the user gets the full init UX.
     if [[ ! -f "$session_key_file" ]] || [[ ! -s "$session_key_file" ]]; then
         # Bug A fix: the old message "running 'coffer init' first..." looked
-        # like an instruction to the user to type that command. On Verve
+        # like an instruction to the user to type that command. On host B
         # (2026-04-22) the user typed "coffer init" at the machine-name prompt
         # and their machine-name was recorded as that string. The new message
         # makes clear that coffer is handling this step automatically, and gives
@@ -84,7 +84,7 @@ EOF
         log ""
         log "=== Step 1 of 2: generate age identity ==="
         log "You will be prompted for a machine name. Press Enter to accept the default"
-        log "(based on hostname), or type a short name like 'verve' or 'macbook'."
+        log "(based on hostname), or type a short name like 'hostb' or 'macbook'."
         log ""
         # Set COFFER_FROM_ONBOARD so init.sh can suppress its manual-steps output
         # (those steps — add-recipient, import csv — contradict onboard's own flow
@@ -166,7 +166,7 @@ coffer:   ${pending_file}
 
 coffer: Next steps:
 coffer:   1. Wait for Mutagen to sync the vault (or git push/pull if Mutagen is not running).
-coffer:   2. On the already-trusted machine (Wiles), run:
+coffer:   2. On the already-trusted machine (host A), run:
 coffer:        coffer finalize-onboard
 coffer:   3. After finalize-onboard completes, Mutagen will sync the re-encrypted vault back.
 coffer:   4. Verify on this machine: coffer list
@@ -197,7 +197,7 @@ Steps:
   3. Prints a summary and reminds you to commit + push so Mutagen can sync the
      re-encrypted vault back to the new machine.
 
-Run on the already-trusted machine (Wiles) after Mutagen has synced the
+Run on the already-trusted machine (host A) after Mutagen has synced the
 pending-recipient file(s) from the new machine.
 EOF
                 return 0

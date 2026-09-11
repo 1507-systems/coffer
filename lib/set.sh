@@ -41,7 +41,7 @@ cmd_set() {
     # Encryption recipients come from .sops.yaml (COFFER_SOPS_CONFIG), NOT from
     # the local public-key file. Passing --age on the command line overrides
     # .sops.yaml entirely and silently drops every other recipient — which is
-    # exactly the bug that locked Wiles out of cloudflare/* and ai/* in
+    # exactly the bug that locked host A out of cloudflare/* and ai/* in
     # April 2026, because every cross-machine `coffer set` re-encrypted with
     # only the writing machine's key.
     #

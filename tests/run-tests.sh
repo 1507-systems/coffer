@@ -405,7 +405,7 @@ test_list_missing_category_fails() {
 }
 
 # Bug C: coffer list must not crash when a vault yaml file is empty or null.
-# Regression: on Verve, github.yaml was null-valued and caused list to print
+# Regression: on host B, github.yaml was null-valued and caused list to print
 #   "Error: cannot get keys of !!null" and stop iterating entirely.
 
 test_list_empty_map_category_does_not_crash() {
@@ -534,8 +534,8 @@ test_onboard_whitespace_machine_name_internal_space() {
 }
 
 test_onboard_whitespace_machine_name_leading_trailing() {
-    # A machine-name file with leading/trailing whitespace (e.g., " verve ")
-    # should be trimmed to "verve", not produce " verve" or "verve " as the
+    # A machine-name file with leading/trailing whitespace (e.g., " hostb ")
+    # should be trimmed to "hostb", not produce " hostb" or "hostb " as the
     # pending filename.
     if ! command -v age-keygen >/dev/null 2>&1; then
         echo "  SKIP (age-keygen not installed)"
@@ -559,7 +559,7 @@ test_onboard_whitespace_machine_name_leading_trailing() {
     chmod 600 "${config_dir}/.session-key"
     printf '%s\n' "$pub_key" > "${config_dir}/public-key"
     # Leading and trailing spaces around a simple name
-    printf '  verve  \n' > "${config_dir}/machine-name"
+    printf '  hostb  \n' > "${config_dir}/machine-name"
 
     # shellcheck disable=SC2030,SC2031
     (
@@ -576,13 +576,13 @@ test_onboard_whitespace_machine_name_leading_trailing() {
         cmd_onboard
     ) 2>/dev/null
 
-    local pending_file="${vault_dir}/.pending-recipient-verve.pub"
+    local pending_file="${vault_dir}/.pending-recipient-hostb.pub"
     local ok=0
     [[ -f "$pending_file" ]] && ok=1
     rm -rf "$sandbox"
 
     if [[ $ok -eq 0 ]]; then
-        echo "  FAIL: expected pending file .pending-recipient-verve.pub after leading/trailing trim"
+        echo "  FAIL: expected pending file .pending-recipient-hostb.pub after leading/trailing trim"
         return 1
     fi
     return 0
@@ -653,8 +653,8 @@ test_coffer_version() {
 # Bug: cmd_set called `sops encrypt --age <single-pubkey>`, which overrode the
 # .sops.yaml multi-recipient list and silently re-encrypted with only the
 # writing machine's key. Any cross-machine `coffer set` then locked the other
-# machine out of that category file. Caught after Wiles couldn't decrypt
-# cloudflare/* and ai/* (last-written-on-Verve) on 2026-04-19.
+# machine out of that category file. Caught after host A couldn't decrypt
+# cloudflare/* and ai/* (last-written-on-host B) on 2026-04-19.
 #
 # Fix: drop --age, use SOPS_CONFIG + --filename-override so all recipients
 # from .sops.yaml are applied to both new-file and update paths.

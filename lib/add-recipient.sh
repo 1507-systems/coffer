@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # add-recipient.sh -- Add an age public key as an additional SOPS recipient
 # Adds the key to .sops.yaml and re-encrypts all vault files so both
-# machines (e.g., Verve and Wiles) can decrypt.
+# machines (e.g., host B and host A) can decrypt.
 # Usage: coffer add-recipient <age-public-key>
 set -euo pipefail
 

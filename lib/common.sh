@@ -14,7 +14,7 @@ COFFER_NTFY_TOPIC="${COFFER_NTFY_TOPIC:-}"
 # --- Logging ---
 
 # Return the machine identity used in alert titles/tags.
-# Prefers the coffer machine-name file (wiles/verve) and falls back to the
+# Prefers the coffer machine-name file (hosta/hostb) and falls back to the
 # short hostname if coffer hasn't been initialized. Always prints something.
 coffer_machine_id() {
     local machine_id=""
