@@ -6,8 +6,9 @@
 # files with 3 recipients via sops updatekeys, but never committed/pushed
 # .sops.yaml, leaving host A's git-tracked config at 2 recipients) was invisible
 # until a write operation failed. `coffer doctor` surfaces drift proactively:
-# it compares each vault file's embedded recipient list against the canonical
-# list in config/.sops.yaml and reports any mismatch before it causes a lockout.
+# it compares each vault file's embedded recipient list against the
+# creation_rule in config/.sops.yaml that matches the file (first match wins,
+# as in sops) and reports any mismatch before it causes a lockout.
 #
 # Usage:  coffer doctor
 # Exit:   0 if all checks pass, 1 if any drift or problem is found.
@@ -27,31 +28,90 @@ _line_ok()    { printf '%s %s\n' "$(_color_ok    '[OK]')"    "$*"; }
 _line_drift() { printf '%s %s\n' "$(_color_drift '[DRIFT]')" "$*"; }
 
 # --- Recipient parsing helpers ---
+#
+# config/.sops.yaml holds an ordered list of creation_rules, and sops applies
+# the FIRST rule whose path_regex matches the file being encrypted (a rule with
+# no path_regex matches everything). Each rule carries its own recipient list,
+# so "the canonical recipients" is a per-file question, never a single list.
+#
+# The string sops matches path_regex against is the file's path relative to
+# the directory holding .sops.yaml when coffer passes an absolute
+# --filename-override (the only form coffer uses), and the override verbatim
+# when it is relative. Verified against sops 3.12.2: with the config at
+# config/.sops.yaml, vault/github.yaml is matched as ../vault/github.yaml.
 
-# Parse the canonical age recipient list from config/.sops.yaml.
-# The file has the structure:
-#   creation_rules:
-#     - path_regex: vault/.*\.yaml$
-#       age: >-
-#         key1,key2,key3
-#
-# The >- block may wrap across lines; yq normalizes it. We fall back to a
-# grep-based approach if yq is unavailable so doctor can run even on a
-# partially-bootstrapped machine.
-#
-# Prints one key per line on stdout.
-parse_sops_yaml_recipients() {
+# The path sops matches path_regex against for a given file.
+# Lexical on purpose, like filepath.Rel in sops: symlinks are not resolved.
+sops_match_path() {
     local sops_config="$1"
+    local file="$2"
+
+    if [[ "$file" != /* ]]; then
+        printf '%s\n' "$file"
+        return 0
+    fi
+
+    local base
+    base=$(dirname "$sops_config")
+    [[ "$base" == /* ]] || base="${PWD}/${base#./}"
+
+    local up=""
+    while [[ "$file" != "${base%/}/"* ]]; do
+        [[ "$base" == "/" ]] && break
+        base=$(dirname "$base")
+        up="../${up}"
+    done
+    printf '%s%s\n' "$up" "${file#"${base%/}/"}"
+}
+
+# Zero-based index of the creation_rule sops would apply to a match path, or
+# empty when no rule matches (sops refuses to encrypt such a file).
+# yq's test() is Go regexp, the same engine sops compiles path_regex with.
+sops_rule_index_for_path() {
+    local sops_config="$1"
+    local match_path="$2"
     require_cmd yq
 
-    # yq expression: grab the first creation_rules entry's age field and split
-    # on commas. The >- folded scalar collapses newlines, so the value is a
-    # single comma-separated string. We split on comma+optional-whitespace.
+    COFFER_MATCH_PATH="$match_path" yq \
+        '[.creation_rules[] | .path_regex as $re | (($re == null) or (strenv(COFFER_MATCH_PATH) | test($re)))]
+         | to_entries | filter(.value == true) | .[0].key // ""' \
+        "$sops_config" 2>/dev/null || true
+}
+
+# Number of creation_rules in the config (0 when absent or malformed).
+sops_rule_count() {
+    local sops_config="$1"
+    require_cmd yq
+    local n
+    n=$(yq '.creation_rules | length' "$sops_config" 2>/dev/null || echo 0)
+    [[ "$n" =~ ^[0-9]+$ ]] && printf '%s\n' "$n" || printf '0\n'
+}
+
+# The path_regex of one rule, for display. Empty when the rule has none.
+sops_rule_regex() {
+    local sops_config="$1"
+    local index="$2"
+    yq ".creation_rules[${index}].path_regex // \"\"" "$sops_config" 2>/dev/null || true
+}
+
+# Parse the age recipient list of one creation_rule. The rule looks like:
+#   - path_regex: vault/.*\.yaml$
+#     age: >-
+#       key1,key2,key3
+#
+# The >- block may wrap across lines; yq normalizes it to one comma-separated
+# string. Prints one key per line on stdout; returns 1 when the rule has no
+# age field, which callers treat as a drift condition.
+parse_sops_rule_recipients() {
+    local sops_config="$1"
+    local index="$2"
+    require_cmd yq
+
     local age_value
-    age_value=$(yq '.creation_rules[0].age' "$sops_config" 2>/dev/null || echo "")
+    age_value=$(yq ".creation_rules[${index}].age" "$sops_config" 2>/dev/null || echo "")
 
     if [[ -z "$age_value" ]] || [[ "$age_value" == "null" ]]; then
-        return 1  # caller treats empty list as a drift condition
+        return 1
     fi
 
     # Split comma-separated list; trim whitespace around each key.
@@ -67,6 +127,22 @@ parse_sops_yaml_recipients() {
         key="${key%"${key##*[![:space:]]}"}"
         [[ -n "$key" ]] && printf '%s\n' "$key"
     done
+}
+
+# Parse the age recipients sops would encrypt a given vault file with: the
+# recipients of the first creation_rule matching that file's path.
+# Prints one key per line on stdout; returns 1 when no rule matches or the
+# matching rule has no age field.
+parse_sops_yaml_recipients() {
+    local sops_config="$1"
+    local vault_file="$2"
+
+    local match_path index
+    match_path=$(sops_match_path "$sops_config" "$vault_file")
+    index=$(sops_rule_index_for_path "$sops_config" "$match_path")
+    [[ -n "$index" ]] || return 1
+
+    parse_sops_rule_recipients "$sops_config" "$index"
 }
 
 # Parse the recipient list embedded in a SOPS-encrypted vault file.
@@ -117,6 +193,17 @@ compare_recipient_sets() {
     return $any_diff
 }
 
+# Join a newline-separated key list as abbreviated keys, comma separated.
+# Pure bash: BSD paste -s needs a file argument on macOS.
+_abbrev_join() {
+    local out="" k
+    while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        out="${out:+${out}, }$(_abbrev_key "$k")"
+    done <<< "$1"
+    printf '%s' "$out"
+}
+
 # Truncate an age pubkey for display: show age1 prefix + first 8 chars + ...
 # This keeps output scannable without blowing up terminal width.
 _abbrev_key() {
@@ -156,37 +243,46 @@ cmd_doctor() {
         return 1
     fi
 
-    local canonical_recipients
-    canonical_recipients=$(parse_sops_yaml_recipients "$sops_config" 2>/dev/null || echo "")
+    local rule_count
+    rule_count=$(sops_rule_count "$sops_config")
 
-    if [[ -z "$canonical_recipients" ]]; then
-        _line_drift ".sops.yaml: could not parse age recipients (file may be malformed)"
+    if [[ "$rule_count" -eq 0 ]]; then
+        _line_drift ".sops.yaml: no creation_rules found (file may be malformed)"
         issues=$((issues + 1))
         echo ""
         _summary "$issues"
         return 1
     fi
 
-    local recipient_count
-    recipient_count=$(printf '%s\n' "$canonical_recipients" | grep -c '.' || echo 0)
-
-    # Build a short display list of abbreviated keys.
-    # Pure bash join to avoid BSD paste's stdin limitation (paste -sd requires
-    # a file argument on macOS, unlike GNU paste which accepts stdin).
-    local abbrev_list=""
-    while IFS= read -r k; do
-        local abbrev
-        abbrev=$(_abbrev_key "$k")
-        if [[ -z "$abbrev_list" ]]; then
-            abbrev_list="$abbrev"
+    # One line per rule: a rule sops can select must carry recipients.
+    local rule_index=0
+    while [[ $rule_index -lt $rule_count ]]; do
+        local rule_label="rule $((rule_index + 1))"
+        local rule_regex
+        rule_regex=$(sops_rule_regex "$sops_config" "$rule_index")
+        if [[ -n "$rule_regex" ]]; then
+            rule_label="${rule_label} (${rule_regex})"
         else
-            abbrev_list="${abbrev_list}, ${abbrev}"
+            rule_label="${rule_label} (any path)"
         fi
-    done <<< "$canonical_recipients"
-    _line_ok ".sops.yaml: ${recipient_count} recipient(s) (${abbrev_list})"
+
+        local rule_recipients
+        rule_recipients=$(parse_sops_rule_recipients "$sops_config" "$rule_index" 2>/dev/null || echo "")
+        if [[ -z "$rule_recipients" ]]; then
+            _line_drift ".sops.yaml ${rule_label}: could not parse age recipients (file may be malformed)"
+            issues=$((issues + 1))
+        else
+            local rule_recipient_count
+            rule_recipient_count=$(printf '%s\n' "$rule_recipients" | grep -c '.' || echo 0)
+            _line_ok ".sops.yaml ${rule_label}: ${rule_recipient_count} recipient(s) ($(_abbrev_join "$rule_recipients"))"
+        fi
+        rule_index=$((rule_index + 1))
+    done
 
     # --- Check 2: Identity consistency ---
-    # This machine's pubkey must appear in the canonical recipient list.
+    # This machine's pubkey must appear in at least one rule. A rule that
+    # leaves it out is how a file is kept from this machine on purpose, so
+    # only absence from every rule is drift.
     local pubkey_file="${config_dir}/public-key"
     if [[ ! -f "$pubkey_file" ]]; then
         _line_drift "Identity: ~/.config/coffer/public-key not found — run: coffer init"
@@ -205,10 +301,23 @@ cmd_doctor() {
             machine_name="${machine_name%"${machine_name##*[![:space:]]}"}"
         fi
 
-        if printf '%s\n' "$canonical_recipients" | grep -qF "$my_pubkey"; then
-            _line_ok "Identity: $(_abbrev_key "$my_pubkey") is in recipient list (machine: ${machine_name})"
+        local rules_with_me=0
+        rule_index=0
+        while [[ $rule_index -lt $rule_count ]]; do
+            local rule_keys
+            rule_keys=$(parse_sops_rule_recipients "$sops_config" "$rule_index" 2>/dev/null || echo "")
+            # Whole-line match without a pipe: grep -q closing early under
+            # pipefail reads as "not found".
+            if [[ $'\n'"${rule_keys}"$'\n' == *$'\n'"${my_pubkey}"$'\n'* ]]; then
+                rules_with_me=$((rules_with_me + 1))
+            fi
+            rule_index=$((rule_index + 1))
+        done
+
+        if [[ $rules_with_me -gt 0 ]]; then
+            _line_ok "Identity: $(_abbrev_key "$my_pubkey") is in ${rules_with_me} of ${rule_count} rule(s) (machine: ${machine_name})"
         else
-            _line_drift "Identity: $(_abbrev_key "$my_pubkey") (machine: ${machine_name}) NOT in .sops.yaml recipient list"
+            _line_drift "Identity: $(_abbrev_key "$my_pubkey") (machine: ${machine_name}) NOT in any .sops.yaml creation_rule"
             _line_drift "         This machine cannot decrypt vault files encrypted after the last add-recipient."
             _line_drift "         Run 'coffer finalize-onboard' on a trusted machine to fix this."
             issues=$((issues + 1))
@@ -282,8 +391,9 @@ cmd_doctor() {
 
     # --- Check 4: Vault file recipient drift ---
     # For each encrypted vault file, compare its embedded recipient list to the
-    # canonical list. Any mismatch means a sops updatekeys ran with a different
-    # .sops.yaml than what is currently on disk — the root cause of the bug.
+    # rule that matches it. Any mismatch means a sops updatekeys ran with a
+    # different .sops.yaml than what is currently on disk — the root cause of
+    # the bug.
     if [[ ! -d "$vault_dir" ]]; then
         _line_drift "Vault directory not found at ${vault_dir}"
         issues=$((issues + 1))
@@ -318,6 +428,28 @@ cmd_doctor() {
 
             local file_count
             file_count=$(printf '%s\n' "$file_recipients" | grep -c '.' || echo 0)
+
+            local match_path file_rule
+            match_path=$(sops_match_path "$sops_config" "$vault_file")
+            file_rule=$(sops_rule_index_for_path "$sops_config" "$match_path")
+            if [[ -z "$file_rule" ]]; then
+                _line_drift "vault/${filename}: no creation_rule matches ${match_path} (sops would refuse to encrypt it)"
+                total_drifted=$((total_drifted + 1))
+                issues=$((issues + 1))
+                continue
+            fi
+
+            local canonical_recipients
+            canonical_recipients=$(parse_sops_rule_recipients "$sops_config" "$file_rule" 2>/dev/null || echo "")
+            if [[ -z "$canonical_recipients" ]]; then
+                _line_drift "vault/${filename}: matching rule $((file_rule + 1)) has no age recipients"
+                total_drifted=$((total_drifted + 1))
+                issues=$((issues + 1))
+                continue
+            fi
+
+            local recipient_count
+            recipient_count=$(printf '%s\n' "$canonical_recipients" | grep -c '.' || echo 0)
 
             # Compare sets in both directions.
             local diff_output
@@ -359,7 +491,7 @@ cmd_doctor() {
                     detail="${detail}extra ${abbrev_extra}"
                 fi
 
-                _line_drift "vault/${filename}: ${file_count} recipient(s) in file vs ${recipient_count} in .sops.yaml (${detail})"
+                _line_drift "vault/${filename}: ${file_count} recipient(s) in file vs ${recipient_count} in .sops.yaml rule $((file_rule + 1)) (${detail})"
                 total_drifted=$((total_drifted + 1))
                 issues=$((issues + 1))
             fi
@@ -428,9 +560,10 @@ preflight_recipient_check() {
     # No encrypted files yet (fresh vault) — nothing to compare against.
     [[ -n "$sample_file" ]] || return 0
 
-    # Parse both lists.
+    # Parse both lists. The canonical list is the one sops would apply to the
+    # sampled file, so a narrower rule above the general one is not drift.
     local canonical_recipients
-    canonical_recipients=$(parse_sops_yaml_recipients "$sops_config" 2>/dev/null || echo "")
+    canonical_recipients=$(parse_sops_yaml_recipients "$sops_config" "$sample_file" 2>/dev/null || echo "")
     [[ -n "$canonical_recipients" ]] || return 0  # can't parse — let write proceed
 
     local file_recipients

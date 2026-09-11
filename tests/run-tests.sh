@@ -1486,6 +1486,212 @@ EOF
     assert_contains "$output" "coffer doctor" "error should point the user to coffer doctor"
 }
 
+# f. sops_match_path derives the string sops tests path_regex against: relative
+#    to the .sops.yaml directory for absolute files, verbatim for relative ones.
+test_sops_match_path_relative_to_config_dir() {
+    local output
+    output=$(bash -c '
+        source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+        source "'"${SCRIPT_DIR}/../lib/doctor.sh"'"
+        sops_match_path /repo/config/.sops.yaml /repo/vault/github.yaml
+        sops_match_path /repo/.sops.yaml /repo/vault/github.yaml
+        sops_match_path /repo/config/.sops.yaml vault/github.yaml
+        sops_match_path /.sops.yaml /repo/vault/github.yaml
+    ' 2>&1)
+    assert_eq $'../vault/github.yaml\nvault/github.yaml\nvault/github.yaml\nrepo/vault/github.yaml' "$output" \
+        "match path should be relative to the .sops.yaml directory for absolute files and verbatim otherwise"
+}
+
+# g. Rule selection follows sops: first matching path_regex wins, a rule with
+#    no path_regex matches everything, and no match yields no rule.
+test_sops_rule_index_first_match_wins() {
+    local sandbox
+    sandbox=$(mktemp -d)
+    mkdir -p "${sandbox}/config"
+    cat > "${sandbox}/config/.sops.yaml" <<'EOF'
+creation_rules:
+  - path_regex: narrow\.yaml$
+    age: age1narrow
+  - path_regex: vault/.*\.yaml$
+    age: >-
+      age1broadA, age1broadB
+  - age: age1any
+EOF
+    cat > "${sandbox}/anchored.sops.yaml" <<'EOF'
+creation_rules:
+  - path_regex: ^vault/.*\.yaml$
+    age: age1anchored
+EOF
+
+    local output
+    output=$(bash -c '
+        source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+        source "'"${SCRIPT_DIR}/../lib/doctor.sh"'"
+        cfg="'"${sandbox}/config/.sops.yaml"'"
+        sops_rule_index_for_path "$cfg" ../vault/narrow.yaml
+        sops_rule_index_for_path "$cfg" ../vault/other.yaml
+        sops_rule_index_for_path "$cfg" notes.txt
+        echo "[$(sops_rule_index_for_path "'"${sandbox}/anchored.sops.yaml"'" ../vault/other.yaml)]"
+        sops_rule_count "$cfg"
+        parse_sops_yaml_recipients "$cfg" "'"${sandbox}/vault/other.yaml"'"
+        parse_sops_yaml_recipients "$cfg" "'"${sandbox}/vault/narrow.yaml"'"
+    ' 2>&1)
+    rm -rf "$sandbox"
+
+    assert_eq $'0\n1\n2\n[]\n3\nage1broadA\nage1broadB\nage1narrow' "$output" \
+        "rule index, count and per-file recipients should follow sops first-match semantics"
+}
+
+# Encrypt a JSON document into a vault file the way coffer does: absolute
+# --filename-override so sops selects the creation_rule itself.
+# Usage: _sops_encrypt_into <sops-config> <age-secret-key> <vault-file>
+_sops_encrypt_into() {
+    local sops_config="$1" secret="$2" vault_file="$3"
+    jq -n '{"test-key": "test-value"}' \
+        | SOPS_AGE_KEY="$secret" SOPS_CONFIG="$sops_config" \
+          sops encrypt --filename-override "$vault_file" \
+            --input-type json --output-type yaml /dev/stdin > "$vault_file" 2>/dev/null
+}
+
+# Rewrite the doctor sandbox .sops.yaml as two rules: narrow.yaml gets key A
+# only, every other vault file gets A and B.
+_write_two_rule_sops_config() {
+    local sandbox="$1"
+    local pub_a pub_b
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    pub_b=$(grep "public key" "${sandbox}/keyB.txt" | awk '{print $4}')
+    cat > "$DOCTOR_SANDBOX_SOPS" <<EOF
+creation_rules:
+  - path_regex: narrow\\.yaml\$
+    age: ${pub_a}
+  - path_regex: vault/.*\\.yaml\$
+    age: >-
+      ${pub_a},${pub_b}
+EOF
+}
+
+_run_doctor_in_sandbox() {
+    COFFER_VAULT_ROOT="${DOCTOR_SANDBOX_ROOT}" \
+    COFFER_ROOT="${DOCTOR_SANDBOX_ROOT}" \
+    COFFER_VAULT="${DOCTOR_SANDBOX_VAULT}" \
+    COFFER_SOPS_CONFIG="${DOCTOR_SANDBOX_SOPS}" \
+    COFFER_CONFIG_DIR="${DOCTOR_SANDBOX_CONFIG}" \
+    COFFER_SESSION_KEY="${DOCTOR_SANDBOX_CONFIG}/.session-key" \
+    COFFER_NTFY_TOPIC="http://localhost:1/fake" \
+    bash -c '
+        source "'"${SCRIPT_DIR}/../lib/common.sh"'"
+        source "'"${SCRIPT_DIR}/../lib/doctor.sh"'"
+        die() { echo "die: $*" >&2; exit 1; }
+        '"$1"'
+    ' 2>&1
+}
+
+# h. Two-rule config: sops encrypts each file under its first matching rule,
+#    and doctor judges each file against that same rule.
+test_doctor_two_rule_config_first_match_wins() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_doctor_sandbox "$sandbox"
+    _write_two_rule_sops_config "$sandbox"
+
+    local secret_a
+    secret_a=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+    _sops_encrypt_into "$DOCTOR_SANDBOX_SOPS" "$secret_a" "${DOCTOR_SANDBOX_VAULT}/narrow.yaml" \
+        && _sops_encrypt_into "$DOCTOR_SANDBOX_SOPS" "$secret_a" "${DOCTOR_SANDBOX_VAULT}/broad.yaml" \
+        || { rm -rf "$sandbox"; echo "  SKIP (sops encrypt failed)"; return 0; }
+
+    # sops itself must have applied rule 1 to narrow.yaml and rule 2 to broad.yaml;
+    # this pins the semantics doctor mirrors.
+    local narrow_n broad_n
+    narrow_n=$(yq '.sops.age | length' "${DOCTOR_SANDBOX_VAULT}/narrow.yaml")
+    broad_n=$(yq '.sops.age | length' "${DOCTOR_SANDBOX_VAULT}/broad.yaml")
+
+    local output rc=0
+    output=$(_run_doctor_in_sandbox cmd_doctor) || rc=$?
+    rm -rf "$sandbox"
+
+    assert_eq "1" "$narrow_n" "sops should encrypt narrow.yaml under the first (narrow) rule" || return 1
+    assert_eq "2" "$broad_n" "sops should encrypt broad.yaml under the second (broad) rule" || return 1
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: doctor exited ${rc} on a vault that matches its two-rule config (expected 0)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_contains "$output" ".sops.yaml rule 1 (narrow\\.yaml$): 1 recipient(s)" "doctor should report rule 1" && \
+    assert_contains "$output" ".sops.yaml rule 2 (vault/.*\\.yaml$): 2 recipient(s)" "doctor should report rule 2" && \
+    assert_contains "$output" "is in 2 of 2 rule(s)" "identity should be counted per rule" && \
+    assert_contains "$output" "Vault files: 2 checked, 2 match .sops.yaml" "both files should match their own rule"
+}
+
+# i. A file encrypted under the wrong rule is drift against the rule that
+#    matches it, named by number.
+test_doctor_two_rule_config_flags_wrong_rule() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_doctor_sandbox "$sandbox"
+
+    # Encrypt narrow.yaml with A and B under the original one-rule config, then
+    # switch to the two-rule config where narrow.yaml must be A only.
+    local secret_a
+    secret_a=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+    _sops_encrypt_into "$DOCTOR_SANDBOX_SOPS" "$secret_a" "${DOCTOR_SANDBOX_VAULT}/narrow.yaml" \
+        && _sops_encrypt_into "$DOCTOR_SANDBOX_SOPS" "$secret_a" "${DOCTOR_SANDBOX_VAULT}/broad.yaml" \
+        || { rm -rf "$sandbox"; echo "  SKIP (sops encrypt failed)"; return 0; }
+    _write_two_rule_sops_config "$sandbox"
+
+    local output rc=0
+    output=$(_run_doctor_in_sandbox cmd_doctor) || rc=$?
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 1 ]]; then
+        echo "  FAIL: doctor exited ${rc} on a file encrypted under the wrong rule (expected 1)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_contains "$output" "vault/narrow.yaml: 2 recipient(s) in file vs 1 in .sops.yaml rule 1 (extra " "narrow.yaml should drift against rule 1" && \
+    assert_contains "$output" "Vault files: 2 checked, 1 drifted" "only narrow.yaml should drift"
+}
+
+# j. preflight judges the sampled file by its own rule, so a narrower rule
+#    listed first does not abort writes to files under the general rule.
+test_preflight_two_rule_config_uses_matching_rule() {
+    if ! command -v age-keygen >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox
+    sandbox=$(mktemp -d)
+    _setup_doctor_sandbox "$sandbox"
+    _write_two_rule_sops_config "$sandbox"
+
+    local secret_a
+    secret_a=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+    _sops_encrypt_into "$DOCTOR_SANDBOX_SOPS" "$secret_a" "${DOCTOR_SANDBOX_VAULT}/broad.yaml" \
+        || { rm -rf "$sandbox"; echo "  SKIP (sops encrypt failed)"; return 0; }
+
+    local output rc=0
+    output=$(_run_doctor_in_sandbox preflight_recipient_check) || rc=$?
+    rm -rf "$sandbox"
+
+    if [[ $rc -ne 0 ]]; then
+        echo "  FAIL: preflight_recipient_check exited ${rc} for a file that matches its own rule (expected 0)"
+        echo "    output: ${output}"
+        return 1
+    fi
+    assert_eq "" "$output" "preflight should be silent when the sampled file matches its rule"
+}
+
 # =============================================================================
 # --- auto_sync_pull tests (feat/auto-pull-before-write, April 2026) ---
 #
@@ -2443,6 +2649,11 @@ main() {
     run_test test_auto_sync_push_disabled_by_env
     run_test test_auto_sync_push_non_main_commits_only
     run_test test_preflight_blocks_write_on_drift
+    run_test test_sops_match_path_relative_to_config_dir
+    run_test test_sops_rule_index_first_match_wins
+    run_test test_doctor_two_rule_config_first_match_wins
+    run_test test_doctor_two_rule_config_flags_wrong_rule
+    run_test test_preflight_two_rule_config_uses_matching_rule
 
     # auto_sync_pull tests (feat/auto-pull-before-write, April 2026)
     run_test test_auto_sync_pull_disabled_by_env

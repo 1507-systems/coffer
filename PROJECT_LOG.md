@@ -201,3 +201,17 @@ mechanism to make that happen out-of-band.
 
 **Tests.** 10 new delete tests added to `tests/run-tests.sh`: round-trip set/delete/get, recipient preservation (regression guard), missing-key error, missing-category error, no-args, unknown-flag, dispatcher routing, retype-match proceeds, retype-mismatch aborts with key intact. 58/58 tests passing (was 48). Shellcheck clean.
 
+
+### 2026-09-11 - Doctor evaluates creation_rules per path (fix/doctor-per-path-creation-rules)
+
+**Problem.** `parse_sops_yaml_recipients` read the first `creation_rules` entry only. sops applies the first rule whose `path_regex` matches the file, so a narrower rule placed above the general one made every file under the general rule report `[DRIFT]` and made `preflight_recipient_check` abort writes.
+
+**Changes:**
+
+- **`lib/doctor.sh`**: `sops_match_path` (the path sops tests `path_regex` against: relative to the `.sops.yaml` directory for absolute files, verbatim otherwise; confirmed against sops 3.12.2), `sops_rule_index_for_path` (first match wins, a rule without `path_regex` matches everything, Go regexp via yq `test()`), `sops_rule_count`, `sops_rule_regex`, `parse_sops_rule_recipients`. `parse_sops_yaml_recipients` now takes the vault file and resolves its rule. Doctor prints one `[OK]` line per rule, counts identity membership per rule (drift only when in no rule), and judges each vault file against its own rule, naming the rule number. `preflight_recipient_check` uses the same resolution for the file it samples.
+
+- **`SPEC.md`**: doctor checks (a), (b), (d) and the preflight section describe per-rule resolution.
+
+**Tests.** 5 new tests: match path derivation, rule index and per-file recipients on a three-rule config, two-rule clean vault, two-rule wrong-rule drift, preflight under two rules. The two-rule tests encrypt with real sops and assert the recipient counts sops produced, so the semantics doctor mirrors are pinned by the tool. 80/80 passing (was 75). Shellcheck clean.
+
+**Not changed.** `lib/add-recipient.sh` (and `finalize-onboard`, which calls it) still reads the first recipient line and rewrites `.sops.yaml` as a single rule. A multi-rule config needs those made rule-aware before it is safe to adopt.

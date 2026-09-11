@@ -1113,13 +1113,13 @@ A read-only audit command that every operator should run before and after major 
 
 **Checks performed:**
 
-a. **Recipient list in `.sops.yaml`** - parses `config/.sops.yaml` and extracts the canonical age key list.
+a. **Creation rules in `.sops.yaml`** - parses every `creation_rules` entry and lists its age recipients, one `[OK]` line per rule. Rules are ordered: sops applies the first rule whose `path_regex` matches the file, tested against the file's path relative to the directory holding `.sops.yaml` (`../vault/github.yaml` for the standard layout), and a rule without `path_regex` matches everything.
 
-b. **Identity consistency** - verifies this machine's `~/.config/coffer/public-key` appears in the canonical list. If not, this machine's `set` calls would be encrypting with keys it cannot decrypt.
+b. **Identity consistency** - verifies this machine's `~/.config/coffer/public-key` appears in at least one rule. A rule that omits it is how a file is withheld from a machine on purpose, so only absence from every rule is drift.
 
 c. **Git state** - reports branch (auto-push is disabled off `main`), ahead/behind origin/main count, and uncommitted changes in `config/.sops.yaml` and `vault/` paths.
 
-d. **Vault file recipient drift** - for each SOPS-encrypted vault file, compares the recipient list embedded in the SOPS metadata block to the canonical `.sops.yaml` list. Any mismatch is reported as `[DRIFT]`.
+d. **Vault file recipient drift** - for each SOPS-encrypted vault file, compares the recipient list embedded in the SOPS metadata block to the rule that matches the file. Any mismatch, or a file no rule matches, is reported as `[DRIFT]` naming the rule number.
 
 **Output format:**
 
@@ -1144,7 +1144,7 @@ Every state-modifying command (`set`, `edit`, `import`, `add-recipient`, `finali
 
 #### 3. Preflight check on writes
 
-Before `coffer set` or `coffer edit` executes the write, a lightweight recipient consistency check samples one encrypted vault file and compares its embedded recipient list to `.sops.yaml`. If they differ, the write is aborted with:
+Before `coffer set` or `coffer edit` executes the write, a lightweight recipient consistency check samples one encrypted vault file and compares its embedded recipient list to the `.sops.yaml` rule that matches that file. If they differ, the write is aborted with:
 
 ```
 coffer: error: vault state is inconsistent (.sops.yaml does not match vault file metadata in <file>)
