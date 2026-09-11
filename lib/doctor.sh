@@ -2,9 +2,9 @@
 # doctor.sh -- Read-only vault state audit for coffer
 #
 # WHY THIS EXISTS:
-# The April 2026 drift bug (Verve ran add-recipient, which re-encrypted vault
+# The April 2026 drift bug (host B ran add-recipient, which re-encrypted vault
 # files with 3 recipients via sops updatekeys, but never committed/pushed
-# .sops.yaml, leaving Wiles's git-tracked config at 2 recipients) was invisible
+# .sops.yaml, leaving host A's git-tracked config at 2 recipients) was invisible
 # until a write operation failed. `coffer doctor` surfaces drift proactively:
 # it compares each vault file's embedded recipient list against the canonical
 # list in config/.sops.yaml and reports any mismatch before it causes a lockout.

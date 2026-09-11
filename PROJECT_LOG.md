@@ -80,7 +80,7 @@ truth: the session-key file at `${COFFER_SESSION_KEY}` (default
 - `SPEC.md`: added "Identity and Unlock Model" section (threat-model
   equivalence, single-source rationale, future passphrase-encrypted
   identity). Removed obsolete "Auto-Unlock at Boot", "Remote Unlock
-  from Verve", "wiles-unlock", and "Keychain Safety Rules" sections —
+  from host B", "hosta-unlock", and "Keychain Safety Rules" sections —
   their contents were never implemented and their premise (Keychain
   holds the master passphrase) is gone.
 
@@ -112,8 +112,8 @@ has broken four times in two weeks:
 
 | Commit | Regression |
 |--------|-----------|
-| `dce6721` | Verve's pubkey in `.sops.yaml` didn't match its current identity |
-| `012eb1b` | Cleanup of a stale Verve pubkey (old identity nobody held) |
+| `dce6721` | host B's pubkey in `.sops.yaml` didn't match its current identity |
+| `012eb1b` | Cleanup of a stale host B pubkey (old identity nobody held) |
 | `f51e29d` | `cmd_set` re-encrypted with only the writing machine's key, silently stripping the other recipient |
 | `54975bb` | Session-key-file refactor; any machine not yet migrated failed with "No identity found" |
 
@@ -129,7 +129,7 @@ mechanism to make that happen out-of-band.
   `vault/.pending-recipient-<machine-name>.pub` — a plaintext file that travels
   via Mutagen and git to all connected machines.
 
-- **`coffer finalize-onboard`** (runs on Wiles or any trusted machine):
+- **`coffer finalize-onboard`** (runs on host A or any trusted machine):
   globs `vault/.pending-recipient-*.pub`, validates each key, calls
   `cmd_add_recipient` for each (same code path as `coffer add-recipient`),
   deletes handled files on success, prints a summary + commit reminder.
@@ -158,7 +158,7 @@ mechanism to make that happen out-of-band.
 
 - **PR #16 (chore/remove-vault-from-tool-repo):** Removed `config/` and `vault/.gitkeep` from the tool repo. Updated `.gitignore` to drop vault-specific lines. Added top-level `README.md` with setup instructions for new users. Removed the backward-compat in-repo fallback (now COFFER_VAULT_ROOT is required with sensible default).
 
-- **New private repo:** coffer-vault created with initial commit of all vault content. Both Wiles and Verve cloned the repo. COFFER_VAULT_ROOT set in `~/.zshrc.local` on both machines.
+- **New private repo:** coffer-vault created with initial commit of all vault content. Both host A and host B cloned the repo. COFFER_VAULT_ROOT set in `~/.zshrc.local` on both machines.
 
 - **Auto-sync behavior:** `coffer set/edit/import/add-recipient` now auto-commit-push to the vault repo (coffer-vault), not the tool repo. `coffer sync-pull` does `git pull --ff-only` on the vault repo for SessionStart hooks.
 
@@ -166,7 +166,7 @@ mechanism to make that happen out-of-band.
 
 ### 2026-04-24 - Vault drift prevention: doctor + auto-sync (feat/doctor-and-auto-sync)
 
-**Root cause of the April 22 SNAFU.** Verve ran `coffer add-recipient <wiles-pubkey>` redundantly (key was already present). The add-recipient code path skipped the `.sops.yaml` write but still ran `sops updatekeys` on all 14 vault files using Verve's local 3-recipient `.sops.yaml`. That re-encrypted ciphertext propagated to Wiles via Mutagen, but Wiles's git-tracked `.sops.yaml` still said 2 recipients. Subsequent `coffer set` calls on Wiles encrypted new entries with only 2 keys, locking Verve out of them.
+**Root cause of the April 22 SNAFU.** host B ran `coffer add-recipient <hosta-pubkey>` redundantly (key was already present). The add-recipient code path skipped the `.sops.yaml` write but still ran `sops updatekeys` on all 14 vault files using host B's local 3-recipient `.sops.yaml`. That re-encrypted ciphertext propagated to host A via Mutagen, but host A's git-tracked `.sops.yaml` still said 2 recipients. Subsequent `coffer set` calls on host A encrypted new entries with only 2 keys, locking host B out of them.
 
 **Second drift source.** Mutagen syncs file content between machines but does NOT sync git state. A file can be identical in both working trees while each machine's git repo shows wildly different state (staged, untracked, committed-to-different-refs). Auto-pushing on writes means origin/main is always the truth either machine can pull.
 

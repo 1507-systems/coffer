@@ -112,7 +112,7 @@ Commands:
   finalize-onboard              Consume pending-recipient files from
                                 vault/.pending-recipient-*.pub, call
                                 add-recipient for each, delete handled files.
-                                Run on an ALREADY-TRUSTED machine (Wiles).
+                                Run on an ALREADY-TRUSTED machine (host A).
   refresh                       Pull latest vault changes from origin/main
                                 (git fetch + push any local-only commits, then
                                 pull --rebase). Pushes unpushed local commits
@@ -287,7 +287,7 @@ case "$command" in
         # Pull-rebase from origin BEFORE the write so that if origin advanced
         # since SessionStart (the other machine pushed in the interim), we
         # incorporate those commits first. This eliminates the drift window
-        # that caused the April 2026 non-fast-forward push rejection on Verve.
+        # that caused the April 2026 non-fast-forward push rejection on host B.
         auto_sync_pull
         # Run preflight drift check before any write. If .sops.yaml and vault
         # file recipients are out of sync, the write is aborted with a clear

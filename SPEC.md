@@ -41,8 +41,8 @@ files) is stored in a single local file at `~/.config/coffer/.session-key`
 for the design rationale.
 
 The vault is designed for a 2-machine setup:
-- **Wiles** (Mac Mini 2018, 64GB RAM) -- primary dev machine
-- **Verve** (MacBook Air) -- mobile machine
+- **host A** (Mac Mini 2018, 64GB RAM) -- primary dev machine
+- **host B** (MacBook Air) -- mobile machine
 
 Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the vault works fully offline on both machines.
 
@@ -96,7 +96,7 @@ Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the
                            │
                     ┌──────▼──────────────────────────────────┐
                     │           Mutagen File Sync              │
-                    │     Wiles <──────────────> Verve         │
+                    │     host A <──────────────> host B         │
                     └─────────────────────────────────────────┘
 ```
 
@@ -110,7 +110,7 @@ Encrypted files sync between machines via **Mutagen** (not iCloud), ensuring the
 | `config/categories.yaml` | Category definitions (names, descriptions, default keys) |
 | `vault/*.yaml` | SOPS-encrypted YAML files (one per category) |
 | `~/.config/coffer/.session-key` | Machine-local age private key (plaintext, mode 600, never synced, never committed). Single source of truth for coffer's identity; see [Identity and Unlock Model](#identity-and-unlock-model). |
-| Mutagen | Syncs the coffer directory between Wiles and Verve |
+| Mutagen | Syncs the coffer directory between host A and host B |
 
 ---
 
@@ -129,8 +129,8 @@ Every SOPS-encrypted file is encrypted to **all authorized age public keys**. Th
 creation_rules:
   - path_regex: vault/.*\.yaml$
     age: >-
-      age1wiles_public_key_here,
-      age1verve_public_key_here
+      age1hosta_public_key_here,
+      age1hostb_public_key_here
 ```
 
 ### Identity-at-Rest Protection (current implementation)
@@ -229,12 +229,12 @@ sops:
     azure_kv: []
     hc_vault: []
     age:
-        - recipient: age1wiles...
+        - recipient: age1hosta...
           enc: |
             -----BEGIN AGE ENCRYPTED FILE-----
             ...
             -----END AGE ENCRYPTED FILE-----
-        - recipient: age1verve...
+        - recipient: age1hostb...
           enc: |
             -----BEGIN AGE ENCRYPTED FILE-----
             ...
@@ -512,14 +512,14 @@ wiping it would force a full `coffer init` on every "lock". A real
 lock-at-rest capability (passphrase-encrypted identity file) is listed
 in [Future Work](#future-work).
 
-**Headless machines (Wiles):** The session-key file covers this use
+**Headless machines (host A):** The session-key file covers this use
 case natively — no LaunchAgent, no boot-time unlock step, no Keychain
 dance. The LaunchAgent recipe that used to live in this section has
 been removed; `coffer unlock --auto` is retained as a documented no-op
 so any legacy LaunchAgent still configured on a machine continues to
 exit 0 without side effects.
 
-**Laptops (Verve):** Same model. If the user wants their credentials
+**Laptops (host B):** Same model. If the user wants their credentials
 to clear on sleep or shutdown, they can put a `coffer lock` in a logout
 hook or simply not worry about it (FileVault re-locks the disk on
 shutdown).
@@ -560,7 +560,7 @@ Actually, a cleaner approach: the coffer project itself lives in git. The vault 
 
 **The strategy: "alpha-wins" with operational discipline**
 
-1. **Mutagen mode**: `two-way-resolved` with `alpha-wins` (Wiles is alpha since it is the primary dev machine)
+1. **Mutagen mode**: `two-way-resolved` with `alpha-wins` (host A is alpha since it is the primary dev machine)
 2. **Operational rule**: Only edit secrets on one machine at a time. This is practical because:
    - Secrets change rarely (new token, rotation)
    - Only one person uses both machines
@@ -736,7 +736,7 @@ family of real bugs:
 
 - **Drift.** The Keychain entry and the file could get out of sync
   (one rotated without the other), producing "works here, broken
-  there" symptoms across Wiles / Verve.
+  there" symptoms across host A / host B.
 
 - **Coupled CI footprint.** The Keychain code path required the
   `security` binary and an unlocked login keychain, which is
@@ -848,7 +848,7 @@ Claude - hellgaskitchen.com - Zone Management
 Claude Code - Resend HK
 Claude Code - HK Email Auth
 BS-IoT
-Claude Code - Proxmox PVE000
+Claude Code - Proxmox host
 Claude Code - TUG BBS
 Claude Code - VoIP.ms Portal
 Claude Code - VoIP.ms SIP ASTERISK
@@ -917,7 +917,7 @@ mappings:
   # === Misc ===
   "Claude Code - Memory Sync": misc/memory-sync
   "Claude Code - Tailscale": misc/tailscale
-  "Claude Code - Proxmox PVE000": misc/proxmox-pve000
+  "Claude Code - Proxmox host": misc/proxmox-host
   "Claude Code - TUG BBS": misc/tug-bbs
 ```
 
@@ -1000,8 +1000,8 @@ Earlier drafts of this document specified:
 1. A `coffer unlock --auto` LaunchAgent that read a master passphrase
    from the macOS Keychain at boot and decrypted a passphrase-encrypted
    identity file.
-2. A Verve-side `wiles-unlock` helper that popped an osascript dialog
-   and sent the passphrase to Wiles via SSH.
+2. A host B-side `hosta-unlock` helper that popped an osascript dialog
+   and sent the passphrase to host A via SSH.
 3. A "Keychain Safety Rules" policy governing when automated code was
    allowed to touch `security find-generic-password`.
 
@@ -1050,10 +1050,10 @@ not running) without requiring any additional connectivity.
 coffer onboard
 # → Runs `coffer init` if no .session-key exists.
 # → Writes vault/.pending-recipient-<machine-name>.pub  (plaintext pubkey, NOT a secret).
-# → Prints instructions: wait for Mutagen sync, then run finalize-onboard on Wiles.
+# → Prints instructions: wait for Mutagen sync, then run finalize-onboard on host A.
 ```
 
-**On the already-trusted machine (Wiles):**
+**On the already-trusted machine (host A):**
 
 ```bash
 coffer finalize-onboard
@@ -1214,8 +1214,8 @@ During migration, both systems will work simultaneously. The keychain entries re
 creation_rules:
   - path_regex: vault/.*\.yaml$
     age: >-
-      age1_WILES_PUBLIC_KEY_HERE,
-      age1_VERVE_PUBLIC_KEY_HERE
+      age1_HOSTA_PUBLIC_KEY_HERE,
+      age1_HOSTB_PUBLIC_KEY_HERE
 ```
 
 ### Environment Variables
