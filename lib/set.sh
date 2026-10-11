@@ -62,6 +62,9 @@ cmd_set() {
         [[ -n "$value" ]] || die "Empty value provided"
     fi
 
+    # The value is passed to jq via --rawfile on a process substitution
+    # (printf is a builtin), never --arg: an --arg value lands on jq's argv,
+    # which any same-host process can read with `ps`.
     # All vault operations use JSON for data manipulation to avoid yq's YAML
     # parsing issues with special characters (%, !, $, etc. in passwords).
     # sops handles the YAML encryption layer; we never parse decrypted YAML ourselves.
@@ -73,7 +76,7 @@ cmd_set() {
         # SC2094 is a false positive here: --filename-override is just a path
         # string SOPS uses to match .sops.yaml creation_rules; sops never reads
         # that file. The actual input comes from /dev/stdin.
-        jq -n --arg key "$COFFER_KEY" --arg val "$value" '{($key): $val}' \
+        jq -n --arg key "$COFFER_KEY" --rawfile val <(printf '%s' "$value") '{($key): $val}' \
             | SOPS_AGE_KEY="${SOPS_AGE_KEY}" SOPS_CONFIG="$sops_config" sops encrypt \
                 --filename-override "$COFFER_VAULT_FILE" \
                 --input-type json --output-type yaml \
@@ -87,7 +90,7 @@ cmd_set() {
     # Same recipient-preservation reasoning as the create path above.
     local updated
     updated=$(SOPS_AGE_KEY="${SOPS_AGE_KEY}" sops decrypt --output-type json "$COFFER_VAULT_FILE" \
-        | jq --arg key "$COFFER_KEY" --arg val "$value" '.[$key] = $val') \
+        | jq --arg key "$COFFER_KEY" --rawfile val <(printf '%s' "$value") '.[$key] = $val') \
         || die "Failed to decrypt/update '${COFFER_CATEGORY}'"
 
     # shellcheck disable=SC2094

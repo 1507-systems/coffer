@@ -775,6 +775,77 @@ EOF
     assert_eq "2" "$count" "update path should preserve both recipients from .sops.yaml"
 }
 
+# Regression: the secret value must never appear on any child process argv
+# (visible to same-host `ps`). cmd_set used `jq --arg val "$value"`; the value
+# is now fed via --rawfile from a process substitution.
+test_set_value_not_on_child_argv() {
+    if ! command -v age-keygen >/dev/null || ! command -v sops >/dev/null; then
+        echo "  SKIP (age-keygen or sops not installed)"
+        return 0
+    fi
+
+    local sandbox secret
+    sandbox=$(mktemp -d)
+    secret='s3cr3t-argv-canary-$x"y'"'"'z'
+    age-keygen -o "${sandbox}/keyA.txt" 2>/dev/null
+    local pub_a
+    pub_a=$(grep "public key" "${sandbox}/keyA.txt" | awk '{print $4}')
+    mkdir -p "${sandbox}/vault" "${sandbox}/config" "${sandbox}/.coffer-config" "${sandbox}/bin"
+    cat > "${sandbox}/config/.sops.yaml" <<EOF
+creation_rules:
+  - path_regex: vault/.*\.yaml\$
+    age: >-
+      ${pub_a}
+EOF
+    echo "$pub_a" > "${sandbox}/.coffer-config/public-key"
+
+    # jq shim: record argv, then delegate to the real jq.
+    local real_jq
+    real_jq=$(command -v jq)
+    cat > "${sandbox}/bin/jq" <<EOF
+#!/bin/bash
+printf '%s\0' "\$@" >> "${sandbox}/argv.log"
+exec "${real_jq}" "\$@"
+EOF
+    chmod +x "${sandbox}/bin/jq"
+
+    (
+        export PATH="${sandbox}/bin:${PATH}"
+        export SOPS_AGE_KEY
+        SOPS_AGE_KEY=$(grep AGE-SECRET "${sandbox}/keyA.txt")
+        export COFFER_VAULT="${sandbox}/vault"
+        export COFFER_VAULT_FILE="${sandbox}/vault/test.yaml"
+        export COFFER_CATEGORY="test"
+        export COFFER_CONFIG_DIR="${sandbox}/.coffer-config"
+        export COFFER_SOPS_CONFIG="${sandbox}/config/.sops.yaml"
+        die() { echo "die: $*" >&2; exit 1; }
+        log() { :; }
+        warn() { :; }
+        require_cmd() { command -v "$1" >/dev/null || die "$1 missing"; }
+        require_identity() { :; }
+        ensure_unlocked() { :; }
+        parse_path() { :; }
+        # shellcheck source=../lib/set.sh
+        source "$(cd "${SCRIPT_DIR}/.." && pwd)/lib/set.sh"
+        export COFFER_KEY="first"
+        printf '%s' "$secret" | cmd_set test/first --stdin   # create path
+        export COFFER_KEY="second"
+        printf '%s' "$secret" | cmd_set test/second --stdin  # update path
+    ) || { rm -rf "$sandbox"; return 1; }
+
+    local leaked=0 roundtrip argv_seen=0
+    [[ -s "${sandbox}/argv.log" ]] && argv_seen=1
+    if [[ "$argv_seen" == 1 ]] && grep -aqF -- "$secret" "${sandbox}/argv.log"; then
+        leaked=1
+    fi
+    roundtrip=$(SOPS_AGE_KEY=$(grep AGE-SECRET "${sandbox}/keyA.txt") sops decrypt \
+        --extract '["second"]' "${sandbox}/vault/test.yaml")
+    rm -rf "$sandbox"
+    assert_eq "1" "$argv_seen" "jq shim must have observed calls (test is live)" || return 1
+    assert_eq "0" "$leaked" "secret must not appear in any jq argv" || return 1
+    assert_eq "$secret" "$roundtrip" "value must round-trip exactly"
+}
+
 # --- Identity: Option 2 (file-only, no Keychain) tests ---
 #
 # These tests cover the April 2026 refactor that made ~/.config/coffer/.session-key
@@ -2608,6 +2679,7 @@ main() {
     # Set: recipient preservation regression tests
     run_test test_set_preserves_all_recipients_on_create
     run_test test_set_preserves_all_recipients_on_update
+    run_test test_set_value_not_on_child_argv
 
     # Delete command tests (feat/delete-command, May 2026)
     run_test test_delete_removes_key
