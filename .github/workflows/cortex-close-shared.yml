@@ -300,10 +300,13 @@ jobs:
           while [[ "${CORTEX_API_BASE}" == */ ]]; do CORTEX_API_BASE="${CORTEX_API_BASE%/}"; done
           # The bearer token must never go out in cleartext, and the base
           # must be https://, a host (starting with a letter or digit), an
-          # optional :port and a plain path.
-          BASE_RE='^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?$'
-          if ! [[ "${CORTEX_API_BASE}" =~ ${BASE_RE} ]]; then
-            echo "::warning::the Cortex base URL is not https:// and a host — skipping."
+          # optional :port from 1 to 65535 and a plain path.
+          BASE_RE='^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$'
+          PORT_RE='^https://[^/:]+:([0-9]+)'
+          if ! [[ "${CORTEX_API_BASE}" =~ ${BASE_RE} ]] \
+            || { [[ "${CORTEX_API_BASE}" =~ ${PORT_RE} ]] \
+              && (( 10#${BASH_REMATCH[1]} < 1 || 10#${BASH_REMATCH[1]} > 65535 )); }; then
+            echo "::warning::the Cortex base URL is not https://, a host, an optional port and a path — skipping."
             exit 0
           fi
           case "${_cortex_tok}" in
@@ -343,13 +346,14 @@ jobs:
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
-          # after a type check, so a wrong shape fails closed.
+          # after a type check, so a wrong shape fails closed. MERGED and
+          # OURS run only after CLASSIFY has found every entry an object.
           # $sha, $def, $repo and $sender are jq variables, not shell ones.
           # jq -s gives an array of the documents read; anything but exactly
           # one document reads as null.
           ONE='(if length == 1 then .[0] else null end)'
           # shellcheck disable=SC2016
-          MERGED='[.[] | objects
+          MERGED='[.[]
             | select((.merged_at | type == "string" and . != "")
               and .merge_commit_sha == $sha
               and ((.base.ref)? // "") == $def
@@ -363,7 +367,7 @@ jobs:
             or ((.user.login)? // null | type != "string" or endswith("[bot]"))
             or ((.head.ref)? // null | type != "string"
               or test("^(renovate|dependabot)/"; "i"))'
-          # Merged PRs a person opened and also merged (pushed).
+          # Merged PRs the push's sender opened (mergedBy is checked later).
           # shellcheck disable=SC2016
           OURS='['"${MERGED}"'[] | select(('"${BOT}"' | not)
             and ((.user.login)? // null | type == "string"
@@ -375,7 +379,7 @@ jobs:
           CLASSIFY="${ONE}"'
             | if type != "array" or length >= 100
               or any(.[]; type != "object") then "bad"
-            elif any(.[] | objects; ((.head.repo.full_name)? // ""
+            elif any(.[]; ((.head.repo.full_name)? // ""
               | type != "string"
                 or ascii_downcase != ($repo | ascii_downcase))) then "fork"
             elif ('"${MERGED}"' | length) == 0 then "none"
@@ -645,11 +649,12 @@ jobs:
                 --arg rid "${GITHUB_RUN_ID:-0}.${GITHUB_RUN_ATTEMPT:-1}" \
                 '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
-              # curl can exit non-zero with no answer (HTTP 000) or after a
-              # 2xx (e.g. a timeout while reading the body), so the close
-              # may have applied; a 403 or 409 answer is handled as such.
-              # Exits 6, 7, 35 and 60 with no answer mean nothing was sent
-              # (DNS, connect, TLS handshake, certificate).
+              # curl can exit non-zero with no answer (HTTP 000) or after
+              # any answer (e.g. a timeout while reading a 2xx body), so the
+              # close may have applied; a 403 or 409 answer is handled as
+              # such. Exits 5, 6, 7, 35, 51, 58, 60, 77 and 97 with no answer
+              # mean nothing was sent (proxy or host lookup, connect, proxy
+              # or TLS handshake, certificate, client cert or CA file).
               rc=0
               code="$(cx -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH \
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || rc=$?
@@ -672,7 +677,7 @@ jobs:
                   looked_up "$id" "$?" || break ;;
                 403) echo "::warning::${id}: HTTP 403 (forbidden) — skipping."; break ;;
                 *)
-                  if [ "${code}" = 000 ] && [[ "${rc}" =~ ^(6|7|35|60)$ ]]; then
+                  if [ "${code}" = 000 ] && [[ "${rc}" =~ ^(5|6|7|35|51|58|60|77|97)$ ]]; then
                     echo "::warning::${id}: request not sent (curl exit ${rc}) — skipping."
                   elif [ "${rc}" -ne 0 ]; then
                     echo "::warning::${id}: no complete answer (HTTP ${code}, curl exit ${rc}) — may have applied; check it by hand."
