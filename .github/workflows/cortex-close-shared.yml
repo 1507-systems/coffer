@@ -234,9 +234,12 @@ jobs:
           # loads ~/.jq into every program and gh reads ~/.config/gh, so
           # both get an empty private directory instead (curl gets -q).
           # Cleared first, so an inherited ISO or ERRF names nothing to
-          # delete. For ISO this is defence in depth: the mktemp line
-          # below overwrites it before any exit, so only a signal in the
-          # next few builtins could find it. The traps come before it.
+          # delete. For ISO this is defence in depth: the mktemp -d line
+          # overwrites it before any exit, so without this reset only a
+          # signal between the EXIT trap and that assignment could delete
+          # an inherited path. The traps are set before the directory is
+          # made. Tool stderr below goes to /dev/null: it is not ours to
+          # echo into the log.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
@@ -621,9 +624,10 @@ jobs:
               LISTS[$q]="$resp"
             done
           }
-          # Prints the version (a non-negative whole number). Returns 0 if
-          # open, 3 if already done, 4 if found without a whole-number
-          # version, 2 if not found and a list is missing, 1 if not found.
+          # Prints the version (a non-negative whole number of at most 15
+          # digits, which jq holds exactly). Returns 0 if open, 3 if
+          # already done, 4 if found without such a version, 2 if not
+          # found and a list is missing, 1 if not found.
           get_version() {
             local id="$1" v q failed=0
             for q in todo in_progress backlog blocked "done"; do
@@ -631,7 +635,7 @@ jobs:
               v="$(printf '%s' "${LISTS[$q]}" | jq -c --arg id "$id" '.[] | select(.id==$id) | .version' 2>/dev/null | head -n1)"
               if [ -n "$v" ]; then
                 [ "$q" = "done" ] && return 3
-                [[ "$v" =~ ^[0-9]+$ ]] || return 4
+                [[ "$v" =~ ^[0-9]{1,15}$ ]] || return 4
                 printf '%s' "$v"; return 0
               fi
             done
@@ -643,7 +647,7 @@ jobs:
             case "$2" in
               0) return 0 ;;
               3) echo "  $1: already done." ;;
-              4) echo "::warning::$1: found without a whole-number version — skipping." ;;
+              4) echo "::warning::$1: found without a whole-number version of at most 15 digits — skipping." ;;
               2)
                 if [ "${LATE}" -eq 1 ] && [ "${LFAIL}" -eq 1 ]; then
                   echo "::warning::$1: a status list lookup failed (token or API), and the run ran out of time before the rest were fetched — skipping."
@@ -666,7 +670,7 @@ jobs:
               fi
               payload="$(jq -nc --argjson v "$version" --arg id "$id" --arg a "$attempt" \
                 --arg rid "${GITHUB_RUN_ID:-0}.${GITHUB_RUN_ATTEMPT:-1}" \
-                '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
+                '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}' 2>/dev/null)" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
               # curl can exit non-zero with no answer (HTTP 000) or after
               # any answer (e.g. a timeout while reading a 2xx body), so the
