@@ -1,8 +1,9 @@
 name: Close Cortex Issues (shared)
 # Shared reusable at-merge Cortex issue closer. Public so it can be called by
 # any 1507 repo regardless of visibility/org. Holds NO secrets — the caller
-# passes CORTEX_WRITE_TOKEN at runtime via `secrets: inherit`; it never touches
-# this repo. Callers MUST pin to a commit SHA (supply-chain safety). Epic 4a283f45.
+# passes CORTEX_WRITE_TOKEN at runtime, by name under `secrets:` (declared
+# below, so `secrets: inherit` is not needed); it never touches this repo.
+# Callers MUST pin to a commit SHA (supply-chain safety). Epic 4a283f45.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither the job is a no-op.
 on:
@@ -12,6 +13,10 @@ on:
         description: Cortex REST base URL (falls back to the caller's CORTEX_API_BASE variable)
         required: false
         type: string
+    secrets:
+      CORTEX_WRITE_TOKEN:
+        description: Cortex API token with write scope, used to mark referenced cortex:issue/<uuid> issues done
+        required: true
 permissions:
   contents: read
 jobs:
