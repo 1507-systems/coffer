@@ -11,21 +11,25 @@ name: Close Cortex Issues (shared)
 # variable). A public caller's `runs_on` is ignored and the job runs on
 # GitHub-hosted ubuntu-latest (free for public repos); runner-group repo
 # access remains the real gate for self-hosted runners. The runner needs
-# bash 4+ first on PATH, curl 7.55+, git, gh and jq.
-# Trust: put closing references in the PR body, on a line of their own
-# ("Closes cortex:issue/<uuid>"; quoted, fenced and HTML-comment lines
-# are ignored). For a PR merged as the pushed commit, only its body is
-# scanned, and only when a person opened it from a branch in the
-# caller's repo (write access). Bot PRs (their bodies quote upstream
-# release notes; a [bot] login or a renovate/ or dependabot/ branch
-# counts) and merged fork PRs are skipped. With no merged PR the lookup
-# is retried (GitHub links PRs to commits a little after the push); then
-# a direct push by a person is scanned by its head commit's message, so
-# whoever pushes someone else's commits vouches for them. Pushes by bots
-# and GitHub-made commits with no PR are skipped. Close skipped issues
-# by hand.
-# Known limit: the token can close any issue in the Cortex instance;
-# nothing ties an issue to the calling repo.
+# bash 4+ first on PATH, curl 7.55+, gh, jq, awk and base64.
+# Trust: only a merged PR's body is scanned, and only when the person
+# who merged it (the push's sender, type User) also opened it, from a
+# branch in the caller's repo, and it is not a bot's (a non-User type, a
+# [bot] login, or a renovate/ or dependabot/ branch). Commit messages are
+# never scanned, so direct pushes, fork PRs, bot PRs, merge-queue merges
+# and PRs merged by someone other than their opener close nothing. The
+# lookup is retried while no merged PR is listed (GitHub links a PR to
+# its merge commit a little after the push). Close skipped issues by
+# hand. The current body counts: edits by apps that rewrite PR bodies
+# (summary bots) are trusted as the opener's.
+# A reference counts only at the start of a line, indented at most 3
+# spaces, optionally after a -, * or + list marker
+# ("Closes cortex:issue/<uuid>"). Quoted (>), fenced and HTML-comment
+# lines are ignored.
+# Known limit: CORTEX_WRITE_TOKEN is a general write-scope token. Anyone
+# trusted above, in any caller repo, can close any issue in the Cortex
+# instance (issue UUIDs appear in public repos); anyone who can run a
+# workflow in a caller repo, or code on its runner, can take the token.
 # Callers MUST set `contents: read` and `pull-requests: read` on the
 # job; if the caller's token lacks either, the run fails at startup.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
@@ -60,11 +64,6 @@ jobs:
     runs-on: ${{ github.event.repository.private && inputs.runs_on || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - name: Checkout (commit message and committer)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-        with:
-          fetch-depth: 1
-          persist-credentials: false
       - name: Close referenced Cortex issues
         env:
           CORTEX_WRITE_TOKEN: ${{ secrets.CORTEX_WRITE_TOKEN }}
@@ -73,11 +72,12 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.sha }}
           SENDER_TYPE: ${{ github.event.sender.type }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
         run: |
           # No -e: every failure below is handled; the job is non-blocking.
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
           # (BASH_ENV itself runs first, with the token exported: that is
-          # the runner's and earlier steps' trust, not this script's.)
+          # the runner's trust, not this script's.)
           set +ae -uo pipefail
           # Keep tokens out of child processes' environments; declare +x
           # drops an export the runner may already have on these names.
@@ -87,7 +87,7 @@ jobs:
           if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
             echo "::error::runner bash is ${BASH_VERSION}; need 4+."; exit 1
           fi
-          for t in curl gh git jq; do
+          for t in curl gh jq awk base64; do
             command -v "$t" >/dev/null 2>&1 \
               || { echo "::error::runner is missing ${t}."; exit 1; }
           done
@@ -100,16 +100,19 @@ jobs:
           if [ "${cmaj}" -lt 7 ] || { [ "${cmaj}" -eq 7 ] && [ "${cmin}" -lt 55 ]; }; then
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
-          COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
+          if [ "${SENDER_TYPE:-}" != User ] || [ -z "${SENDER_LOGIN:-}" ]; then
+            echo "::notice::push not made by a person; not trusted to close issues."
+            exit 0
+          fi
           trap 'rm -f "${ERRF:-}" "${HDR:-}"' EXIT
           # Route signals through exit so the EXIT trap removes the files.
           trap 'exit 130' INT
           trap 'exit 143' TERM
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # The PR merged as this commit. With a merge queue only the last
-          # PR in the batch matches; earlier ones are not scanned.
-          # $sha and $repo are jq variables, not shell ones.
+          # The PRs merged as this commit (with a merge queue, only the
+          # last PR in the batch; its sender is a bot anyway).
+          # $sha, $repo and $sender are jq variables, not shell ones.
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
             | select(.merged_at != null and .merge_commit_sha == $sha)]'
@@ -120,16 +123,18 @@ jobs:
             or ((.user.login? // "" | tostring) | endswith("[bot]"))
             or ((.head.ref? // "" | tostring)
               | test("^(renovate|dependabot)/"))'
+          # Merged PRs a person opened and also merged (pushed).
+          # shellcheck disable=SC2016
+          OURS='['"${MERGED}"'[] | select(('"${BOT}"' | not)
+            and ((.user.login? // "" | tostring | ascii_downcase)
+              == ($sender | ascii_downcase)))]'
           # shellcheck disable=SC2016
           CLASSIFY='if type != "array" then "bad"
             elif any(.[] | objects; (.head.repo.full_name? // ""
               | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
-            elif ('"${MERGED}"' | length) == 0 then "direct"
-            elif any('"${MERGED}"'[]; '"${BOT}"') then "bot"
-            else "branch" end'
-          COMMITTER="$(git log -1 --format=%ce "${HEAD_SHA}" 2>/dev/null || true)"
-          # GitHub may not have linked a just-merged PR (or a fork PR
-          # pushed by hand) yet: retry before trusting "no PR".
+            elif ('"${MERGED}"' | length) == 0 then "none"
+            elif ('"${OURS}"' | length) == 0 then "other"
+            else "ours" end'
           for attempt in 1 2 3 4; do
             # Fail closed: if the commit's PRs are unknown, scan nothing.
             if ! PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls?per_page=100" 2>"${ERRF}")"; then
@@ -139,53 +144,59 @@ jobs:
               exit 0
             fi
             KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" \
-              "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)"
-            if [ "${KIND}" != direct ] || [ "${attempt}" -eq 4 ]; then
+              --arg sender "${SENDER_LOGIN}" "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)"
+            if [ "${KIND}" != none ] || [ "${attempt}" -eq 4 ]; then
               break
             fi
             sleep 10
           done
           case "${KIND}" in
-            direct)
-              if [ "${COMMITTER}" = noreply@github.com ]; then
-                echo "::warning::no PR found for a GitHub-made commit — skipping."
-                exit 0
-              fi
-              if [ "${SENDER_TYPE:-}" != User ] \
-                || [[ "${COMMITTER}" == *'[bot]@users.noreply.github.com' ]]; then
-                echo "::notice::direct push not by a person; not trusted to close issues."
-                exit 0
-              fi
-              PR_BODY="" ;;
-            branch)
-              COMMIT_MSG=""
-              PR_BODY="$(jq -r --arg sha "${HEAD_SHA}" \
-                "${MERGED}"' | .[] | .body // empty' <<< "${PR_JSON}")" \
-                || PR_BODY="" ;;
+            ours) ;;
+            none)
+              echo "::notice::no merged PR for this commit; direct pushes close nothing."
+              exit 0 ;;
             fork)
               echo "::notice::commit is in a fork PR; not trusted to close issues."
               exit 0 ;;
-            bot)
-              echo "::notice::merged PR was not opened by a person; not trusted to close issues."
+            other)
+              echo "::notice::merged PR is a bot's or was opened by someone else; not trusted."
               exit 0 ;;
             *)
               echo "::warning::PR lookup unreadable — skipping."
               exit 0 ;;
           esac
+          # One base64 line per trusted body, so each is filtered alone.
+          # shellcheck disable=SC2016
+          mapfile -t BODIES < <(jq -r --arg sha "${HEAD_SHA}" \
+            --arg sender "${SENDER_LOGIN}" "${OURS}"'[]
+            | (.body // "" | tostring) | @base64' <<< "${PR_JSON}" 2>/dev/null)
           unset PR_JSON
-          SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
-          # A reference counts only at the start of a line (after an
-          # optional list marker), outside quotes, fences and comments.
+          # Drop quoted, fenced (closed only by a fence of the same
+          # character, at least as long, with nothing after it) and
+          # HTML-comment lines. [ \t], not [[:space:]], for old mawk.
           # shellcheck disable=SC2016
           STRIP='{ sub(/\r$/, "") }
             c { if (index($0, "-->")) c = 0; next }
-            /^[[:space:]]*(```|~~~)/ { f = !f; next }
-            f || /^[[:space:]]*>/ { next }
+            fc != "" {
+              t = $0; sub(/^ ? ? ?/, "", t); n = 0
+              while (substr(t, n + 1, 1) == fc) n++
+              if (n >= fn && substr(t, n + 1) ~ /^[ \t]*$/) fc = ""
+              next
+            }
+            /^ ? ? ?(```|~~~)/ {
+              t = $0; sub(/^ */, "", t); fc = substr(t, 1, 1); fn = 0
+              while (substr(t, fn + 1, 1) == fc) fn++
+              next
+            }
+            /^[ \t]*>/ { next }
             /<!--/ { if (!index($0, "-->")) c = 1; next }
             { print }'
-          mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" | awk "${STRIP}" \
-            | grep -oiE '^[[:space:]]*([-*+][[:space:]]+)?(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:space:]]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-            | sed -E 's#.*cortex:issue/##' | tr '[:upper:]' '[:lower:]' | sort -u)
+          REF='^ {0,3}([-*+][ \t]+)?(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[ \t]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}([^0-9a-f-]|$)'
+          mapfile -t IDS < <(for b in "${BODIES[@]}"; do
+              printf '%s' "${b}" | base64 -d 2>/dev/null | awk "${STRIP}"
+            done | grep -oiE "${REF}" \
+            | sed -E 's#.*cortex:issue/([0-9a-fA-F-]{36}).*#\1#' \
+            | tr '[:upper:]' '[:lower:]' | sort -u)
           if [ "${#IDS[@]}" -eq 0 ]; then
             echo "No cortex:issue/<uuid> closing references. Nothing to close."
             exit 0
@@ -205,6 +216,7 @@ jobs:
             https://*) ;;
             *) echo "::warning::CORTEX_API_BASE is not https:// — skipping."; exit 0 ;;
           esac
+          CORTEX_API_BASE="${CORTEX_API_BASE%/}"
           case "${_cortex_tok}" in
             *$'\n'*|*$'\r'*)
               echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
@@ -216,32 +228,43 @@ jobs:
           printf 'Authorization: Bearer %s\n' "${_cortex_tok}" > "${HDR}" \
             || { echo "::warning::cannot write header file — skipping."; exit 0; }
           AUTH=(-H "@${HDR}")
-          # Prints the version as raw JSON. Returns 1 if not found, 2 if
-          # every lookup failed (bad token, outage). The API has no get-by-id
-          # or paging, so each query sees at most its first 200 issues.
+          # Prints the version (a JSON number). Returns 0 if open, 3 if
+          # already done, 2 if not found and a lookup failed, 1 if not
+          # found. The API has no get-by-id or paging, so each status
+          # query sees at most its first 200 issues.
           get_version() {
-            local id="$1" resp v q ok=0
-            for q in status=todo status=in_progress status=backlog status=blocked ""; do
-              resp="$(curl -s -f --proto =https --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?${q:+${q}&}limit=200" 2>/dev/null)" || continue
+            local id="$1" resp v q failed=0
+            for q in todo in_progress backlog blocked "done"; do
+              resp="$(curl -s -f --proto =https --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?status=${q}&limit=200" 2>/dev/null)" \
+                || { failed=1; continue; }
               # Only a JSON body with an issues array counts as a lookup.
-              printf '%s' "$resp" | jq -e '.issues | type == "array"' >/dev/null 2>&1 || continue
-              ok=1
-              v="$(printf '%s' "$resp" | jq -c --arg id "$id" '.issues[] | objects | select(.id==$id) | .version | select(type == "number" or type == "string")' 2>/dev/null | head -n1)"
-              [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+              printf '%s' "$resp" | jq -e '.issues | type == "array"' >/dev/null 2>&1 \
+                || { failed=1; continue; }
+              v="$(printf '%s' "$resp" | jq -c --arg id "$id" '.issues[] | objects | select(.id==$id) | .version | select(type == "number")' 2>/dev/null | head -n1)"
+              if [ -n "$v" ]; then
+                [ "$q" = "done" ] && return 3
+                printf '%s' "$v"; return 0
+              fi
             done
-            [ "${ok}" -eq 1 ] && return 1
-            return 2
+            [ "${failed}" -eq 1 ] && return 2
+            return 1
+          }
+          # Report a get_version result other than 0; returns 1 for those.
+          looked_up() {
+            case "$2" in
+              0) return 0 ;;
+              3) echo "  $1: already done." ;;
+              2) echo "::warning::$1: lookup failed (token or API) — skipping." ;;
+              *) echo "::warning::$1: not found in the first 200 issues of any status — skipping." ;;
+            esac
+            return 1
           }
           for id in "${IDS[@]}"; do
             version="$(get_version "$id")"
-            case $? in
-              0) ;;
-              2) echo "::warning::${id}: lookup failed (token or API) — skipping."; continue ;;
-              *) echo "  ${id}: not found — skipping."; continue ;;
-            esac
+            looked_up "$id" "$?" || continue
             for attempt in 1 2; do
               payload="$(jq -nc --argjson v "$version" --arg id "$id" --arg a "$attempt" \
-                --arg rid "${GITHUB_RUN_ID}" \
+                --arg rid "${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT:-1}" \
                 '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
               code="$(curl -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
@@ -253,8 +276,8 @@ jobs:
                     echo "::warning::${id}: version_conflict again — skipping."; break
                   fi
                   echo "  ${id}: version_conflict; re-fetching."
-                  version="$(get_version "$id")" \
-                    || { echo "::warning::${id}: re-fetch failed — skipping."; break; } ;;
+                  version="$(get_version "$id")"
+                  looked_up "$id" "$?" || break ;;
                 403) echo "::warning::${id}: 403 — token lacks write scope."; break ;;
                 *)   echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."; break ;;
               esac
