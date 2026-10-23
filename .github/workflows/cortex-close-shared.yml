@@ -245,8 +245,9 @@ jobs:
           # both get an empty private directory instead (curl gets -q).
           # Cleared first, so an inherited ISO or ERRF names nothing to
           # delete. Each is set only once mktemp's answer has passed the
-          # checks below, so a signal while mktemp runs deletes nothing (a
-          # real mktemp may then leave an empty 0700 directory or file).
+          # checks below, so a signal before it is set deletes nothing
+          # (mktemp's empty 0700 directory or file may then be left in
+          # RUNNER_TEMP).
           # The traps are set before the directory is made.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
@@ -257,14 +258,15 @@ jobs:
           # mktemp's stderr is not ours to echo; the warning says enough.
           mk="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # It must be our template plus a 6-character suffix and name a
-          # directory (not a link), or the trap must not touch it. A
-          # mktemp that lies beyond that is runner code, a known limit.
+          # It must be our template's fixed part (.../cortex-iso.) plus
+          # six letters or digits and name a directory (not a link), or
+          # the trap must not touch it. A mktemp that lies beyond that is
+          # runner code, a known limit.
           mkp="${RUNNER_TEMP:-/tmp}/cortex-iso."
           [[ "${mk}" == "${mkp}"* && "${mk#"${mkp}"}" =~ ^[A-Za-z0-9]{6}$ ]] \
             && [ -d "${mk}" ] && [ ! -L "${mk}" ] \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          ISO="${mk}"
+          ISO="${mk}"; unset mk mkp
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
