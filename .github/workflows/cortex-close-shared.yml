@@ -22,9 +22,10 @@ name: Close Cortex Issues (shared)
 # (the private directory) ends the run with a warning before the
 # base64, jq and curl checks; a failing one for gh's stderr file warns
 # later.
-# Tested on macOS with bash 5.2 and jq 1.7; gh and curl are stubbed in
-# the suite (real gh 2.x checked read-only with an empty config dir),
-# and -H @- was checked by hand on curl 8.7.1.
+# The suite ran on macOS, and reference matching also on glibc, with
+# bash 5.2 and jq 1.7; gh and curl are stubbed in the suite (real gh
+# 2.x checked read-only with an empty config dir), and -H @- was
+# checked by hand on curl 8.7.1.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
 # - the push's sender (type User) opened it and is GitHub's mergedBy,
@@ -168,9 +169,10 @@ jobs:
           # Time from here, whatever SECONDS the environment held.
           SECONDS=0
           # An inherited FUNCNEST would break the nested helpers, and a
-          # TMOUT would make read time out and drop body lines. BASH_ENV
-          # and ENV are dropped so no child shell runs them either (the
-          # allowlist below also covers that), and BASH_COMPAT so this
+          # TMOUT would make read time out on a pipe (the env -0 check
+          # would then fail the job). BASH_ENV and ENV are dropped so no
+          # child shell runs them either (the allowlist below also covers
+          # that), and BASH_COMPAT so this
           # bash keeps its own behaviour. (An inherited EXECIGNORE does
           # nothing: bash reads it only when the shell assigns it.)
           unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
