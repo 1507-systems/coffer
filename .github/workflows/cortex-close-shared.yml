@@ -24,14 +24,16 @@ name: Close Cortex Issues (shared)
 #   or dependabot/ branch, any case);
 # - nobody but its opener ever edited the body.
 # If any PR listed for the commit is from a fork, nothing is scanned.
-# Commit messages are never scanned, so direct pushes and force-pushes
-# close nothing; the rules above rule out bot PRs and PRs merged by
-# anyone but their opener, and apply as usual to a merge-queue push.
+# Commit messages are never scanned, so a push with no such PR behind
+# it closes nothing. Force-pushes close nothing (the push's forced
+# flag), nor do bot or App pushes: every merge-queue push is sent by
+# github-merge-queue[bot], so it stops at the sender check.
 # A body GitHub pre-filled (from commit messages or a template) counts
 # as the opener's: they submitted it. The lookup is retried while no
 # merged PR is listed (GitHub links a PR to its merge commit a little
-# after the push) or GitHub answers 429, 5xx or a 403 rate limit. Close
-# skipped issues by hand. A re-run by the sender re-reads the body as
+# after the push) or a call fails with 429, 5xx, a 403 rate limit or
+# no HTTP status (a network or GraphQL error). Close skipped issues by
+# hand. A re-run by the sender re-reads the body as
 # it is now, so it closes again any referenced issue reopened since the
 # merge; a re-run by anyone else closes nothing.
 # References must open the body: blank lines aside, the first lines are
@@ -49,7 +51,7 @@ name: Close Cortex Issues (shared)
 # instance (issue UUIDs appear in public repos); anyone who can run a
 # workflow in a caller repo, or code on its runner, can take the token
 # (e.g. from this step's /proc environ, or the header file if the job
-# is killed during a gh or curl call, which a signal waits for).
+# is killed during a Cortex curl call, which a signal waits for).
 # An account that opens and merges its own PRs is trusted as a person,
 # even a machine user (and agents acting as the operator are him).
 # Callers MUST set `contents: read` and `pull-requests: read` on the
@@ -101,14 +103,20 @@ jobs:
           TRIGGER_LOGIN: ${{ github.triggering_actor }}
         shell: bash
         run: |
-          # No -e: lookup and API failures are handled and never fail the
-          # job; only a runner without the tools below fails it.
+          # No -e: lookup and API failures are handled and do not fail the
+          # job. A runner without the tools below fails it, and so does a
+          # gh call that hangs until timeout-minutes (gh has no timeout;
+          # curl calls have --max-time).
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
           # (BASH_ENV itself runs first, with the token exported: that is
           # the runner's trust, not this script's.)
           set +ae -uo pipefail
           # ASCII classes and case folding, whatever the runner's locale.
           export LC_ALL=C
+          # Unset and empty mean the same below.
+          : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
+            "${SENDER_TYPE:=}" "${SENDER_LOGIN:=}" "${DEFAULT_BRANCH:=}" \
+            "${FORCED:=}" "${TRIGGER_LOGIN:=}"
           # Keep tokens out of child processes' environments; declare +x
           # drops an export the runner may already have on these names.
           declare +x _cortex_tok="${CORTEX_WRITE_TOKEN-}" _gh_tok="${GH_TOKEN-}"
@@ -143,11 +151,11 @@ jobs:
           if [ "${cmaj}" -lt 7 ] || { [ "${cmaj}" -eq 7 ] && [ "${cmin}" -lt 55 ]; }; then
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
-          if [ "${SENDER_TYPE:-}" != User ] || [ -z "${SENDER_LOGIN:-}" ]; then
+          if [ "${SENDER_TYPE}" != User ] || [ -z "${SENDER_LOGIN}" ]; then
             echo "::notice::push not made by a person; not trusted to close issues."
             exit 0
           fi
-          if [ "${FORCED:-}" = true ]; then
+          if [ "${FORCED}" = true ]; then
             echo "::notice::force-push; it closes nothing."
             exit 0
           fi
@@ -158,7 +166,7 @@ jobs:
           fi
           # The secret is required, so this only catches an empty value.
           if [ -z "${_cortex_tok}" ]; then
-            echo "::notice::CORTEX_WRITE_TOKEN not set — skipping (no-op)."
+            echo "::notice::CORTEX_WRITE_TOKEN is empty — skipping (no-op)."
             exit 0
           fi
           if [ -z "${CORTEX_API_BASE}" ]; then
@@ -166,56 +174,61 @@ jobs:
             exit 0
           fi
           while [[ "${CORTEX_API_BASE}" == */ ]]; do CORTEX_API_BASE="${CORTEX_API_BASE%/}"; done
-          # The bearer token must never go out in cleartext.
-          case "${CORTEX_API_BASE}" in
-            https://?*) ;;
-            *) echo "::warning::CORTEX_API_BASE is not an https:// URL — skipping."; exit 0 ;;
-          esac
+          # The bearer token must never go out in cleartext, and the base
+          # must be https://, a host, an optional :port and a plain path.
+          BASE_RE='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?$'
+          if ! [[ "${CORTEX_API_BASE}" =~ ${BASE_RE} ]]; then
+            echo "::warning::the Cortex base URL is not https:// and a host — skipping."
+            exit 0
+          fi
           case "${_cortex_tok}" in
             *$'\n'*|*$'\r'*)
               echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
               exit 0 ;;
           esac
-          NAP=""
-          trap 'rm -f "${ERRF:-}" "${HDR:-}"; [ -z "${NAP}" ] || kill "${NAP}" 2>/dev/null' EXIT
-          # Route signals through exit so the EXIT trap cleans up.
+          trap 'rm -f "${ERRF:-}" "${HDR:-}"' EXIT
+          # INT and TERM exit with their usual codes, through the EXIT
+          # trap; being trapped, they also end a retry wait at once.
           trap 'exit 130' INT
           trap 'exit 143' TERM
-          # Sleep in the background so a signal is handled at once; the
-          # EXIT trap kills a sleep still running.
-          nap() { sleep 10 & NAP=$!; wait "${NAP}"; NAP=""; }
-          # 429, 5xx, or a 403 whose message is GitHub's rate limit.
+          # The sleep runs in the background, so wait returns at once on a
+          # signal. Its output goes to /dev/null: a sleep left behind holds
+          # no pipe or token and ends by itself within 10 s.
+          nap() { sleep 10 >/dev/null 2>&1 & wait "$!"; }
+          # 429, 5xx, a 403 whose message is GitHub's rate limit, or no
+          # HTTP status at all (a network error, or a GraphQL-level error
+          # such as RATE_LIMITED).
           retryable() {
-            [[ "$1" =~ ^HTTP\ (429|5[0-9][0-9])$ ]] && return 0
+            [[ -z "$1" || "$1" =~ ^HTTP\ (429|5[0-9][0-9])$ ]] && return 0
             [ "$1" = "HTTP 403" ] && grep -qi 'rate limit' "${ERRF}"
           }
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # The PRs merged as this commit (with a merge queue, only the
-          # last PR in the batch).
+          # The PRs merged as this commit. (path)? guards every step of
+          # the path, so a malformed shape reads as missing.
           # $sha, $def, $repo and $sender are jq variables, not shell ones.
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
             | select(.merged_at != null and .merge_commit_sha == $sha
-              and (.base.ref? // "") == $def)]'
+              and ((.base.ref)? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
           # an object), a [bot] login, or a bot's branch name.
           # shellcheck disable=SC2016
-          BOT='((.user.type? // null) != "User")
-            or ((.user.login? // "" | tostring) | endswith("[bot]"))
-            or ((.head.ref? // "" | tostring)
+          BOT='(((.user.type)? // null) != "User")
+            or (((.user.login)? // "" | tostring) | endswith("[bot]"))
+            or (((.head.ref)? // "" | tostring)
               | test("^(renovate|dependabot)/"; "i"))'
           # Merged PRs a person opened and also merged (pushed).
           # shellcheck disable=SC2016
           OURS='['"${MERGED}"'[] | select(('"${BOT}"' | not)
-            and ((.user.login? // "" | tostring | ascii_downcase)
+            and (((.user.login)? // "" | tostring | ascii_downcase)
               == ($sender | ascii_downcase)))]'
           # A full page (100) may be truncated, and any entry that is not
           # an object is unreadable; both fail closed.
           # shellcheck disable=SC2016
           CLASSIFY='if type != "array" or length >= 100
               or any(.[]; type != "object") then "bad"
-            elif any(.[] | objects; (.head.repo.full_name? // ""
+            elif any(.[] | objects; ((.head.repo.full_name)? // ""
               | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
             elif ('"${MERGED}"' | length) == 0 then "none"
             elif ('"${OURS}"' | length) == 0 then "other"
@@ -241,7 +254,7 @@ jobs:
           case "${KIND}" in
             ours) ;;
             none)
-              echo "::notice::no merged PR for this commit; direct pushes close nothing."
+              echo "::notice::no PR merged into the default branch as this commit; nothing to close."
               exit 0 ;;
             fork)
               echo "::notice::commit is in a fork PR; not trusted to close issues."
@@ -281,18 +294,19 @@ jobs:
               userContentEdits(first: 100) {
                 totalCount nodes { editor { login } } } } } }'
           # shellcheck disable=SC2016
-          OWNED='.data.repository.pullRequest
+          OWNED='(.data.repository.pullRequest)?
             | select(type == "object")
-            | select((.author.login? // "" | tostring | ascii_downcase)
+            | select(((.author.login)? // "" | tostring | ascii_downcase)
               == ($sender | ascii_downcase))
-            | select((.mergedBy.login? // "" | tostring | ascii_downcase)
+            | select(((.mergedBy.login)? // "" | tostring | ascii_downcase)
               == ($sender | ascii_downcase))
-            | select((.userContentEdits.totalCount? // 101) <= 100)
+            | select((.userContentEdits | type) == "object")
+            | select((.userContentEdits.totalCount // 101) <= 100)
             | select((.userContentEdits.nodes | type) == "array"
               and (.userContentEdits.nodes | length)
                 == .userContentEdits.totalCount)
             | select(all(.userContentEdits.nodes[]?;
-              (.editor.login? // "" | tostring | ascii_downcase)
+              ((.editor.login)? // "" | tostring | ascii_downcase)
                 == ($sender | ascii_downcase)))
             | (.body // "" | tostring)
             | select(explode | all(. != 0))
