@@ -220,6 +220,10 @@ jobs:
           # Cleared first, so an inherited ERRF names no file to delete.
           ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
+          # INT and TERM exit with their usual codes, through the EXIT
+          # trap; being trapped, they also end a retry wait at once.
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
@@ -228,7 +232,7 @@ jobs:
           # One line of safe characters, so the error below cannot carry
           # a workflow command.
           jv="${jv%%$'\n'*}"; jv="${jv//[^A-Za-z0-9_.-]/?}"; jv="${jv:0:40}"
-          if ! [[ "${jv}" =~ ^jq-([0-9]+)\.([0-9]+) ]] \
+          if ! [[ "${jv}" =~ ^jq-([0-9]{1,6})\.([0-9]{1,6}) ]] \
             || [ "${BASH_REMATCH[1]}" -lt 1 ] \
             || { [ "${BASH_REMATCH[1]}" -eq 1 ] && [ "${BASH_REMATCH[2]}" -lt 5 ]; }; then
             echo "::error::runner jq is '${jv}'; need 1.5+."; exit 1
@@ -236,15 +240,18 @@ jobs:
           if [ "$(jq -n '"A" | test("a"; "i")' 2>/dev/null)" != true ]; then
             echo "::error::runner jq has no regex support (test)."; exit 1
           fi
-          # -H @- (used below) needs curl 7.55+.
+          # -H @- (used below) needs curl 7.55+. Version numbers have at
+          # most 6 digits, so the numeric tests below cannot overflow.
           cv="$(curl -q --version | head -n1 | cut -d' ' -f2)"
+          cv="${cv//[^A-Za-z0-9_.-]/?}"; cv="${cv:0:40}"
           IFS=. read -r cmaj cmin _ <<< "${cv}"
-          if ! [[ "${cmaj}" =~ ^[0-9]+$ && "${cmin}" =~ ^[0-9]+$ ]]; then
+          if ! [[ "${cmaj}" =~ ^[0-9]{1,6}$ && "${cmin}" =~ ^[0-9]{1,6}$ ]]; then
             echo "::error::cannot parse curl version '${cv}'."; exit 1
           fi
           if [ "${cmaj}" -lt 7 ] || { [ "${cmaj}" -eq 7 ] && [ "${cmin}" -lt 55 ]; }; then
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
+          unset jv cv cmaj cmin
           if [ "${SENDER_TYPE}" != User ] || [ -z "${SENDER_LOGIN}" ]; then
             echo "::notice::push not made by a person; not trusted to close issues."
             exit 0
@@ -281,10 +288,6 @@ jobs:
               echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
               exit 0 ;;
           esac
-          # INT and TERM exit with their usual codes, through the EXIT
-          # trap; being trapped, they also end a retry wait at once.
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
           # The sleep runs in the background, so wait returns at once on a
           # signal. Its output goes to /dev/null: a sleep left behind holds
           # no pipe or token and ends by itself within 10 s.
@@ -326,9 +329,11 @@ jobs:
               and ascii_downcase == ($sender | ascii_downcase)))]'
           # A full page (100) may be truncated, and any entry that is not
           # an object is unreadable; both fail closed. A non-string head
-          # repo full_name counts as a fork.
+          # repo full_name counts as a fork. jq -s reads the whole answer:
+          # anything but exactly one JSON document is unreadable.
           # shellcheck disable=SC2016
-          CLASSIFY='if type != "array" or length >= 100
+          CLASSIFY='(if length == 1 then .[0] else null end)
+            | if type != "array" or length >= 100
               or any(.[]; type != "object") then "bad"
             elif any(.[] | objects; ((.head.repo.full_name)? // ""
               | type != "string"
@@ -351,8 +356,9 @@ jobs:
               echo "::warning::PR lookup failed (${st:-no HTTP status}) — skipping."
               exit 0
             fi
-            KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" --arg repo "${REPO}" \
-              --arg sender "${SENDER_LOGIN}" "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)"
+            KIND="$(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" --arg repo "${REPO}" \
+              --arg sender "${SENDER_LOGIN}" "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)" \
+              || KIND=bad
             if [ "${KIND}" != none ] || [ "${attempt}" -eq 4 ]; then
               break
             fi
@@ -373,8 +379,9 @@ jobs:
               echo "::warning::PR lookup unreadable — skipping."
               exit 0 ;;
           esac
-          mapfile -t NUMS < <(jq -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
-            --arg sender "${SENDER_LOGIN}" "${OURS}"'[] | .number
+          # KIND is "ours" only for exactly one document, read as .[0].
+          mapfile -t NUMS < <(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
+            --arg sender "${SENDER_LOGIN}" '.[0] | '"${OURS}"'[] | .number
             | if type == "number" then tostring else "bad" end' <<< "${PR_JSON}" 2>/dev/null)
           unset PR_JSON
           # Any trusted PR without a whole number fails closed as a whole.
@@ -408,7 +415,8 @@ jobs:
           OWNED='def me: type == "object" and .__typename == "User"
               and (.login | type) == "string"
               and (.login | ascii_downcase) == ($sender | ascii_downcase);
-            (.data.repository.pullRequest)?
+            (if length == 1 then .[0] else null end)
+            | (.data.repository.pullRequest)?
             | select(type == "object")
             | select(.author | me)
             | select(.mergedBy | me)
@@ -450,9 +458,10 @@ jobs:
               echo "::warning::PR #${n} lookup failed (${st:-no HTTP status}) — skipping all PRs."
               exit 0
             done
-            b="$(jq -r --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)"
-            # Several JSON documents are unreadable, as in the REST answer.
-            case "${b}" in *$'\n'*) b="" ;; esac
+            # As for the REST answer, jq -s reads the whole answer, and
+            # anything but exactly one JSON document is not trusted.
+            b="$(jq -s -r --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)" \
+              || b=""
             if [ "${b#b:}" = "${b}" ]; then
               echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, its body has a NUL, or the answer is unreadable; not trusted."
               continue
