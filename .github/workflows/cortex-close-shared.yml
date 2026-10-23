@@ -304,15 +304,16 @@ jobs:
           # $sha, $def, $repo and $sender are jq variables, not shell ones.
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
-            | select(.merged_at != null and .merge_commit_sha == $sha
+            | select((.merged_at | type == "string")
+              and .merge_commit_sha == $sha
               and ((.base.ref)? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
           # an object), a [bot] or non-string login, or a bot's (or a
-          # non-string) branch name.
+          # missing or non-string) branch name.
           # shellcheck disable=SC2016
           BOT='(((.user.type)? // null) != "User")
-            or ((.user.login)? // "" | type != "string" or endswith("[bot]"))
-            or ((.head.ref)? // "" | type != "string"
+            or ((.user.login)? // null | type != "string" or endswith("[bot]"))
+            or ((.head.ref)? // null | type != "string"
               or test("^(renovate|dependabot)/"; "i"))'
           # Merged PRs a person opened and also merged (pushed).
           # shellcheck disable=SC2016
