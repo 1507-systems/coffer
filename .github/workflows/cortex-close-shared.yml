@@ -151,6 +151,10 @@ jobs:
           { set +x; } >/dev/null 2>&1
           set +aeCkxv +o posix -uo pipefail
           export -n SHELLOPTS BASHOPTS
+          # Without -p, BASHOPTS could set nocasematch, which would make
+          # the push-context checks case-blind; it is set only around the
+          # reference match below.
+          shopt -u nocasematch
           # ASCII classes and case folding, whatever the runner's locale.
           export LC_ALL=C
           # Time from here, whatever SECONDS the environment held.
@@ -158,9 +162,10 @@ jobs:
           # An inherited FUNCNEST would break the nested helpers, and a
           # TMOUT would make read time out and drop body lines. BASH_ENV
           # and ENV are dropped so no child shell runs them either (the
-          # allowlist below also covers that), BASH_COMPAT so this bash
-          # keeps its own behaviour, and EXECIGNORE so it hides no tool.
-          unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT EXECIGNORE
+          # allowlist below also covers that), and BASH_COMPAT so this
+          # bash keeps its own behaviour. (An inherited EXECIGNORE does
+          # nothing: bash reads it only when the shell assigns it.)
+          unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
             "${SENDER_TYPE:=}" "${SENDER_LOGIN:=}" "${DEFAULT_BRANCH:=}" \
@@ -236,9 +241,10 @@ jobs:
           # Cleared first, so an inherited ISO or ERRF names nothing to
           # delete. For ISO this is defence in depth: the mktemp -d line
           # overwrites it before any exit, so without this reset only a
-          # signal during the two trap lines between the EXIT trap and
-          # that line could delete an inherited path. The traps are set
-          # before the directory is made.
+          # signal before that assignment completes could delete an
+          # inherited path: INT or TERM during the two trap lines, or an
+          # untrapped fatal one (e.g. HUP) up to the assignment. The traps
+          # are set before the directory is made.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
@@ -248,6 +254,10 @@ jobs:
           # mktemp's stderr is not ours to echo; the warning says enough.
           ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
+          # It must have made a directory (not a link), or ISO names
+          # nothing of ours and the trap must not touch it.
+          [ -n "${ISO}" ] && [ -d "${ISO}" ] && [ ! -L "${ISO}" ] \
+            || { ISO=; echo "::warning::mktemp failed — skipping."; exit 0; }
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
@@ -326,6 +336,11 @@ jobs:
               echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
               exit 0 ;;
           esac
+          # A longer here-string could go to a temp file even on bash 5.1+.
+          if [ "${#_cortex_tok}" -gt 4096 ]; then
+            echo "::warning::CORTEX_WRITE_TOKEN is over 4096 bytes — skipping."
+            exit 0
+          fi
           # The sleep runs in the background, so wait returns at once on a
           # signal. Its output goes to /dev/null: a sleep left behind holds
           # no pipe or token and ends by itself within 10 s.
@@ -356,6 +371,8 @@ jobs:
           fi
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
+          [ -n "${ERRF}" ] && [ -f "${ERRF}" ] && [ ! -L "${ERRF}" ] \
+            || { ERRF=; echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
           # after a type check, so a wrong shape fails closed. MERGED and
@@ -601,7 +618,8 @@ jobs:
             exit 0
           fi
           # The Authorization header goes to curl on stdin (-H @-), so the
-          # token is in no process list and, on bash 5.1+, no file (older
+          # token is in no process list and, on bash 5.1+, no file (a
+          # here-string of at most 4096 bytes goes through a pipe; older
           # bash writes a 0600 temp file and unlinks it at once). -q
           # (first) makes curl ignore any ~/.curlrc on the runner.
           cx() { curl -q -H @- "$@" <<< "Authorization: Bearer ${_cortex_tok}"; }
