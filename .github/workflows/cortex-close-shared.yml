@@ -113,20 +113,24 @@ jobs:
           # job. A runner without the tools below fails it, and so does a
           # gh call that hangs until timeout-minutes (gh has no timeout);
           # curl calls have --max-time, and no call starts after 8 min.
-          # bash -p (see shell:) reads no BASH_ENV and imports no options
-          # or functions, so nothing runs before this line; the set and
-          # export -n lines below are a backstop for a shell without -p.
-          # +a too: a `set -a` would re-export the token copies.
+          # bash -p (see shell:) reads no BASH_ENV and imports no
+          # SHELLOPTS, BASHOPTS or functions, so nothing runs before this
+          # line; the set and export -n lines below are a backstop for a
+          # shell without -p.
+          # +a: an inherited allexport would re-export the token copies.
           # +xv: an inherited SHELLOPTS would trace the token to the log;
-          # the first set +x is traced only to /dev/null, so nothing is
-          # traced, whatever PS4 the environment holds. Un-exported,
-          # SHELLOPTS no longer reaches child shells either.
+          # the first set +x has stdout and stderr on /dev/null, so its
+          # own trace goes there, whatever PS4 or BASH_XTRACEFD the
+          # environment holds. Un-exported, SHELLOPTS no longer reaches
+          # child shells either.
+          # +o posix: POSIXLY_CORRECT turns posix mode on even under -p,
+          # and old bash then rejects the process substitutions below.
           # +C: an inherited noclobber would block the writes to ERRF.
           # +k: keyword mode would turn the declare +x words below into
           # env assignments, leaving a bare declare +x, which prints
           # every variable.
-          { set +x; } 2>/dev/null
-          set +aeCkxv -uo pipefail
+          { set +x; } >/dev/null 2>&1
+          set +aeCkxv +o posix -uo pipefail
           export -n SHELLOPTS BASHOPTS
           # ASCII classes and case folding, whatever the runner's locale.
           export LC_ALL=C
@@ -134,8 +138,9 @@ jobs:
           SECONDS=0
           # An inherited FUNCNEST would break the nested helpers, and a
           # TMOUT would make read time out and drop body lines. BASH_ENV
-          # and ENV are dropped so no child shell runs them either.
-          unset FUNCNEST TMOUT BASH_ENV ENV
+          # and ENV are dropped so no child shell runs them either, and
+          # BASH_COMPAT so this bash keeps its own behaviour.
+          unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
             "${SENDER_TYPE:=}" "${SENDER_LOGIN:=}" "${DEFAULT_BRANCH:=}" \
@@ -145,8 +150,11 @@ jobs:
           declare +x _cortex_tok="${CORTEX_WRITE_TOKEN-}" _gh_tok="${GH_TOKEN-}"
           unset CORTEX_WRITE_TOKEN GH_TOKEN
           # gh must talk to github.com, where GH_TOKEN is from, with plain
-          # output; curl must not log TLS keys that would expose the token.
-          unset GH_HOST GH_PAGER GH_FORCE_TTY SSLKEYLOGFILE
+          # output (no forced colour) and no debug log; grep must take no
+          # default options; curl must not log TLS keys that would expose
+          # the token.
+          unset GH_HOST GH_PAGER GH_FORCE_TTY CLICOLOR_FORCE GH_DEBUG \
+            GREP_OPTIONS SSLKEYLOGFILE
           # Fail loudly: old bash or a missing tool would silently no-op.
           if [ "${BASH_VERSINFO[0]}" -lt 4 ] \
             || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
@@ -253,7 +261,7 @@ jobs:
               and ((.base.ref)? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
           # an object), a [bot] or non-string login, or a bot's (or a
-          # non-string) branch name. A non-string fork name is a fork.
+          # non-string) branch name.
           # shellcheck disable=SC2016
           BOT='(((.user.type)? // null) != "User")
             or ((.user.login)? // "" | type != "string" or endswith("[bot]"))
@@ -265,7 +273,8 @@ jobs:
             and ((.user.login)? // null | type == "string"
               and ascii_downcase == ($sender | ascii_downcase)))]'
           # A full page (100) may be truncated, and any entry that is not
-          # an object is unreadable; both fail closed.
+          # an object is unreadable; both fail closed. A non-string head
+          # repo full_name counts as a fork.
           # shellcheck disable=SC2016
           CLASSIFY='if type != "array" or length >= 100
               or any(.[]; type != "object") then "bad"
