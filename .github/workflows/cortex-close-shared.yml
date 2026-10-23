@@ -24,7 +24,7 @@ name: Close Cortex Issues (shared)
 #   and the run was started by that push or a re-run by the sender;
 # - it is from a branch in the caller's repo;
 # - it is not a bot's (a non-User type; a [bot], missing or
-#   non-string login; or a missing or non-string branch name, or a
+#   non-string login; a missing or non-string branch name; or a
 #   renovate/ or dependabot/ branch, any case);
 # - nobody but its opener ever edited the body.
 # If any PR listed for the commit is from a fork, nothing is scanned.
@@ -225,6 +225,9 @@ jobs:
             echo "::error::runner base64 does not decode with -d."; exit 1
           fi
           jv="$(jq --version 2>/dev/null)"
+          # One line of safe characters, so the error below cannot carry
+          # a workflow command.
+          jv="${jv%%$'\n'*}"; jv="${jv//[^A-Za-z0-9_.-]/?}"; jv="${jv:0:40}"
           if ! [[ "${jv}" =~ ^jq-([0-9]+)\.([0-9]+) ]] \
             || [ "${BASH_REMATCH[1]}" -lt 1 ] \
             || { [ "${BASH_REMATCH[1]}" -eq 1 ] && [ "${BASH_REMATCH[2]}" -lt 5 ]; }; then
@@ -448,6 +451,8 @@ jobs:
               exit 0
             done
             b="$(jq -r --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)"
+            # Several JSON documents are unreadable, as in the REST answer.
+            case "${b}" in *$'\n'*) b="" ;; esac
             if [ "${b#b:}" = "${b}" ]; then
               echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, its body has a NUL, or the answer is unreadable; not trusted."
               continue
@@ -499,7 +504,6 @@ jobs:
           # to id and version. The API has no get-by-id or paging, so each
           # list holds at most its first 200 issues.
           declare -A LISTS=()
-          LATE=0; LFAIL=0
           fetch_lists() {
             local q resp
             LISTS=(); LATE=0; LFAIL=0
