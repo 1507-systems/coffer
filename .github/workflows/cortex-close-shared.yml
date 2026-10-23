@@ -45,7 +45,9 @@ name: Close Cortex Issues (shared)
 # hand. A re-run by the sender re-reads the body as it is now, so it
 # closes again any referenced issue reopened since the merge, and also
 # closes the issues of references the sender has since added at the
-# top; a re-run by anyone else closes nothing.
+# top; a re-run by anyone else closes nothing. A later non-forced push
+# by the sender whose head is that merge commit (e.g. after a reset)
+# acts the same as a re-run by the sender.
 # References must open the body: blank lines aside, the first lines are
 # read while each is exactly a keyword (close, closes, closed, fix,
 # fixes, fixed, resolve, resolves, resolved, retire, retires, retired;
@@ -300,13 +302,12 @@ jobs:
           while [[ "${CORTEX_API_BASE}" == */ ]]; do CORTEX_API_BASE="${CORTEX_API_BASE%/}"; done
           # The bearer token must never go out in cleartext, and the base
           # must be https://, a host (starting with a letter or digit), an
-          # optional :port from 1 to 65535 and a plain path.
+          # optional :port from 1 to 65535 and an optional plain path.
           BASE_RE='^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$'
-          PORT_RE='^https://[^/:]+:([0-9]+)'
           if ! [[ "${CORTEX_API_BASE}" =~ ${BASE_RE} ]] \
-            || { [[ "${CORTEX_API_BASE}" =~ ${PORT_RE} ]] \
-              && (( 10#${BASH_REMATCH[1]} < 1 || 10#${BASH_REMATCH[1]} > 65535 )); }; then
-            echo "::warning::the Cortex base URL is not https://, a host, an optional port and a path — skipping."
+            || { _port="${BASH_REMATCH[1]#:}"; [ -n "${_port}" ] \
+              && (( 10#${_port} < 1 || 10#${_port} > 65535 )); }; then
+            echo "::warning::the Cortex base URL is not https://host[:port 1-65535][/path] — skipping."
             exit 0
           fi
           case "${_cortex_tok}" in
@@ -367,7 +368,8 @@ jobs:
             or ((.user.login)? // null | type != "string" or endswith("[bot]"))
             or ((.head.ref)? // null | type != "string"
               or test("^(renovate|dependabot)/"; "i"))'
-          # Merged PRs the push's sender opened (mergedBy is checked later).
+          # Merged, non-bot PRs the push's sender opened (mergedBy is
+          # checked later).
           # shellcheck disable=SC2016
           OURS='['"${MERGED}"'[] | select(('"${BOT}"' | not)
             and ((.user.login)? // null | type == "string"
