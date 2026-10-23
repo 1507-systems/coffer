@@ -18,7 +18,8 @@ name: Close Cortex Issues (shared)
 # with regex support, gh, a base64 that takes -d, an env that takes -0,
 # grep, sort, head, cut, mktemp, rm and sleep. Each must exist, and
 # bash, curl, jq, base64 and env are also checked by version or
-# feature; the job fails otherwise.
+# feature; the job fails otherwise, except that a mktemp that runs but
+# fails ends the run with a warning first, before the later checks.
 # Tested on bash 5.2, jq 1.7 and curl 8.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
@@ -130,10 +131,11 @@ jobs:
           # curl calls have --max-time, and no call starts after 8 min.
           # bash -p (see shell:) reads no BASH_ENV and imports no
           # SHELLOPTS, BASHOPTS or functions, so nothing runs before this
-          # line. The set and export -n lines below are a backstop for
-          # shell options only, and not for noexec (nothing would run):
-          # without -p, BASH_ENV and exported functions would still act,
-          # so -p must stay.
+          # line. The set, export -n and shopt lines below are a backstop
+          # for shell options only, and not for noexec (nothing would run):
+          # without -p, BASH_ENV, exported functions and an extdebug
+          # BASHOPTS (bash's debugger start-up file) would still act, so
+          # -p must stay.
           # +a: an inherited allexport would re-export the token copies.
           # +xv: an inherited SHELLOPTS would trace the token to the log;
           # the first set +x has stdout and stderr on /dev/null, so its
@@ -239,12 +241,11 @@ jobs:
           # loads ~/.jq into every program and gh reads ~/.config/gh, so
           # both get an empty private directory instead (curl gets -q).
           # Cleared first, so an inherited ISO or ERRF names nothing to
-          # delete. For ISO this is defence in depth: the mktemp -d line
-          # overwrites it before any exit, so without this reset only a
-          # signal before that assignment completes could delete an
-          # inherited path: INT or TERM during the two trap lines, or an
-          # untrapped fatal one (e.g. HUP) up to the assignment. The traps
-          # are set before the directory is made.
+          # delete. For ISO this is defence in depth: without this reset,
+          # an inherited path could be deleted by INT or TERM at any time
+          # from the EXIT trap until mktemp -d starts, or by an untrapped
+          # fatal signal (e.g. HUP) until the assignment completes. The
+          # traps are set before the directory is made.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
@@ -254,9 +255,11 @@ jobs:
           # mktemp's stderr is not ours to echo; the warning says enough.
           ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # It must have made a directory (not a link), or ISO names
-          # nothing of ours and the trap must not touch it.
-          [ -n "${ISO}" ] && [ -d "${ISO}" ] && [ ! -L "${ISO}" ] \
+          # It must name a directory (not a link) from our template, or
+          # the trap must not touch it. A mktemp that lies beyond that is
+          # runner code, a known limit.
+          [ -n "${ISO}" ] && [[ "${ISO}" == "${RUNNER_TEMP:-/tmp}/cortex-iso."* ]] \
+            && [ -d "${ISO}" ] && [ ! -L "${ISO}" ] \
             || { ISO=; echo "::warning::mktemp failed — skipping."; exit 0; }
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
@@ -336,9 +339,11 @@ jobs:
               echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
               exit 0 ;;
           esac
-          # A longer here-string could go to a temp file even on bash 5.1+.
-          if [ "${#_cortex_tok}" -gt 4096 ]; then
-            echo "::warning::CORTEX_WRITE_TOKEN is over 4096 bytes — skipping."
+          # The header here-string is the token plus 23 bytes. Bash 5.1+
+          # sends it through a pipe only if it fits, and on some builds a
+          # pipe takes just 4096 bytes; a longer one goes to a temp file.
+          if [ "${#_cortex_tok}" -gt 4000 ]; then
+            echo "::warning::CORTEX_WRITE_TOKEN is over 4000 bytes — skipping."
             exit 0
           fi
           # The sleep runs in the background, so wait returns at once on a
@@ -371,7 +376,9 @@ jobs:
           fi
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          [ -n "${ERRF}" ] && [ -f "${ERRF}" ] && [ ! -L "${ERRF}" ] \
+          # A file (not a link) from our template, as for ISO above.
+          [ -n "${ERRF}" ] && [[ "${ERRF}" == "${RUNNER_TEMP:-/tmp}/cortex-err."* ]] \
+            && [ -f "${ERRF}" ] && [ ! -L "${ERRF}" ] \
             || { ERRF=; echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
@@ -618,8 +625,8 @@ jobs:
             exit 0
           fi
           # The Authorization header goes to curl on stdin (-H @-), so the
-          # token is in no process list and, on bash 5.1+, no file (a
-          # here-string of at most 4096 bytes goes through a pipe; older
+          # token is in no process list and, on bash 5.1+, no file (the
+          # token is capped above so the here-string fits in a pipe; older
           # bash writes a 0600 temp file and unlinks it at once). -q
           # (first) makes curl ignore any ~/.curlrc on the runner.
           cx() { curl -q -H @- "$@" <<< "Authorization: Bearer ${_cortex_tok}"; }
