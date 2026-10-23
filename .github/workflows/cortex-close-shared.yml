@@ -28,7 +28,10 @@ name: Close Cortex Issues (shared)
 # - it is not a bot's (a non-User type; a [bot], missing or
 #   non-string login; a missing or non-string branch name; or a
 #   renovate/ or dependabot/ branch, any case);
-# - nobody but its opener ever edited the body.
+# - nobody but its opener ever edited the body, and the PR's own
+#   latest editor and lastEditedAt are consistent with that;
+# - GitHub's REST entry and GraphQL answer are the same PR, merged as
+#   this commit into the default branch of this repo.
 # If any PR listed for the commit is from a fork, nothing is scanned.
 # Commit messages are never scanned, so a push with no such PR behind
 # it closes nothing. Force-pushes close nothing (the push's forced
@@ -326,10 +329,11 @@ jobs:
           # The job's if: already needs a real push; check its context here
           # too, since an empty repo or default branch would loosen the PR
           # checks below, and a repo or SHA of another shape would change
-          # the REST path. An owner is letters, digits and hyphens; a repo
-          # name may not be . or ..
+          # the REST path. An owner is letters, digits, hyphens and
+          # underscores, starting with a letter or digit; a repo name may
+          # not be . or ..
           if [ -z "${DEFAULT_BRANCH}" ] \
-            || ! [[ "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] \
+            || ! [[ "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9_.-]+$ ]] \
             || [ "${REPO#*/}" = . ] || [ "${REPO#*/}" = .. ] \
             || ! [[ "${HEAD_SHA}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
             echo "::warning::push context (repo, commit or default branch) unreadable — skipping."
@@ -450,13 +454,13 @@ jobs:
           # Each must also be a User (an App's GraphQL login has no [bot]
           # suffix), and a revision deleted from the edit history must
           # have been deleted by the sender. The PR's own editor and
-          # lastEditedAt must agree with the list: both keys present; with
-          # no edits listed both null, otherwise editor is the sender and
-          # lastEditedAt a timestamp string (so a latest edit missing from
-          # the list is caught).
-          # The PR must also be the one REST listed, so the body scanned is
-          # the one checked: its merge commit, base branch and base repo
-          # must be this push's commit, default branch and repo.
+          # lastEditedAt must be consistent with the list: both keys
+          # present; with no edits listed both null, otherwise editor is
+          # the sender and lastEditedAt a timestamp string (so a latest
+          # edit by someone else missing from the list is caught).
+          # The PR must also be the one REST listed, so the GraphQL answer
+          # cannot describe another PR: its merge commit, base branch and
+          # base repo must be this push's commit, default branch and repo.
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
@@ -664,7 +668,13 @@ jobs:
                   version="$(get_version "$id")"
                   looked_up "$id" "$?" || break ;;
                 403) echo "::warning::${id}: HTTP 403 (forbidden) — skipping."; break ;;
-                *)   echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."; break ;;
+                *)
+                  if [ "${rc}" -ne 0 ]; then
+                    echo "::warning::${id}: no complete answer (HTTP ${code}, curl exit ${rc}) — may have applied; check it by hand."
+                  else
+                    echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."
+                  fi
+                  break ;;
               esac
             done
           done
