@@ -56,7 +56,9 @@ name: Close Cortex Issues (shared)
 # instance (issue UUIDs appear in public repos); anyone who can run a
 # workflow in a caller repo, or code on its runner, can take the token
 # (e.g. from this step's /proc environ, or through the runner's PATH,
-# proxy or CA settings).
+# proxy or CA settings). The edit-history rule relies on GitHub
+# recording every body edit (also an App's or a GITHUB_TOKEN's, or a
+# second person's soon after another); that is not checked on a live PR.
 # An account that opens and merges its own PRs is trusted as a person,
 # even a machine user; agents that open and merge PRs under a person's
 # account are trusted as that person.
@@ -195,11 +197,15 @@ jobs:
             # Names only, never values; anything that could start a
             # workflow command is replaced, and each name is capped.
             if [ "${odd}" -le 5 ]; then
-              e="${e%%=*}"; e="${e//[^A-Za-z0-9_.%-]/?}"
+              # A trailing %% (as in BASH_FUNC_name%%) is kept; any other %
+              # is replaced too, so no %-escape reaches the message.
+              e="${e%%=*}"; sfx=""
+              [[ "${e}" == *%% ]] && { e="${e%\%\%}"; sfx="%%"; }
+              e="${e//[^A-Za-z0-9_.-]/?}${sfx}"
               names="${names} ${e:0:40}"
             fi
           done < <(env -0)
-          unset e
+          unset e sfx
           if [ "${seen}" -ne 1 ]; then
             echo "::error::runner env -0 output could not be read."; exit 1
           fi
@@ -228,21 +234,25 @@ jobs:
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
           fi
+          # Each version number must be 1-6 digits (a longer one fails), so
+          # the -lt and -eq tests in the jq and curl checks cannot overflow.
           jv="$(jq --version 2>/dev/null)"
-          # One line of safe characters, so the error below cannot carry
+          # One line of safe characters, so the errors below cannot carry
           # a workflow command.
           jv="${jv%%$'\n'*}"; jv="${jv//[^A-Za-z0-9_.-]/?}"; jv="${jv:0:40}"
-          if ! [[ "${jv}" =~ ^jq-([0-9]{1,6})\.([0-9]{1,6}) ]] \
-            || [ "${BASH_REMATCH[1]}" -lt 1 ] \
+          if ! [[ "${jv}" =~ ^jq-([0-9]{1,6})\.([0-9]{1,6})([^0-9]|$) ]]; then
+            echo "::error::cannot parse jq version '${jv}'."; exit 1
+          fi
+          if [ "${BASH_REMATCH[1]}" -lt 1 ] \
             || { [ "${BASH_REMATCH[1]}" -eq 1 ] && [ "${BASH_REMATCH[2]}" -lt 5 ]; }; then
             echo "::error::runner jq is '${jv}'; need 1.5+."; exit 1
           fi
           if [ "$(jq -n '"A" | test("a"; "i")' 2>/dev/null)" != true ]; then
             echo "::error::runner jq has no regex support (test)."; exit 1
           fi
-          # -H @- (used below) needs curl 7.55+. Version numbers have at
-          # most 6 digits, so the numeric tests below cannot overflow.
+          # -H @- (used below) needs curl 7.55+.
           cv="$(curl -q --version | head -n1 | cut -d' ' -f2)"
+          # Cut like the jq version, for the errors below.
           cv="${cv//[^A-Za-z0-9_.-]/?}"; cv="${cv:0:40}"
           IFS=. read -r cmaj cmin _ <<< "${cv}"
           if ! [[ "${cmaj}" =~ ^[0-9]{1,6}$ && "${cmin}" =~ ^[0-9]{1,6}$ ]]; then
@@ -251,7 +261,7 @@ jobs:
           if [ "${cmaj}" -lt 7 ] || { [ "${cmaj}" -eq 7 ] && [ "${cmin}" -lt 55 ]; }; then
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
-          unset jv cv cmaj cmin
+          unset jv cv cmaj cmin t v
           if [ "${SENDER_TYPE}" != User ] || [ -z "${SENDER_LOGIN}" ]; then
             echo "::notice::push not made by a person; not trusted to close issues."
             exit 0
@@ -379,7 +389,8 @@ jobs:
               echo "::warning::PR lookup unreadable — skipping."
               exit 0 ;;
           esac
-          # KIND is "ours" only for exactly one document, read as .[0].
+          # KIND is "ours" only for exactly one document, read as .[0]. A
+          # jq failure here leaves NUMS empty, which warns below.
           mapfile -t NUMS < <(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
             --arg sender "${SENDER_LOGIN}" '.[0] | '"${OURS}"'[] | .number
             | if type == "number" then tostring else "bad" end' <<< "${PR_JSON}" 2>/dev/null)
@@ -522,8 +533,8 @@ jobs:
               if out_of_time; then LATE=1; continue; fi
               resp="$(cx -s -f --proto =https --max-time 10 "${CORTEX_API_BASE}/issues?status=${q}&limit=200" 2>/dev/null)" \
                 || { LFAIL=1; continue; }
-              # Only a JSON body with an issues array counts as a lookup.
-              resp="$(printf '%s' "$resp" | jq -ce '.issues | arrays | [.[] | objects | {id, version}]' 2>/dev/null)" \
+              # Only one JSON document with an issues array is a lookup.
+              resp="$(printf '%s' "$resp" | jq -s -ce '(if length == 1 then .[0] else null end) | .issues | arrays | [.[] | objects | {id, version}]' 2>/dev/null)" \
                 || { LFAIL=1; continue; }
               LISTS[$q]="$resp"
             done
