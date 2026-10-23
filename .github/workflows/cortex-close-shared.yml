@@ -22,9 +22,9 @@ name: Close Cortex Issues (shared)
 # (the private directory) ends the run with a warning before the
 # base64, jq and curl checks; a failing one for gh's stderr file warns
 # later.
-# Tested on bash 5.2 and jq 1.7; gh and curl are stubbed in the suite
-# (real gh 2.x checked read-only with an empty config dir), and -H @-
-# was checked by hand on curl 8.7.1.
+# Tested on macOS with bash 5.2 and jq 1.7; gh and curl are stubbed in
+# the suite (real gh 2.x checked read-only with an empty config dir),
+# and -H @- was checked by hand on curl 8.7.1.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
 # - the push's sender (type User) opened it and is GitHub's mergedBy,
