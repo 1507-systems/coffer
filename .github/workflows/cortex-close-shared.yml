@@ -57,8 +57,8 @@ name: Close Cortex Issues (shared)
 # workflow in a caller repo, or code on its runner, can take the token
 # (e.g. from this step's /proc environ, or through the runner's PATH,
 # proxy or CA settings). The edit-history rule relies on GitHub
-# recording every body edit (also an App's or a GITHUB_TOKEN's, or a
-# second person's soon after another); that is not checked on a live PR.
+# recording every body edit; that it records an App's, a GITHUB_TOKEN's
+# or a second person's edit has not been verified on a live PR.
 # An account that opens and merges its own PRs is trusted as a person,
 # even a machine user; agents that open and merge PRs under a person's
 # account are trusted as that person.
@@ -109,6 +109,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           FORCED: ${{ github.event.forced }}
           TRIGGER_LOGIN: ${{ github.triggering_actor }}
+          API_URL: ${{ github.api_url }}
         # -p: bash ignores SHELLOPTS, BASHOPTS, BASH_ENV, ENV and exported
         # functions from the environment (see the comments below).
         shell: bash --noprofile --norc -p -o pipefail {0}
@@ -153,7 +154,7 @@ jobs:
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
             "${SENDER_TYPE:=}" "${SENDER_LOGIN:=}" "${DEFAULT_BRANCH:=}" \
-            "${FORCED:=}" "${TRIGGER_LOGIN:=}"
+            "${FORCED:=}" "${TRIGGER_LOGIN:=}" "${API_URL:=}"
           # Keep tokens out of child processes' environments; declare +x
           # drops an export the runner may already have on these names.
           declare +x _cortex_tok="${CORTEX_WRITE_TOKEN-}" _gh_tok="${GH_TOKEN-}"
@@ -197,12 +198,13 @@ jobs:
             # Names only, never values; anything that could start a
             # workflow command is replaced, and each name is capped.
             if [ "${odd}" -le 5 ]; then
-              # A trailing %% (as in BASH_FUNC_name%%) is kept; any other %
-              # is replaced too, so no %-escape reaches the message.
+              # A trailing %% (as in BASH_FUNC_name%%) is kept, inside the
+              # cap; any other % is replaced, so no %-escape reaches the
+              # message.
               e="${e%%=*}"; sfx=""
               [[ "${e}" == *%% ]] && { e="${e%\%\%}"; sfx="%%"; }
-              e="${e//[^A-Za-z0-9_.-]/?}${sfx}"
-              names="${names} ${e:0:40}"
+              e="${e//[^A-Za-z0-9_.-]/?}"
+              names="${names} ${e:0:$((40 - ${#sfx}))}${sfx}"
             fi
           done < <(env -0)
           unset e sfx
@@ -234,7 +236,7 @@ jobs:
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
           fi
-          # Each version number must be 1-6 digits (a longer one fails), so
+          # Major and minor versions must be 1-6 digits (longer fails), so
           # the -lt and -eq tests in the jq and curl checks cannot overflow.
           jv="$(jq --version 2>/dev/null)"
           # One line of safe characters, so the errors below cannot carry
@@ -262,6 +264,12 @@ jobs:
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
           unset jv cv cmaj cmin t v
+          # gh is given no GH_HOST, so it always calls github.com; on any
+          # other GitHub host the token would leave its tenant, so skip.
+          if [ "${API_URL}" != https://api.github.com ]; then
+            echo "::notice::not running on github.com; nothing closed."
+            exit 0
+          fi
           if [ "${SENDER_TYPE}" != User ] || [ -z "${SENDER_LOGIN}" ]; then
             echo "::notice::push not made by a person; not trusted to close issues."
             exit 0
@@ -319,6 +327,9 @@ jobs:
           # non-object is read with (path)? (which guards every step) or
           # after a type check, so a wrong shape fails closed.
           # $sha, $def, $repo and $sender are jq variables, not shell ones.
+          # jq -s gives an array of the documents read; anything but exactly
+          # one document reads as null.
+          ONE='(if length == 1 then .[0] else null end)'
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
             | select((.merged_at | type == "string" and . != "")
@@ -342,7 +353,7 @@ jobs:
           # repo full_name counts as a fork. jq -s reads the whole answer:
           # anything but exactly one JSON document is unreadable.
           # shellcheck disable=SC2016
-          CLASSIFY='(if length == 1 then .[0] else null end)
+          CLASSIFY="${ONE}"'
             | if type != "array" or length >= 100
               or any(.[]; type != "object") then "bad"
             elif any(.[] | objects; ((.head.repo.full_name)? // ""
@@ -390,14 +401,18 @@ jobs:
               exit 0 ;;
           esac
           # KIND is "ours" only for exactly one document, read as .[0]. A
-          # jq failure here leaves NUMS empty, which warns below.
-          mapfile -t NUMS < <(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
+          # jq failure leaves no PR number, which warns below.
+          nums="$(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
             --arg sender "${SENDER_LOGIN}" '.[0] | '"${OURS}"'[] | .number
-            | if type == "number" then tostring else "bad" end' <<< "${PR_JSON}" 2>/dev/null)
+            | if type == "number" then tostring else "bad" end' <<< "${PR_JSON}" 2>/dev/null)" \
+            || nums=""
+          mapfile -t NUMS <<< "${nums}"
+          unset nums
           unset PR_JSON
-          # Any trusted PR without a whole number fails closed as a whole.
+          # Any trusted PR without a whole number (1-10 digits) fails
+          # closed as a whole.
           bad=0
-          for n in "${NUMS[@]}"; do [[ "${n}" =~ ^[0-9]+$ ]] || bad=1; done
+          for n in "${NUMS[@]}"; do [[ "${n}" =~ ^[0-9]{1,10}$ ]] || bad=1; done
           if [ "${#NUMS[@]}" -eq 0 ] || [ "${bad}" -eq 1 ]; then
             echo "::warning::PR lookup unreadable (a PR number) — skipping."
             exit 0
@@ -419,6 +434,7 @@ jobs:
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
               author { __typename login } mergedBy { __typename login } body
+              editor { __typename login } lastEditedAt
               userContentEdits(first: 100) {
                 totalCount nodes { editor { __typename login }
                   deletedBy { __typename login } } } } } }'
@@ -426,7 +442,7 @@ jobs:
           OWNED='def me: type == "object" and .__typename == "User"
               and (.login | type) == "string"
               and (.login | ascii_downcase) == ($sender | ascii_downcase);
-            (if length == 1 then .[0] else null end)
+            '"${ONE}"'
             | (.data.repository.pullRequest)?
             | select(type == "object")
             | select(.author | me)
@@ -440,6 +456,9 @@ jobs:
               type == "object" and (.editor | me)
                 and has("deletedBy")
                 and (.deletedBy == null or (.deletedBy | me))))
+            | select(if .userContentEdits.totalCount == 0
+                then .editor == null and .lastEditedAt == null
+                else (.editor | me) end)
             | select(.body == null or (.body | type) == "string")
             | (.body // "")
             | select(explode | all(. != 0))
@@ -534,7 +553,7 @@ jobs:
               resp="$(cx -s -f --proto =https --max-time 10 "${CORTEX_API_BASE}/issues?status=${q}&limit=200" 2>/dev/null)" \
                 || { LFAIL=1; continue; }
               # Only one JSON document with an issues array is a lookup.
-              resp="$(printf '%s' "$resp" | jq -s -ce '(if length == 1 then .[0] else null end) | .issues | arrays | [.[] | objects | {id, version}]' 2>/dev/null)" \
+              resp="$(printf '%s' "$resp" | jq -s -ce "${ONE}"' | .issues | arrays | [.[] | objects | {id, version}]' 2>/dev/null)" \
                 || { LFAIL=1; continue; }
               LISTS[$q]="$resp"
             done
