@@ -116,8 +116,10 @@ jobs:
             local id="$1" resp v q ok=0
             for q in status=todo status=in_progress status=backlog status=blocked ""; do
               resp="$(curl -s -f --proto =https --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?${q:+${q}&}limit=200" 2>/dev/null)" || continue
+              # Only a JSON body with an issues array counts as a lookup.
+              printf '%s' "$resp" | jq -e '.issues | type == "array"' >/dev/null 2>&1 || continue
               ok=1
-              v="$(printf '%s' "$resp" | jq -c --arg id "$id" '.issues[]? | select(.id==$id) | .version' 2>/dev/null | head -n1)"
+              v="$(printf '%s' "$resp" | jq -c --arg id "$id" '.issues[] | objects | select(.id==$id) | .version | select(type == "number" or type == "string")' 2>/dev/null | head -n1)"
               [ -n "$v" ] && [ "$v" != "null" ] && { printf '%s' "$v"; return 0; }
             done
             [ "${ok}" -eq 1 ] && return 1
@@ -132,8 +134,8 @@ jobs:
             esac
             for attempt in 1 2; do
               payload="$(jq -nc --argjson v "$version" --arg id "$id" --arg a "$attempt" \
-                --arg rid "${GITHUB_RUN_ID}" --arg note "COMPLETED via merge (gh run ${GITHUB_RUN_ID}) — auto-closed by at-merge hook." \
-                '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
+                --arg rid "${GITHUB_RUN_ID}" \
+                '{version:$v, patch:{status:"done", body:("COMPLETED via merge (gh run "+$rid+") — auto-closed by at-merge hook.")}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: bad version — skipping."; break; }
               code="$(curl -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
