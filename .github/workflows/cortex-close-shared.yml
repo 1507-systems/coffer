@@ -8,8 +8,8 @@ name: Close Cortex Issues (shared)
 # Runner: pass `runs_on` (private callers: ${{ vars.RUNNER_LABEL ||
 # 'ubuntu-latest' }}, so they use the self-hosted runner). Without it the
 # job runs on GitHub-hosted ubuntu-latest, which is free for public repos.
-# Self-hosted labels are for private callers only. The runner needs bash 4+,
-# curl, git, gh and jq.
+# Self-hosted labels are for private callers only. The runner needs bash 4+
+# first on PATH, curl 7.55+, git, gh and jq.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither the job is a no-op.
 on:
@@ -50,7 +50,8 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          set -uo pipefail
+          # No -e: every failure below is handled; the job is non-blocking.
+          set +e -uo pipefail
           # Fail loudly: old bash or a missing tool would silently no-op.
           if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
             echo "::error::runner bash is ${BASH_VERSION}; need 4+."; exit 1
@@ -59,6 +60,13 @@ jobs:
             command -v "$t" >/dev/null 2>&1 \
               || { echo "::error::runner is missing ${t}."; exit 1; }
           done
+          # -H @file (used below) needs curl 7.55+.
+          cv="$(curl --version | head -n1 | cut -d' ' -f2)"
+          IFS=. read -r cmaj cmin _ <<< "${cv}"
+          if [ "${cmaj:-0}" -lt 7 ] 2>/dev/null \
+            || { [ "${cmaj}" -eq 7 ] && [ "${cmin:-0}" -lt 55 ]; }; then
+            echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
+          fi
           COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
           PR_BODY="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[]?.body // empty' 2>/dev/null || true)"
           SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
@@ -84,11 +92,17 @@ jobs:
             https://*) ;;
             *) echo "::warning::CORTEX_API_BASE is not https:// — skipping."; exit 0 ;;
           esac
+          case "${CORTEX_WRITE_TOKEN}" in
+            *$'\n'*|*$'\r'*)
+              echo "::warning::CORTEX_WRITE_TOKEN has a newline — skipping."
+              exit 0 ;;
+          esac
           # Header from a 0600 file so the token stays out of the process list.
           HDR="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-hdr.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           trap 'rm -f "${HDR}"' EXIT
-          printf 'Authorization: Bearer %s\n' "${CORTEX_WRITE_TOKEN}" > "${HDR}"
+          printf 'Authorization: Bearer %s\n' "${CORTEX_WRITE_TOKEN}" > "${HDR}" \
+            || { echo "::warning::cannot write header file — skipping."; exit 0; }
           AUTH=(-H "@${HDR}")
           get_version() {
             local id="$1" resp v
@@ -104,9 +118,10 @@ jobs:
             for _ in 1 2; do
               payload="$(jq -nc --argjson v "$version" --arg id "$id" \
                 --arg note "COMPLETED via merge (gh run ${GITHUB_RUN_ID}) — auto-closed by at-merge hook." \
-                '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+env.GITHUB_RUN_ID+"-"+$id)}')"
+                '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+env.GITHUB_RUN_ID+"-"+$id)}')" \
+                || { echo "::warning::${id}: bad version — skipping."; break; }
               code="$(curl -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
-                -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)"
+                -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
               case "$code" in
                 200) echo "  ${id}: closed (status=done)."; break ;;
                 409) echo "  ${id}: version_conflict; re-fetching."; version="$(get_version "$id")" || break ;;
