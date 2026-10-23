@@ -53,7 +53,8 @@ name: Close Cortex Issues (shared)
 # trusted above, in any caller repo, can close any issue in the Cortex
 # instance (issue UUIDs appear in public repos); anyone who can run a
 # workflow in a caller repo, or code on its runner, can take the token
-# (e.g. from this step's /proc environ).
+# (e.g. from this step's /proc environ, or through the runner's proxy
+# or CA settings).
 # An account that opens and merges its own PRs is trusted as a person,
 # even a machine user; agents that open and merge PRs under a person's
 # account are trusted as that person.
