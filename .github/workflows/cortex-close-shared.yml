@@ -5,12 +5,13 @@ name: Close Cortex Issues (shared)
 # below, so `secrets: inherit` is not needed); it never touches this repo.
 # Callers MUST pin to a commit SHA (supply-chain safety), and only a SHA
 # that includes the secrets declaration below. Epic 4a283f45.
-# Runner: pass `runs_on: ${{ github.event.repository.private &&
-# vars.RUNNER_LABEL || 'ubuntu-latest' }}`, so only a private repo can
-# reach the self-hosted runner. Without it the job runs on GitHub-hosted
-# ubuntu-latest, which is free for public repos. The runner needs bash 4+
-# first on PATH, curl 7.55+, git, gh and jq.
-# Callers grant the job `contents: read` and `pull-requests: read`.
+# Runner: private callers pass `runs_on` (e.g. their RUNNER_LABEL
+# variable). A public caller's `runs_on` is ignored and the job runs on
+# GitHub-hosted ubuntu-latest, free for public repos, so a public repo
+# never asks for a self-hosted label (runner-group repo access is the real
+# gate). The runner needs bash 4+ first on PATH, curl 7.55+, git, gh, jq.
+# Callers MUST grant the job `contents: read` and `pull-requests: read`;
+# without the latter GitHub refuses to start the run.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither the job is a no-op.
 on:
@@ -37,7 +38,7 @@ permissions:
 jobs:
   close-cortex-issue:
     name: Close referenced Cortex issues
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && inputs.runs_on || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout (need merge commit message)
