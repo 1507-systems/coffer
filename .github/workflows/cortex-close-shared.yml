@@ -53,9 +53,7 @@ name: Close Cortex Issues (shared)
 # trusted above, in any caller repo, can close any issue in the Cortex
 # instance (issue UUIDs appear in public repos); anyone who can run a
 # workflow in a caller repo, or code on its runner, can take the token
-# (e.g. from this step's /proc environ, or from the header file if the
-# job is killed outright in the Cortex phase; INT and TERM are handled
-# once the running curl call ends, within 10 s).
+# (e.g. from this step's /proc environ).
 # An account that opens and merges its own PRs is trusted as a person,
 # even a machine user; agents that open and merge PRs under a person's
 # account are trusted as that person.
@@ -115,7 +113,10 @@ jobs:
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
           # (BASH_ENV itself runs first, with the token exported: that is
           # the runner's trust, not this script's.)
-          set +ae -uo pipefail
+          # +xv: an inherited SHELLOPTS would trace the token to the log;
+          # un-exported, it no longer reaches child shells either.
+          set +aexv -uo pipefail
+          export -n SHELLOPTS BASHOPTS
           # ASCII classes and case folding, whatever the runner's locale.
           export LC_ALL=C
           # Time from here, whatever SECONDS the environment held.
@@ -144,7 +145,9 @@ jobs:
           # both get an empty private directory instead (curl gets -q).
           ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}" "${HDR:-}"' EXIT
+          # Cleared first, so an inherited ERRF names no file to delete.
+          ERRF=
+          trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
@@ -158,7 +161,7 @@ jobs:
           if [ "$(jq -n '"A" | test("a"; "i")' 2>/dev/null)" != true ]; then
             echo "::error::runner jq has no regex support (test)."; exit 1
           fi
-          # -H @file (used below) needs curl 7.55+.
+          # -H @- (used below) needs curl 7.55+.
           cv="$(curl --version | head -n1 | cut -d' ' -f2)"
           IFS=. read -r cmaj cmin _ <<< "${cv}"
           if ! [[ "${cmaj}" =~ ^[0-9]+$ && "${cmin}" =~ ^[0-9]+$ ]]; then
@@ -212,8 +215,8 @@ jobs:
           # no pipe or token and ends by itself within 10 s.
           nap() { sleep 10 >/dev/null 2>&1 & wait "$!"; }
           # Start no call after 8 minutes (checked before every call), so
-          # slow answers end in a warning before timeout-minutes (each curl
-          # call takes at most 10 s).
+          # slow Cortex answers end in a warning before timeout-minutes
+          # (each curl call takes at most 10 s; a gh call has no limit).
           out_of_time() { [ "${SECONDS}" -ge 480 ]; }
           # 429, 5xx, a 403 whose message is GitHub's rate limit, or no
           # HTTP status at all (a network error, or a GraphQL-level error
@@ -312,27 +315,32 @@ jobs:
           # merge commit (e.g. a fast-forward) closes nothing.
           # Logins, not IDs, are compared. All but the sender's are read
           # now; a rename since the push makes them differ (fails closed).
+          # Each must also be a User (an App's GraphQL login has no [bot]
+          # suffix), and a revision deleted from the edit history must
+          # have been deleted by the sender.
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
-              author { login } mergedBy { login } body
+              author { __typename login } mergedBy { __typename login } body
               userContentEdits(first: 100) {
-                totalCount nodes { editor { login } } } } } }'
+                totalCount nodes { editor { __typename login }
+                  deletedBy { __typename login } } } } } }'
           # shellcheck disable=SC2016
-          OWNED='(.data.repository.pullRequest)?
+          OWNED='def me: type == "object" and .__typename == "User"
+              and ((.login // "" | tostring | ascii_downcase)
+                == ($sender | ascii_downcase));
+            (.data.repository.pullRequest)?
             | select(type == "object")
-            | select(((.author.login)? // "" | tostring | ascii_downcase)
-              == ($sender | ascii_downcase))
-            | select(((.mergedBy.login)? // "" | tostring | ascii_downcase)
-              == ($sender | ascii_downcase))
+            | select(.author | me)
+            | select(.mergedBy | me)
             | select((.userContentEdits | type) == "object")
             | select((.userContentEdits.totalCount // 101) <= 100)
             | select((.userContentEdits.nodes | type) == "array"
               and (.userContentEdits.nodes | length)
                 == .userContentEdits.totalCount)
             | select(all(.userContentEdits.nodes[]?;
-              ((.editor.login)? // "" | tostring | ascii_downcase)
-                == ($sender | ascii_downcase)))
+              ((.editor)? // null | me)
+                and ((.deletedBy)? // null | . == null or me)))
             | (.body // "" | tostring)
             | select(explode | all(. != 0))
             | "b:" + @base64'
@@ -403,15 +411,10 @@ jobs:
             echo "::warning::out of time before the Cortex calls — skipping."
             exit 0
           fi
-          # Header from a 0600 file so the token stays out of the process
-          # list. -q (first) makes curl ignore any ~/.curlrc on the runner.
-          # If the job is killed, the file stays on the runner until it
-          # empties RUNNER_TEMP (after the job, or before its next one).
-          HDR="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-hdr.XXXXXX")" \
-            || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          printf 'Authorization: Bearer %s\n' "${_cortex_tok}" > "${HDR}" \
-            || { echo "::warning::cannot write header file — skipping."; exit 0; }
-          AUTH=(-H "@${HDR}")
+          # The header goes to curl on stdin (-H @-), so the token is in
+          # no process list and no file. -q (first) makes curl ignore any
+          # ~/.curlrc on the runner.
+          cx() { curl -q -H @- "$@" <<< "Authorization: Bearer ${_cortex_tok}"; }
           # Each status list is fetched once (again after a 409), trimmed
           # to id and version. The API has no get-by-id or paging, so each
           # list holds at most its first 200 issues.
@@ -424,7 +427,7 @@ jobs:
               # A list not fetched in time is missing; LATE and LFAIL say
               # why in the warning.
               if out_of_time; then LATE=1; continue; fi
-              resp="$(curl -q -s -f --proto =https --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?status=${q}&limit=200" 2>/dev/null)" \
+              resp="$(cx -s -f --proto =https --max-time 10 "${CORTEX_API_BASE}/issues?status=${q}&limit=200" 2>/dev/null)" \
                 || { LFAIL=1; continue; }
               # Only a JSON body with an issues array counts as a lookup.
               resp="$(printf '%s' "$resp" | jq -ce '.issues | arrays | [.[] | objects | {id, version}]' 2>/dev/null)" \
@@ -479,7 +482,7 @@ jobs:
                 --arg rid "${GITHUB_RUN_ID:-0}.${GITHUB_RUN_ATTEMPT:-1}" \
                 '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
-              code="$(curl -q -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
+              code="$(cx -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH \
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
               case "$code" in
                 2[0-9][0-9]) echo "  ${id}: closed (status=done)."; break ;;
