@@ -158,9 +158,9 @@ jobs:
           # An inherited FUNCNEST would break the nested helpers, and a
           # TMOUT would make read time out and drop body lines. BASH_ENV
           # and ENV are dropped so no child shell runs them either (the
-          # allowlist below also covers that), and BASH_COMPAT so this
-          # bash keeps its own behaviour.
-          unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
+          # allowlist below also covers that), BASH_COMPAT so this bash
+          # keeps its own behaviour, and EXECIGNORE so it hides no tool.
+          unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT EXECIGNORE
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
             "${SENDER_TYPE:=}" "${SENDER_LOGIN:=}" "${DEFAULT_BRANCH:=}" \
@@ -236,16 +236,16 @@ jobs:
           # Cleared first, so an inherited ISO or ERRF names nothing to
           # delete. For ISO this is defence in depth: the mktemp -d line
           # overwrites it before any exit, so without this reset only a
-          # signal between the EXIT trap and that assignment could delete
-          # an inherited path. The traps are set before the directory is
-          # made. Tool stderr below goes to /dev/null: it is not ours to
-          # echo into the log.
+          # signal during the two trap lines between the EXIT trap and
+          # that line could delete an inherited path. The traps are set
+          # before the directory is made.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
           # trap; being trapped, they also end a retry wait at once.
           trap 'exit 130' INT
           trap 'exit 143' TERM
+          # mktemp's stderr is not ours to echo; the warning says enough.
           ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           jq() { HOME="${ISO}" command jq "$@"; }
