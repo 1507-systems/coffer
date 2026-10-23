@@ -308,8 +308,8 @@ jobs:
               and .merge_commit_sha == $sha
               and ((.base.ref)? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
-          # an object), a [bot] or non-string login, or a bot's (or a
-          # missing or non-string) branch name.
+          # an object), a [bot], missing or non-string login, or a missing,
+          # non-string or bot's (renovate/, dependabot/) branch name.
           # shellcheck disable=SC2016
           BOT='(((.user.type)? // null) != "User")
             or ((.user.login)? // null | type != "string" or endswith("[bot]"))
