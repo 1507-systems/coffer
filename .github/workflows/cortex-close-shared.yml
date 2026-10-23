@@ -46,8 +46,9 @@ name: Close Cortex Issues (shared)
 # closes again any referenced issue reopened since the merge, and also
 # closes the issues of references the sender has since added at the
 # top; a re-run by anyone else closes nothing. A later non-forced push
-# by the sender whose head is that merge commit (e.g. after a reset)
-# acts the same as a re-run by the sender.
+# by the sender whose head is that merge commit (e.g. re-pushing it
+# after the branch was reset back past it) acts the same as a re-run by
+# the sender.
 # References must open the body: blank lines aside, the first lines are
 # read while each is exactly a keyword (close, closes, closed, fix,
 # fixes, fixed, resolve, resolves, resolved, retire, retires, retired;
@@ -304,12 +305,14 @@ jobs:
           # must be https://, a host (starting with a letter or digit), an
           # optional :port from 1 to 65535 and an optional plain path.
           BASE_RE='^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$'
+          # BASH_REMATCH[1] is the :port group (the host has no group).
           if ! [[ "${CORTEX_API_BASE}" =~ ${BASE_RE} ]] \
-            || { _port="${BASH_REMATCH[1]#:}"; [ -n "${_port}" ] \
-              && (( 10#${_port} < 1 || 10#${_port} > 65535 )); }; then
+            || { port="${BASH_REMATCH[1]#:}"; [ -n "${port}" ] \
+              && (( 10#${port} < 1 || 10#${port} > 65535 )); }; then
             echo "::warning::the Cortex base URL is not https://host[:port 1-65535][/path] — skipping."
             exit 0
           fi
+          unset port
           case "${_cortex_tok}" in
             *$'\n'*|*$'\r'*)
               echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
