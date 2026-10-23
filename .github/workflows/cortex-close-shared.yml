@@ -18,8 +18,10 @@ name: Close Cortex Issues (shared)
 # with regex support, gh, a base64 that takes -d, an env that takes -0,
 # grep, sort, head, cut, mktemp, rm and sleep. Each must exist, and
 # bash, curl, jq, base64 and env are also checked by version or
-# feature; the job fails otherwise, except that a mktemp that runs but
-# fails ends the run with a warning first, before the later checks.
+# feature; the job fails otherwise, except that a failing mktemp -d
+# (the private directory) ends the run with a warning before the
+# base64, jq and curl checks; a failing one for gh's stderr file warns
+# later.
 # Tested on bash 5.2, jq 1.7 and curl 8.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
@@ -137,7 +139,8 @@ jobs:
           # BASHOPTS (bash's debugger start-up file) would still act, so
           # -p must stay.
           # +a: an inherited allexport would re-export the token copies.
-          # +xv: an inherited SHELLOPTS would trace the token to the log;
+          # +x: an inherited xtrace would trace the token to the log (+v:
+          # verbose would echo the script's text, though no values);
           # the first set +x has stdout and stderr on /dev/null, so its
           # own trace goes there, whatever PS4 holds, unless
           # BASH_XTRACEFD names an fd other than 1 or 2 that is open for
@@ -241,11 +244,10 @@ jobs:
           # loads ~/.jq into every program and gh reads ~/.config/gh, so
           # both get an empty private directory instead (curl gets -q).
           # Cleared first, so an inherited ISO or ERRF names nothing to
-          # delete. For ISO this is defence in depth: without this reset,
-          # an inherited path could be deleted by INT or TERM at any time
-          # from the EXIT trap until mktemp -d starts, or by an untrapped
-          # fatal signal (e.g. HUP) until the assignment completes. The
-          # traps are set before the directory is made.
+          # delete. Each is set only once mktemp's answer has passed the
+          # checks below, so a signal while mktemp runs deletes nothing (a
+          # real mktemp may then leave an empty 0700 directory or file).
+          # The traps are set before the directory is made.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
@@ -253,14 +255,16 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
           # mktemp's stderr is not ours to echo; the warning says enough.
-          ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
+          mk="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # It must name a directory (not a link) from our template, or
-          # the trap must not touch it. A mktemp that lies beyond that is
-          # runner code, a known limit.
-          [ -n "${ISO}" ] && [[ "${ISO}" == "${RUNNER_TEMP:-/tmp}/cortex-iso."* ]] \
-            && [ -d "${ISO}" ] && [ ! -L "${ISO}" ] \
-            || { ISO=; echo "::warning::mktemp failed — skipping."; exit 0; }
+          # It must be our template plus a 6-character suffix and name a
+          # directory (not a link), or the trap must not touch it. A
+          # mktemp that lies beyond that is runner code, a known limit.
+          mkp="${RUNNER_TEMP:-/tmp}/cortex-iso."
+          [[ "${mk}" == "${mkp}"* && "${mk#"${mkp}"}" =~ ^[A-Za-z0-9]{6}$ ]] \
+            && [ -d "${mk}" ] && [ ! -L "${mk}" ] \
+            || { echo "::warning::mktemp failed — skipping."; exit 0; }
+          ISO="${mk}"
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
@@ -374,12 +378,14 @@ jobs:
             echo "::warning::push context (repo, commit or default branch) unreadable — skipping."
             exit 0
           fi
-          ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX" 2>/dev/null)" \
+          mk="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # A file (not a link) from our template, as for ISO above.
-          [ -n "${ERRF}" ] && [[ "${ERRF}" == "${RUNNER_TEMP:-/tmp}/cortex-err."* ]] \
-            && [ -f "${ERRF}" ] && [ ! -L "${ERRF}" ] \
-            || { ERRF=; echo "::warning::mktemp failed — skipping."; exit 0; }
+          # A file (not a link), checked as for ISO above.
+          mkp="${RUNNER_TEMP:-/tmp}/cortex-err."
+          [[ "${mk}" == "${mkp}"* && "${mk#"${mkp}"}" =~ ^[A-Za-z0-9]{6}$ ]] \
+            && [ -f "${mk}" ] && [ ! -L "${mk}" ] \
+            || { echo "::warning::mktemp failed — skipping."; exit 0; }
+          ERRF="${mk}"; unset mk mkp
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
           # after a type check, so a wrong shape fails closed. MERGED and
