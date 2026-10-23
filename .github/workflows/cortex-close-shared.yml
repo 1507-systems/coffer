@@ -85,8 +85,8 @@ name: Close Cortex Issues (shared)
 # job; if the caller's token lacks either, the run fails at startup.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither, it makes no GitHub
-# or Cortex call (the runner checks still run first and can fail the
-# job).
+# or Cortex call (the runner checks still run first: they can fail the
+# job, or a failing mktemp -d ends it with a warning).
 on:
   workflow_call:
     inputs:
@@ -95,7 +95,7 @@ on:
         required: false
         type: string
       runs_on:
-        description: Runner label; honoured for private callers only (public callers use ubuntu-latest)
+        description: Runner label; honoured for private callers only (public callers, and an empty value such as an unset RUNNER_LABEL, use ubuntu-latest)
         required: false
         type: string
         default: ubuntu-latest
@@ -173,11 +173,12 @@ jobs:
           SECONDS=0
           # An inherited FUNCNEST would break the nested helpers, and a
           # short TMOUT can make read time out on a pipe, ending the env -0
-          # read early: that fails the job, or, if LC_ALL=C and no odd name
-          # were read yet, passes the check without seeing the rest.
-          # BASH_ENV and ENV are dropped so no child
-          # shell runs them either (the allowlist below also covers that),
-          # and BASH_COMPAT so this bash keeps its own behaviour. (An
+          # read early: that fails the job, or, if LC_ALL=C had already
+          # been read and no odd name had, passes the check without seeing
+          # the rest. BASH_ENV and ENV are dropped so no child shell runs
+          # them either (the allowlist below also covers that), and
+          # BASH_COMPAT because at 5.0 or lower bash 5.1+ writes
+          # here-strings, the token header too, to a temp file. (An
           # inherited EXECIGNORE does nothing: bash reads it only when the
           # shell assigns it.)
           unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
