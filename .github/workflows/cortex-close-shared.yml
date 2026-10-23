@@ -8,7 +8,8 @@ name: Close Cortex Issues (shared)
 # Runs only for a push to the caller's default branch; any other event
 # or ref skips the job. Runs only on github.com (github.api_url must be
 # https://api.github.com, since gh is given no GH_HOST); elsewhere it
-# prints a notice and makes no GitHub call.
+# prints a notice and makes no GitHub call (the runner checks still
+# run first and can fail the job).
 # Runner: private callers pass `runs_on` (e.g. their RUNNER_LABEL
 # variable). A public caller's `runs_on` is ignored and the job runs on
 # a runner labelled ubuntu-latest: GitHub-hosted (free for public
@@ -169,12 +170,13 @@ jobs:
           # Time from here, whatever SECONDS the environment held.
           SECONDS=0
           # An inherited FUNCNEST would break the nested helpers, and a
-          # TMOUT would make read time out on a pipe (the env -0 check
-          # would then fail the job). BASH_ENV and ENV are dropped so no
-          # child shell runs them either (the allowlist below also covers
-          # that), and BASH_COMPAT so this
-          # bash keeps its own behaviour. (An inherited EXECIGNORE does
-          # nothing: bash reads it only when the shell assigns it.)
+          # short TMOUT can make read time out on a pipe, ending the env -0
+          # read early: that fails the job, or passes the check if LC_ALL=C
+          # was already read. BASH_ENV and ENV are dropped so no child
+          # shell runs them either (the allowlist below also covers that),
+          # and BASH_COMPAT so this bash keeps its own behaviour. (An
+          # inherited EXECIGNORE does nothing: bash reads it only when the
+          # shell assigns it.)
           unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
