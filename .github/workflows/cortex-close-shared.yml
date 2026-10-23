@@ -3,23 +3,31 @@ name: Close Cortex Issues (shared)
 # any 1507 repo regardless of visibility/org. Holds NO secrets — the caller
 # passes CORTEX_WRITE_TOKEN at runtime, by name under `secrets:` (declared
 # below, so `secrets: inherit` is not needed); it never touches this repo.
-# Callers MUST pin to a commit SHA (supply-chain safety), and only a SHA
-# that includes the secrets declaration below. Epic 4a283f45.
+# Callers MUST pin to a commit SHA (supply-chain safety), at or after
+# coffer#40 (the trust model below). Epic 4a283f45.
+# Runs only for a push to the caller's default branch; any other event
+# or ref skips the job.
 # Runner: private callers pass `runs_on` (e.g. their RUNNER_LABEL
 # variable). A public caller's `runs_on` is ignored and the job runs on
 # GitHub-hosted ubuntu-latest (free for public repos); runner-group repo
 # access remains the real gate for self-hosted runners. The runner needs
 # bash 4+ first on PATH, curl 7.55+, git, gh and jq.
-# Trust: put closing references in the PR body. For a PR merged as the
-# pushed commit, only its body is scanned, and only when a person opened
-# it from a branch in the caller's repo (write access); bot PRs (their
-# bodies quote upstream release notes) and fork PRs are skipped. A direct
-# push by a person is scanned by its commit message: whoever pushes
-# someone else's commits vouches for them. A GitHub-made commit with no
-# PR found yet is retried, then skipped. Close skipped issues by hand.
-# Callers MUST grant the job `contents: read` and `pull-requests: read`
-# (set explicitly on the job); if either is missing GitHub refuses to
-# start the run.
+# Trust: put closing references in the PR body, on a line of their own
+# ("Closes cortex:issue/<uuid>"; quoted, fenced and HTML-comment lines
+# are ignored). For a PR merged as the pushed commit, only its body is
+# scanned, and only when a person opened it from a branch in the
+# caller's repo (write access). Bot PRs (their bodies quote upstream
+# release notes; a [bot] login or a renovate/ or dependabot/ branch
+# counts) and merged fork PRs are skipped. With no merged PR the lookup
+# is retried (GitHub links PRs to commits a little after the push); then
+# a direct push by a person is scanned by its head commit's message, so
+# whoever pushes someone else's commits vouches for them. Pushes by bots
+# and GitHub-made commits with no PR are skipped. Close skipped issues
+# by hand.
+# Known limit: the token can close any issue in the Cortex instance;
+# nothing ties an issue to the calling repo.
+# Callers MUST set `contents: read` and `pull-requests: read` on the
+# job; if the caller's token lacks either, the run fails at startup.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither the job is a no-op.
 on:
@@ -46,13 +54,16 @@ permissions:
 jobs:
   close-cortex-issue:
     name: Close referenced Cortex issues
+    if: >-
+      github.event_name == 'push'
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ${{ github.event.repository.private && inputs.runs_on || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - name: Checkout (need merge commit message)
+      - name: Checkout (commit message and committer)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          fetch-depth: 2
+          fetch-depth: 1
           persist-credentials: false
       - name: Close referenced Cortex issues
         env:
@@ -61,9 +72,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.sha }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
         run: |
           # No -e: every failure below is handled; the job is non-blocking.
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
+          # (BASH_ENV itself runs first, with the token exported: that is
+          # the runner's and earlier steps' trust, not this script's.)
           set +ae -uo pipefail
           # Keep tokens out of child processes' environments; declare +x
           # drops an export the runner may already have on these names.
@@ -99,16 +113,23 @@ jobs:
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
             | select(.merged_at != null and .merge_commit_sha == $sha)]'
+          # Not a person: a non-User type (fails closed if `user` is not
+          # an object), a [bot] login, or a bot's branch name.
+          # shellcheck disable=SC2016
+          BOT='((.user.type? // null) != "User")
+            or ((.user.login? // "" | tostring) | endswith("[bot]"))
+            or ((.head.ref? // "" | tostring)
+              | test("^(renovate|dependabot)/"))'
           # shellcheck disable=SC2016
           CLASSIFY='if type != "array" then "bad"
             elif any(.[] | objects; (.head.repo.full_name? // ""
               | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
             elif ('"${MERGED}"' | length) == 0 then "direct"
-            elif any('"${MERGED}"'[]; .user.type? != "User") then "bot"
+            elif any('"${MERGED}"'[]; '"${BOT}"') then "bot"
             else "branch" end'
           COMMITTER="$(git log -1 --format=%ce "${HEAD_SHA}" 2>/dev/null || true)"
-          # GitHub may not have linked a just-merged PR yet: for a commit
-          # GitHub made (web-flow), retry before treating it as unknown.
+          # GitHub may not have linked a just-merged PR (or a fork PR
+          # pushed by hand) yet: retry before trusting "no PR".
           for attempt in 1 2 3 4; do
             # Fail closed: if the commit's PRs are unknown, scan nothing.
             if ! PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls?per_page=100" 2>"${ERRF}")"; then
@@ -119,8 +140,7 @@ jobs:
             fi
             KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" \
               "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)"
-            if [ "${KIND}" != direct ] || [ "${COMMITTER}" != noreply@github.com ] \
-              || [ "${attempt}" -eq 4 ]; then
+            if [ "${KIND}" != direct ] || [ "${attempt}" -eq 4 ]; then
               break
             fi
             sleep 10
@@ -129,6 +149,11 @@ jobs:
             direct)
               if [ "${COMMITTER}" = noreply@github.com ]; then
                 echo "::warning::no PR found for a GitHub-made commit — skipping."
+                exit 0
+              fi
+              if [ "${SENDER_TYPE:-}" != User ] \
+                || [[ "${COMMITTER}" == *'[bot]@users.noreply.github.com' ]]; then
+                echo "::notice::direct push not by a person; not trusted to close issues."
                 exit 0
               fi
               PR_BODY="" ;;
@@ -141,7 +166,7 @@ jobs:
               echo "::notice::commit is in a fork PR; not trusted to close issues."
               exit 0 ;;
             bot)
-              echo "::notice::merged PR was opened by a bot; not trusted to close issues."
+              echo "::notice::merged PR was not opened by a person; not trusted to close issues."
               exit 0 ;;
             *)
               echo "::warning::PR lookup unreadable — skipping."
@@ -149,8 +174,17 @@ jobs:
           esac
           unset PR_JSON
           SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
-          mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" \
-            | grep -oiE '(^|[^[:alnum:]])(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:space:]]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+          # A reference counts only at the start of a line (after an
+          # optional list marker), outside quotes, fences and comments.
+          # shellcheck disable=SC2016
+          STRIP='{ sub(/\r$/, "") }
+            c { if (index($0, "-->")) c = 0; next }
+            /^[[:space:]]*(```|~~~)/ { f = !f; next }
+            f || /^[[:space:]]*>/ { next }
+            /<!--/ { if (!index($0, "-->")) c = 1; next }
+            { print }'
+          mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" | awk "${STRIP}" \
+            | grep -oiE '^[[:space:]]*([-*+][[:space:]]+)?(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:space:]]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
             | sed -E 's#.*cortex:issue/##' | tr '[:upper:]' '[:lower:]' | sort -u)
           if [ "${#IDS[@]}" -eq 0 ]; then
             echo "No cortex:issue/<uuid> closing references. Nothing to close."
@@ -208,7 +242,7 @@ jobs:
             for attempt in 1 2; do
               payload="$(jq -nc --argjson v "$version" --arg id "$id" --arg a "$attempt" \
                 --arg rid "${GITHUB_RUN_ID}" \
-                '{version:$v, patch:{status:"done", body:("COMPLETED via merge (gh run "+$rid+") — auto-closed by at-merge hook.")}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
+                '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
               code="$(curl -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
