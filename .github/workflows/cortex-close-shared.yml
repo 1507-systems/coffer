@@ -10,8 +10,9 @@ name: Close Cortex Issues (shared)
 # GitHub-hosted ubuntu-latest, free for public repos, so a public repo
 # never asks for a self-hosted label (runner-group repo access is the real
 # gate). The runner needs bash 4+ first on PATH, curl 7.55+, git, gh, jq.
-# Callers MUST grant the job `contents: read` and `pull-requests: read`;
-# without the latter GitHub refuses to start the run.
+# Callers MUST grant the job `contents: read` and `pull-requests: read`
+# (set explicitly on the job); if either is missing GitHub refuses to
+# start the run.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither the job is a no-op.
 on:
@@ -22,7 +23,7 @@ on:
         required: false
         type: string
       runs_on:
-        description: Runner label for the job (default ubuntu-latest)
+        description: Runner label; honoured for private callers only (public callers use ubuntu-latest)
         required: false
         type: string
         default: ubuntu-latest
@@ -79,10 +80,23 @@ jobs:
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
           COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
-          if ! PR_BODY="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[]?.body // empty' 2>/dev/null)"; then
-            echo "::warning::PR lookup failed; scanning the commit message only."
-            PR_BODY=""
+          # A PR body counts only for a PR merged as this commit whose author
+          # is a repo owner, member or collaborator.
+          PR_BODY=""
+          if PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" 2>&1)"; then
+            PR_BODY="$(jq -r --arg sha "${HEAD_SHA}" '.[]? | objects
+              | select(.merged_at != null and .merge_commit_sha == $sha)
+              | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+              | .body // empty' <<< "${PR_JSON}" 2>/dev/null)" || {
+              echo "::warning::PR lookup unreadable; scanning the commit message only."
+              PR_BODY=""
+            }
+          else
+            # Print only the status; gh's other output is not ours to echo.
+            st="$(grep -oE 'HTTP [0-9]{3}' <<< "${PR_JSON}" | head -n1)"
+            echo "::warning::PR lookup failed (${st:-no HTTP status}); scanning the commit message only."
           fi
+          unset PR_JSON
           SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
           mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" \
             | grep -oiE '(^|[^[:alnum:]])(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:space:]]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
