@@ -330,8 +330,8 @@ jobs:
           # too, since an empty repo or default branch would loosen the PR
           # checks below, and a repo or SHA of another shape would change
           # the REST path. An owner is letters, digits, hyphens and
-          # underscores, starting with a letter or digit; a repo name may
-          # not be . or ..
+          # underscores (Enterprise Managed User logins end in _shortcode),
+          # starting with a letter or digit; a repo name may not be . or ..
           if [ -z "${DEFAULT_BRANCH}" ] \
             || ! [[ "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9_.-]+$ ]] \
             || [ "${REPO#*/}" = . ] || [ "${REPO#*/}" = .. ] \
@@ -645,8 +645,11 @@ jobs:
                 --arg rid "${GITHUB_RUN_ID:-0}.${GITHUB_RUN_ATTEMPT:-1}" \
                 '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
-              # curl can exit non-zero after a 2xx (e.g. a timeout while
-              # reading the body), so the close may have applied.
+              # curl can exit non-zero with no answer (HTTP 000) or after a
+              # 2xx (e.g. a timeout while reading the body), so the close
+              # may have applied; a 403 or 409 answer is handled as such.
+              # Exits 6, 7, 35 and 60 with no answer mean nothing was sent
+              # (DNS, connect, TLS handshake, certificate).
               rc=0
               code="$(cx -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH \
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || rc=$?
@@ -669,7 +672,9 @@ jobs:
                   looked_up "$id" "$?" || break ;;
                 403) echo "::warning::${id}: HTTP 403 (forbidden) — skipping."; break ;;
                 *)
-                  if [ "${rc}" -ne 0 ]; then
+                  if [ "${code}" = 000 ] && [[ "${rc}" =~ ^(6|7|35|60)$ ]]; then
+                    echo "::warning::${id}: request not sent (curl exit ${rc}) — skipping."
+                  elif [ "${rc}" -ne 0 ]; then
                     echo "::warning::${id}: no complete answer (HTTP ${code}, curl exit ${rc}) — may have applied; check it by hand."
                   else
                     echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."
