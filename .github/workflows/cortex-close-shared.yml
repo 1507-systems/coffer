@@ -10,10 +10,13 @@ name: Close Cortex Issues (shared)
 # GitHub-hosted ubuntu-latest (free for public repos); runner-group repo
 # access remains the real gate for self-hosted runners. The runner needs
 # bash 4+ first on PATH, curl 7.55+, git, gh and jq.
-# Trust: only a direct push, or a PR merged from a branch in the caller's
-# own repo (both need write access), can close issues. A commit in any
-# fork PR, merged or not (e.g. fast-forwarded by hand), is skipped: its
-# author controls the commit message and PR body. Close those by hand.
+# Trust: put closing references in the PR body. For a PR merged as the
+# pushed commit, only its body is scanned, and only when a person opened
+# it from a branch in the caller's repo (write access); bot PRs (their
+# bodies quote upstream release notes) and fork PRs are skipped. A direct
+# push by a person is scanned by its commit message: whoever pushes
+# someone else's commits vouches for them. A GitHub-made commit with no
+# PR found yet is retried, then skipped. Close skipped issues by hand.
 # Callers MUST grant the job `contents: read` and `pull-requests: read`
 # (set explicitly on the job); if either is missing GitHub refuses to
 # start the run.
@@ -85,34 +88,60 @@ jobs:
           fi
           COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
           trap 'rm -f "${ERRF:-}" "${HDR:-}"' EXIT
+          # Route signals through exit so the EXIT trap removes the files.
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # Fail closed: if the commit's PRs are unknown, scan nothing.
-          if ! PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" 2>"${ERRF}")"; then
-            # Print only the status; gh's other output is not ours to echo.
-            st="$(grep -oE 'HTTP [0-9]{3}' "${ERRF}" | head -n1)"
-            echo "::warning::PR lookup failed (${st:-no HTTP status}) — skipping."
-            exit 0
-          fi
-          # PRs merged as this commit (with a merge queue, the last one).
-          # $sha is a jq variable, not a shell one.
+          # The PR merged as this commit. With a merge queue only the last
+          # PR in the batch matches; earlier ones are not scanned.
+          # $sha and $repo are jq variables, not shell ones.
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
             | select(.merged_at != null and .merge_commit_sha == $sha)]'
-          KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" \
-            'if type != "array" then "bad"
-              elif any(.[] | objects; (.head.repo.full_name? // ""
-                | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
-              elif ('"${MERGED}"' | length) == 0 then "direct"
-              else "branch" end' <<< "${PR_JSON}" 2>/dev/null)"
+          # shellcheck disable=SC2016
+          CLASSIFY='if type != "array" then "bad"
+            elif any(.[] | objects; (.head.repo.full_name? // ""
+              | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
+            elif ('"${MERGED}"' | length) == 0 then "direct"
+            elif any('"${MERGED}"'[]; .user.type? != "User") then "bot"
+            else "branch" end'
+          COMMITTER="$(git log -1 --format=%ce "${HEAD_SHA}" 2>/dev/null || true)"
+          # GitHub may not have linked a just-merged PR yet: for a commit
+          # GitHub made (web-flow), retry before treating it as unknown.
+          for attempt in 1 2 3 4; do
+            # Fail closed: if the commit's PRs are unknown, scan nothing.
+            if ! PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls?per_page=100" 2>"${ERRF}")"; then
+              # Print only the status; gh's other output is not ours to echo.
+              st="$(grep -oE 'HTTP [0-9]{3}' "${ERRF}" | head -n1)"
+              echo "::warning::PR lookup failed (${st:-no HTTP status}) — skipping."
+              exit 0
+            fi
+            KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" \
+              "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)"
+            if [ "${KIND}" != direct ] || [ "${COMMITTER}" != noreply@github.com ] \
+              || [ "${attempt}" -eq 4 ]; then
+              break
+            fi
+            sleep 10
+          done
           case "${KIND}" in
-            direct) PR_BODY="" ;;
+            direct)
+              if [ "${COMMITTER}" = noreply@github.com ]; then
+                echo "::warning::no PR found for a GitHub-made commit — skipping."
+                exit 0
+              fi
+              PR_BODY="" ;;
             branch)
+              COMMIT_MSG=""
               PR_BODY="$(jq -r --arg sha "${HEAD_SHA}" \
                 "${MERGED}"' | .[] | .body // empty' <<< "${PR_JSON}")" \
                 || PR_BODY="" ;;
             fork)
               echo "::notice::commit is in a fork PR; not trusted to close issues."
+              exit 0 ;;
+            bot)
+              echo "::notice::merged PR was opened by a bot; not trusted to close issues."
               exit 0 ;;
             *)
               echo "::warning::PR lookup unreadable — skipping."
