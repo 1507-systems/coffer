@@ -78,8 +78,9 @@ name: Close Cortex Issues (shared)
 # Callers MUST set `contents: read` and `pull-requests: read` on the
 # job; if the caller's token lacks either, the run fails at startup.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
-# CORTEX_API_BASE Actions variable. With neither the job is a no-op,
-# checked before any GitHub lookup.
+# CORTEX_API_BASE Actions variable. With neither, it makes no GitHub
+# or Cortex call (the runner checks still run first and can fail the
+# job).
 on:
   workflow_call:
     inputs:
@@ -260,8 +261,9 @@ jobs:
           mk="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           # It must be our template's fixed part (.../cortex-iso.) plus
-          # six letters or digits and name a directory (not a link), or
-          # the trap must not touch it. A mktemp that lies beyond that is
+          # six letters or digits and name a directory, not a link;
+          # otherwise the run ends with the warning before ISO is set, so
+          # the trap never touches it. A mktemp that lies beyond that is
           # runner code, a known limit.
           mkp="${RUNNER_TEMP:-/tmp}/cortex-iso."
           [[ "${mk}" == "${mkp}"* && "${mk#"${mkp}"}" =~ ^[A-Za-z0-9]{6}$ ]] \
@@ -359,7 +361,8 @@ jobs:
           nap() { sleep 10 >/dev/null 2>&1 & wait "$!"; }
           # Start no call after 8 minutes (checked before every call), so
           # slow Cortex answers end in a warning before timeout-minutes
-          # (each curl call takes at most 10 s; a gh call has no limit).
+          # (each Cortex curl call takes at most 10 s; a gh call has no
+          # limit).
           out_of_time() { [ "${SECONDS}" -ge 480 ]; }
           # 429, 5xx, a 403 whose message is GitHub's rate limit, or no
           # HTTP status at all (a network error, or a GraphQL-level error
@@ -389,6 +392,7 @@ jobs:
             && [ -f "${mk}" ] && [ ! -L "${mk}" ] \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           ERRF="${mk}"
+          unset mk mkp
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
           # after a type check, so a wrong shape fails closed. MERGED and
