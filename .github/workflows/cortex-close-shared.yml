@@ -7,9 +7,13 @@ name: Close Cortex Issues (shared)
 # that includes the secrets declaration below. Epic 4a283f45.
 # Runner: private callers pass `runs_on` (e.g. their RUNNER_LABEL
 # variable). A public caller's `runs_on` is ignored and the job runs on
-# GitHub-hosted ubuntu-latest, free for public repos, so a public repo
-# never asks for a self-hosted label (runner-group repo access is the real
-# gate). The runner needs bash 4+ first on PATH, curl 7.55+, git, gh, jq.
+# GitHub-hosted ubuntu-latest (free for public repos); runner-group repo
+# access remains the real gate for self-hosted runners. The runner needs
+# bash 4+ first on PATH, curl 7.55+, git, gh and jq.
+# Trust: only a direct push, or a PR merged from a branch in the caller's
+# own repo (both need write access), can close issues. A commit in any
+# fork PR, merged or not (e.g. fast-forwarded by hand), is skipped: its
+# author controls the commit message and PR body. Close those by hand.
 # Callers MUST grant the job `contents: read` and `pull-requests: read`
 # (set explicitly on the job); if either is missing GitHub refuses to
 # start the run.
@@ -80,22 +84,40 @@ jobs:
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
           COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
-          # A PR body counts only for a PR merged as this commit whose author
-          # is a repo owner, member or collaborator.
-          PR_BODY=""
-          if PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" 2>&1)"; then
-            PR_BODY="$(jq -r --arg sha "${HEAD_SHA}" '.[]? | objects
-              | select(.merged_at != null and .merge_commit_sha == $sha)
-              | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
-              | .body // empty' <<< "${PR_JSON}" 2>/dev/null)" || {
-              echo "::warning::PR lookup unreadable; scanning the commit message only."
-              PR_BODY=""
-            }
-          else
+          trap 'rm -f "${ERRF:-}" "${HDR:-}"' EXIT
+          ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
+            || { echo "::warning::mktemp failed — skipping."; exit 0; }
+          # Fail closed: if the commit's PRs are unknown, scan nothing.
+          if ! PR_JSON="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" 2>"${ERRF}")"; then
             # Print only the status; gh's other output is not ours to echo.
-            st="$(grep -oE 'HTTP [0-9]{3}' <<< "${PR_JSON}" | head -n1)"
-            echo "::warning::PR lookup failed (${st:-no HTTP status}); scanning the commit message only."
+            st="$(grep -oE 'HTTP [0-9]{3}' "${ERRF}" | head -n1)"
+            echo "::warning::PR lookup failed (${st:-no HTTP status}) — skipping."
+            exit 0
           fi
+          # PRs merged as this commit (with a merge queue, the last one).
+          # $sha is a jq variable, not a shell one.
+          # shellcheck disable=SC2016
+          MERGED='[.[] | objects
+            | select(.merged_at != null and .merge_commit_sha == $sha)]'
+          KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" \
+            'if type != "array" then "bad"
+              elif any(.[] | objects; (.head.repo.full_name? // ""
+                | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
+              elif ('"${MERGED}"' | length) == 0 then "direct"
+              else "branch" end' <<< "${PR_JSON}" 2>/dev/null)"
+          case "${KIND}" in
+            direct) PR_BODY="" ;;
+            branch)
+              PR_BODY="$(jq -r --arg sha "${HEAD_SHA}" \
+                "${MERGED}"' | .[] | .body // empty' <<< "${PR_JSON}")" \
+                || PR_BODY="" ;;
+            fork)
+              echo "::notice::commit is in a fork PR; not trusted to close issues."
+              exit 0 ;;
+            *)
+              echo "::warning::PR lookup unreadable — skipping."
+              exit 0 ;;
+          esac
           unset PR_JSON
           SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
           mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" \
@@ -128,7 +150,6 @@ jobs:
           # Header from a 0600 file so the token stays out of the process list.
           HDR="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-hdr.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          trap 'rm -f "${HDR}"' EXIT
           printf 'Authorization: Bearer %s\n' "${_cortex_tok}" > "${HDR}" \
             || { echo "::warning::cannot write header file — skipping."; exit 0; }
           AUTH=(-H "@${HDR}")
