@@ -36,19 +36,19 @@ name: Close Cortex Issues (shared)
 # after the push) or a call fails with 429, 5xx, a 403 rate limit or
 # no HTTP status (a network or GraphQL error). Close skipped issues by
 # hand. A re-run by the sender re-reads the body as it is now, so it
-# closes again any referenced issue reopened since the merge, and any
-# reference the sender has since added at the top; a re-run by anyone
-# else closes nothing.
+# closes again any referenced issue reopened since the merge, and also
+# closes the issues of references the sender has since added at the
+# top; a re-run by anyone else closes nothing.
 # References must open the body: blank lines aside, the first lines are
 # read while each is exactly a keyword (close, closes, closed, fix,
 # fixes, fixed, resolve, resolves, resolved, retire, retires, retired;
 # an optional colon), blanks, then cortex:issue/<uuid>, and only blanks
-# after it, in any case. The line may start with "- ", "* " or "+ ",
-# e.g. "- Closes cortex:issue/<uuid>". Reading stops at the first other
-# line; any other reference closes nothing (a notice says so). Only
-# references and blank lines come before a reference, so no Markdown
-# can hide it. Matching is in the C locale: blanks are space and tab
-# only. A body containing a NUL is not trusted.
+# after it, matched case-insensitively. The line may start with "- ",
+# "* " or "+ ", e.g. "- Closes cortex:issue/<uuid>". Reading stops at
+# the first other line; any other reference closes nothing (a notice
+# says so). Only references and blank lines come before a reference,
+# so no Markdown can hide it. Matching is in the C locale: blanks are
+# space and tab only. A body containing a NUL is not trusted.
 # Known limit: CORTEX_WRITE_TOKEN is a general write-scope token. Anyone
 # trusted above, in any caller repo, can close any issue in the Cortex
 # instance (issue UUIDs appear in public repos); anyone who can run a
@@ -255,7 +255,7 @@ jobs:
             elif ('"${OURS}"' | length) == 0 then "other"
             else "ours" end'
           for attempt in 1 2 3 4; do
-            if [ "${attempt}" -gt 1 ] && out_of_time; then
+            if out_of_time; then
               echo "::warning::out of time before the PR lookup finished — skipping."
               exit 0
             fi
@@ -416,18 +416,19 @@ jobs:
           # to id and version. The API has no get-by-id or paging, so each
           # list holds at most its first 200 issues.
           declare -A LISTS=()
-          LATE=0
+          LATE=0; LFAIL=0
           fetch_lists() {
             local q resp
-            LISTS=(); LATE=0
+            LISTS=(); LATE=0; LFAIL=0
             for q in todo in_progress backlog blocked "done"; do
-              # A list not fetched in time counts as a failed lookup.
+              # A list not fetched in time is missing; LATE and LFAIL say
+              # why in the warning.
               if out_of_time; then LATE=1; continue; fi
               resp="$(curl -q -s -f --proto =https --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?status=${q}&limit=200" 2>/dev/null)" \
-                || continue
+                || { LFAIL=1; continue; }
               # Only a JSON body with an issues array counts as a lookup.
               resp="$(printf '%s' "$resp" | jq -ce '.issues | arrays | [.[] | objects | {id, version}]' 2>/dev/null)" \
-                || continue
+                || { LFAIL=1; continue; }
               LISTS[$q]="$resp"
             done
           }
@@ -455,7 +456,9 @@ jobs:
               3) echo "  $1: already done." ;;
               4) echo "::warning::$1: found without a numeric version — skipping." ;;
               2)
-                if [ "${LATE}" -eq 1 ]; then
+                if [ "${LATE}" -eq 1 ] && [ "${LFAIL}" -eq 1 ]; then
+                  echo "::warning::$1: a status list lookup failed (token or API), and the run ran out of time before the rest were fetched — skipping."
+                elif [ "${LATE}" -eq 1 ]; then
                   echo "::warning::$1: out of time before its status lists were fetched — skipping."
                 else
                   echo "::warning::$1: lookup failed (token or API) — skipping."
