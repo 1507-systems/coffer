@@ -130,7 +130,7 @@ jobs:
           # No -e: lookup and API failures are handled and do not fail the
           # job. A runner without the tools below fails it, and so does a
           # gh call that hangs until timeout-minutes (gh has no timeout);
-          # curl calls have --max-time, and no call starts after 8 min.
+          # Cortex curl calls have --max-time; no call starts after 8 min.
           # bash -p (see shell:) reads no BASH_ENV and imports no
           # SHELLOPTS, BASHOPTS or functions, so nothing runs before this
           # line. The set, export -n and shopt lines below are a backstop
@@ -244,10 +244,11 @@ jobs:
           # loads ~/.jq into every program and gh reads ~/.config/gh, so
           # both get an empty private directory instead (curl gets -q).
           # Cleared first, so an inherited ISO or ERRF names nothing to
-          # delete. Each is set only once mktemp's answer has passed the
-          # checks below, so a signal before it is set deletes nothing
-          # (mktemp's empty 0700 directory or file may then be left in
-          # RUNNER_TEMP).
+          # delete. Each is assigned in a later statement than its mktemp,
+          # and only after its checks, so a signal before then leaves that
+          # answer alone (mktemp's empty 0700 directory or 0600 file may
+          # be left in RUNNER_TEMP or /tmp); one during the second mktemp
+          # still removes the private directory.
           # The traps are set before the directory is made.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
@@ -266,7 +267,7 @@ jobs:
           [[ "${mk}" == "${mkp}"* && "${mk#"${mkp}"}" =~ ^[A-Za-z0-9]{6}$ ]] \
             && [ -d "${mk}" ] && [ ! -L "${mk}" ] \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          ISO="${mk}"; unset mk mkp
+          ISO="${mk}"
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
@@ -387,7 +388,7 @@ jobs:
           [[ "${mk}" == "${mkp}"* && "${mk#"${mkp}"}" =~ ^[A-Za-z0-9]{6}$ ]] \
             && [ -f "${mk}" ] && [ ! -L "${mk}" ] \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          ERRF="${mk}"; unset mk mkp
+          ERRF="${mk}"
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
           # after a type check, so a wrong shape fails closed. MERGED and
