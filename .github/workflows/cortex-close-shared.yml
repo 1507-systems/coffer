@@ -11,8 +11,8 @@ name: Close Cortex Issues (shared)
 # variable). A public caller's `runs_on` is ignored and the job runs on
 # GitHub-hosted ubuntu-latest (free for public repos); runner-group repo
 # access remains the real gate for self-hosted runners. The runner needs
-# bash 4.4+ first on PATH, curl 7.55+, gh, jq, base64, grep, sort,
-# head, cut, mktemp, rm and sleep.
+# bash 4.4+, curl 7.55+, jq 1.5+, gh, base64, grep, sort, head, cut,
+# mktemp, rm and sleep.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
 # - the push's sender (type User) opened it and is GitHub's mergedBy;
@@ -20,20 +20,26 @@ name: Close Cortex Issues (shared)
 # - it is not a bot's (a non-User type, a [bot] login, or a renovate/
 #   or dependabot/ branch, any case);
 # - nobody but its opener ever edited the body.
-# Commit messages are never scanned, so direct pushes, force-pushes, bot
-# PRs, merge-queue merges and PRs merged by someone other than their
-# opener close nothing; if any PR listed for the commit is from a fork,
-# nothing is scanned. The lookup is retried while no merged PR is listed
+# If any PR listed for the commit is from a fork, nothing is scanned.
+# Commit messages are never scanned, so direct pushes and force-pushes
+# close nothing; the rules above rule out bot PRs, merge-queue merges
+# and PRs merged by anyone but their opener. A body GitHub pre-filled
+# (from commit messages or a template) counts as the opener's: they
+# submitted it. The lookup is retried while no merged PR is listed
 # (GitHub links a PR to its merge commit a little after the push) or
 # GitHub answers 429/5xx. Close skipped issues by hand.
+# Re-running an old run re-reads the body as it is now, so it closes
+# again any referenced issue reopened since the merge.
 # References must open the body: blank lines aside, the first lines are
 # read while each is exactly a keyword (close, closes, closed, fix,
 # fixes, fixed, resolve, resolves, resolved, retire, retires, retired;
 # any case; an optional colon), blanks, then cortex:issue/<uuid>, with
 # optionally "- ", "* " or "+ " before it and only blanks after it, e.g.
 # "Closes cortex:issue/<uuid>". Reading stops at the first other line;
-# later references close nothing (a notice says so). Only references
-# and blank lines come before a reference, so no Markdown can hide it.
+# any other reference closes nothing (a notice says so). Only
+# references and blank lines come before a reference, so no Markdown
+# can hide it. Matching is in the C locale: blanks are space and tab
+# only. A body containing a NUL is not trusted.
 # Known limit: CORTEX_WRITE_TOKEN is a general write-scope token. Anyone
 # trusted above, in any caller repo, can close any issue in the Cortex
 # instance (issue UUIDs appear in public repos); anyone who can run a
@@ -43,7 +49,8 @@ name: Close Cortex Issues (shared)
 # Callers MUST set `contents: read` and `pull-requests: read` on the
 # job; if the caller's token lacks either, the run fails at startup.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
-# CORTEX_API_BASE Actions variable. With neither the job is a no-op.
+# CORTEX_API_BASE Actions variable. With neither the job is a no-op,
+# checked before any GitHub lookup.
 on:
   workflow_call:
     inputs:
@@ -85,12 +92,16 @@ jobs:
           SENDER_LOGIN: ${{ github.event.sender.login }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           FORCED: ${{ github.event.forced }}
+        shell: bash
         run: |
-          # No -e: every failure below is handled; the job is non-blocking.
+          # No -e: lookup and API failures are handled and never fail the
+          # job; only a runner without the tools below fails it.
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
           # (BASH_ENV itself runs first, with the token exported: that is
           # the runner's trust, not this script's.)
           set +ae -uo pipefail
+          # ASCII classes and case folding, whatever the runner's locale.
+          export LC_ALL=C
           # Keep tokens out of child processes' environments; declare +x
           # drops an export the runner may already have on these names.
           declare +x _cortex_tok="${CORTEX_WRITE_TOKEN-}" _gh_tok="${GH_TOKEN-}"
@@ -104,6 +115,12 @@ jobs:
             command -v "$t" >/dev/null 2>&1 \
               || { echo "::error::runner is missing ${t}."; exit 1; }
           done
+          jv="$(jq --version 2>/dev/null)"
+          if ! [[ "${jv}" =~ ^jq-([0-9]+)\.([0-9]+) ]] \
+            || [ "${BASH_REMATCH[1]}" -lt 1 ] \
+            || { [ "${BASH_REMATCH[1]}" -eq 1 ] && [ "${BASH_REMATCH[2]}" -lt 5 ]; }; then
+            echo "::error::runner jq is '${jv}'; need 1.5+."; exit 1
+          fi
           # -H @file (used below) needs curl 7.55+.
           cv="$(curl --version | head -n1 | cut -d' ' -f2)"
           IFS=. read -r cmaj cmin _ <<< "${cv}"
@@ -121,10 +138,32 @@ jobs:
             echo "::notice::force-push; it closes nothing."
             exit 0
           fi
+          # The secret is required, so this only catches an empty value.
+          if [ -z "${_cortex_tok}" ]; then
+            echo "::notice::CORTEX_WRITE_TOKEN not set — skipping (no-op)."
+            exit 0
+          fi
+          if [ -z "${CORTEX_API_BASE}" ]; then
+            echo "::notice::no cortex_api_base input and no CORTEX_API_BASE variable — skipping (no-op)."
+            exit 0
+          fi
+          # The bearer token must never go out in cleartext.
+          case "${CORTEX_API_BASE}" in
+            https://*) ;;
+            *) echo "::warning::CORTEX_API_BASE is not https:// — skipping."; exit 0 ;;
+          esac
+          while [[ "${CORTEX_API_BASE}" == */ ]]; do CORTEX_API_BASE="${CORTEX_API_BASE%/}"; done
+          case "${_cortex_tok}" in
+            *$'\n'*|*$'\r'*)
+              echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
+              exit 0 ;;
+          esac
           trap 'rm -f "${ERRF:-}" "${HDR:-}"' EXIT
           # Route signals through exit so the EXIT trap removes the files.
           trap 'exit 130' INT
           trap 'exit 143' TERM
+          # Sleep in the background so a signal is handled at once.
+          nap() { sleep 10 & wait "$!"; }
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit (with a merge queue, only the
@@ -147,7 +186,8 @@ jobs:
             and ((.user.login? // "" | tostring | ascii_downcase)
               == ($sender | ascii_downcase)))]'
           # shellcheck disable=SC2016
-          CLASSIFY='if type != "array" then "bad"
+          # A full page (100) may be truncated, so it fails closed too.
+          CLASSIFY='if type != "array" or length >= 100 then "bad"
             elif any(.[] | objects; (.head.repo.full_name? // ""
               | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
             elif ('"${MERGED}"' | length) == 0 then "none"
@@ -159,7 +199,7 @@ jobs:
               # Print only the status; gh's other output is not ours to echo.
               st="$(grep -oE 'HTTP [0-9]{3}' "${ERRF}" | head -n1)"
               if [[ "${st}" =~ ^HTTP\ (429|5[0-9][0-9])$ ]] && [ "${attempt}" -lt 4 ]; then
-                sleep 10; continue
+                nap; continue
               fi
               echo "::warning::PR lookup failed (${st:-no HTTP status}) — skipping."
               exit 0
@@ -169,7 +209,7 @@ jobs:
             if [ "${KIND}" != none ] || [ "${attempt}" -eq 4 ]; then
               break
             fi
-            sleep 10
+            nap
           done
           case "${KIND}" in
             ours) ;;
@@ -188,14 +228,21 @@ jobs:
           esac
           mapfile -t NUMS < <(jq -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
             --arg sender "${SENDER_LOGIN}" "${OURS}"'[] | .number
-            | select(type == "number")' <<< "${PR_JSON}" 2>/dev/null)
+            | select(type == "number")' <<< "${PR_JSON}" 2>/dev/null | sort -un)
           unset PR_JSON
+          if [ "${#NUMS[@]}" -eq 0 ]; then
+            echo "::warning::PR lookup unreadable (no PR number) — skipping."
+            exit 0
+          fi
           # Body and edit history in one query, so the body scanned is
           # the one checked. Only a body nobody but the opener (also the
           # merger) ever edited counts: anyone else's edit, even after the
-          # merge and then a re-run, would put their text under his name.
+          # merge and then a re-run, would put their text under the
+          # opener's name.
           # mergedBy must be the sender too, so pushing someone else's
           # merge commit (e.g. a fast-forward) closes nothing.
+          # Logins, not IDs, are compared. All but the sender's are read
+          # now; a rename since the push makes them differ (fails closed).
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
@@ -216,8 +263,11 @@ jobs:
             | select(all(.userContentEdits.nodes[]?;
               (.editor.login? // "" | tostring | ascii_downcase)
                 == ($sender | ascii_downcase)))
-            | "b:" + (.body // "" | tostring | @base64)'
-          # One base64 line per trusted body, so each is filtered alone.
+            | (.body // "" | tostring)
+            | select(explode | all(. != 0))
+            | "b:" + @base64'
+          # One base64 line per trusted body, so each is read alone.
+          # A NUL fails closed: bash's read would drop it silently.
           BODIES=()
           for n in "${NUMS[@]}"; do
             for attempt in 1 2 3; do
@@ -227,7 +277,7 @@ jobs:
                 && break
               st="$(grep -oE 'HTTP [0-9]{3}' "${ERRF}" | head -n1)"
               if [[ "${st}" =~ ^HTTP\ (429|5[0-9][0-9])$ ]] && [ "${attempt}" -lt 3 ]; then
-                sleep 10; continue
+                nap; continue
               fi
               # Fail closed as a whole: no body is scanned.
               echo "::warning::PR #${n} lookup failed (${st:-no HTTP status}) — skipping all PRs."
@@ -235,13 +285,14 @@ jobs:
             done
             b="$(jq -r --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)"
             if [ "${b#b:}" = "${b}" ]; then
-              echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, or the answer is unreadable; not trusted."
+              echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, its body has a NUL, or the answer is unreadable; not trusted."
               continue
             fi
             BODIES+=("${b#b:}")
           done
           # Read each body's leading reference block (see the header).
           # nocasematch makes =~ ignore case, so [0-9a-f] also takes A-F.
+          # A cortex:issue/ on any other line sets LATE (closes nothing).
           UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
           REF="^([-*+] )?(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:blank:]]+cortex:issue/(${UUID})[[:blank:]]*\$"
           FOUND=(); LATE=0
@@ -262,7 +313,7 @@ jobs:
           done
           shopt -u nocasematch
           if [ "${LATE}" -eq 1 ]; then
-            echo "::notice::cortex:issue/ appears outside the opening reference lines; it closes nothing there."
+            echo "::notice::a cortex:issue/ is not on an exact reference line at the top of the body; it closes nothing."
           fi
           mapfile -t IDS < <(printf '%s\n' "${FOUND[@]+"${FOUND[@]}"}" | grep . | sort -u)
           if [ "${#IDS[@]}" -eq 0 ]; then
@@ -270,28 +321,9 @@ jobs:
             exit 0
           fi
           echo "Found ${#IDS[@]} cortex issue reference(s): ${IDS[*]}"
-          # The secret is required, so this only catches an empty value.
-          if [ -z "${_cortex_tok}" ]; then
-            echo "::notice::CORTEX_WRITE_TOKEN not set — skipping (no-op)."
-            exit 0
-          fi
-          if [ -z "${CORTEX_API_BASE}" ]; then
-            echo "::notice::no cortex_api_base input and no CORTEX_API_BASE variable — skipping (no-op)."
-            exit 0
-          fi
-          # The bearer token must never go out in cleartext.
-          case "${CORTEX_API_BASE}" in
-            https://*) ;;
-            *) echo "::warning::CORTEX_API_BASE is not https:// — skipping."; exit 0 ;;
-          esac
-          while [[ "${CORTEX_API_BASE}" == */ ]]; do CORTEX_API_BASE="${CORTEX_API_BASE%/}"; done
-          case "${_cortex_tok}" in
-            *$'\n'*|*$'\r'*)
-              echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
-              exit 0 ;;
-          esac
           # Header from a 0600 file so the token stays out of the process list.
-          # (If the job is killed, RUNNER_TEMP is emptied after the job.)
+          # If the job is killed, the file stays on the runner until it
+          # empties RUNNER_TEMP (after the job, or before its next one).
           HDR="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-hdr.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           printf 'Authorization: Bearer %s\n' "${_cortex_tok}" > "${HDR}" \
