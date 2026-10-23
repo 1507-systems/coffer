@@ -30,13 +30,15 @@ name: Close Cortex Issues (shared)
 #   renovate/ or dependabot/ branch, any case);
 # - nobody but its opener ever edited the body, and the PR's own
 #   latest editor and lastEditedAt are consistent with that;
-# - GitHub's REST entry and GraphQL answer are the same PR, merged as
-#   this commit into the default branch of this repo.
+# - GitHub's REST entry and GraphQL answer are the same PR (the same
+#   number), merged as this commit into the default branch of this repo.
 # If any PR listed for the commit is from a fork, nothing is scanned.
 # Commit messages are never scanned, so a push with no such PR behind
 # it closes nothing. Force-pushes close nothing (the push's forced
-# flag), nor do bot or App pushes: every merge-queue push is sent by
-# github-merge-queue[bot], so it stops at the sender check.
+# flag), nor do bot or App pushes. A merge-queue push is expected to be
+# sent by github-merge-queue[bot] (not checked on a real one), so it
+# stops at the sender check; if a person sent it, the opener and
+# mergedBy checks still apply.
 # A body GitHub pre-filled (from commit messages or a template) counts
 # as the opener's: they submitted it. The lookup is retried while no
 # merged PR is listed (GitHub links a PR to its merge commit a little
@@ -231,15 +233,16 @@ jobs:
           # Runner residue must not steer the tools that decide trust: jq
           # loads ~/.jq into every program and gh reads ~/.config/gh, so
           # both get an empty private directory instead (curl gets -q).
-          ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX")" \
-            || { echo "::warning::mktemp failed — skipping."; exit 0; }
-          # Cleared first, so an inherited ERRF names no file to delete.
-          ERRF=
+          # Cleared first, so an inherited ISO or ERRF names nothing to
+          # delete; the traps are set before the directory is made.
+          ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
           # trap; being trapped, they also end a retry wait at once.
           trap 'exit 130' INT
           trap 'exit 143' TERM
+          ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX")" \
+            || { echo "::warning::mktemp failed — skipping."; exit 0; }
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
             echo "::error::runner base64 does not decode with -d."; exit 1
@@ -468,12 +471,13 @@ jobs:
           # the sender and lastEditedAt a timestamp string (so a latest
           # edit by someone else missing from the list is caught).
           # The PR must also be the one REST listed, so the GraphQL answer
-          # cannot describe another PR: its merge commit, base branch and
-          # base repo must be this push's commit, default branch and repo.
+          # cannot describe another PR: its number must be the one asked
+          # for, and its merge commit, base branch and base repo must be
+          # this push's commit, default branch and repo.
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
-              author { __typename login } mergedBy { __typename login } body
+              number author { __typename login } mergedBy { __typename login } body
               editor { __typename login } lastEditedAt
               mergeCommit { oid } baseRefName baseRepository { nameWithOwner }
               userContentEdits(first: 100) {
@@ -486,6 +490,7 @@ jobs:
             '"${ONE}"'
             | (.data.repository.pullRequest)?
             | select(type == "object")
+            | select(.number == ($n | tonumber))
             | select(((.mergeCommit.oid)? // null) == $sha
               and .baseRefName == $def
               and ((.baseRepository.nameWithOwner)? // null
@@ -539,7 +544,7 @@ jobs:
             # As for the REST answer, jq -s reads the whole answer, and
             # anything but exactly one JSON document is not trusted.
             b="$(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" --arg repo "${REPO}" \
-              --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)" \
+              --arg sender "${SENDER_LOGIN}" --arg n "${n}" "${OWNED}" <<< "${g}" 2>/dev/null)" \
               || b=""
             if [ "${b#b:}" = "${b}" ]; then
               echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, it is not the PR merged as this commit, its body has a NUL, or the answer is unreadable; not trusted."
@@ -556,6 +561,12 @@ jobs:
           FOUND=()
           shopt -s nocasematch
           for i in "${!BODIES[@]}"; do
+            # Decode first: a base64 that fails part-way could leave a
+            # cut line that reads as a reference, so that body is skipped.
+            if ! body="$(printf '%s' "${BODIES[$i]}" | base64 -d 2>/dev/null)"; then
+              echo "::notice::PR #${BNUMS[$i]}: its body could not be decoded; it closes nothing."
+              continue
+            fi
             lead=1; late=0
             while IFS= read -r line || [ -n "${line}" ]; do
               line="${line%$'\r'}"
@@ -567,12 +578,13 @@ jobs:
                 lead=0
               fi
               [[ "${line}" == *cortex:issue/* ]] && late=1
-            done < <(printf '%s' "${BODIES[$i]}" | base64 -d 2>/dev/null)
+            done <<< "${body}"
             if [ "${late}" -eq 1 ]; then
               echo "::notice::PR #${BNUMS[$i]}: a cortex:issue/ is not on an exact reference line at the top of the body; it closes nothing."
             fi
           done
           shopt -u nocasematch
+          unset body
           mapfile -t IDS < <(printf '%s\n' "${FOUND[@]}" | grep . | sort -u)
           if [ "${#IDS[@]}" -eq 0 ]; then
             echo "No cortex:issue/<uuid> closing references. Nothing to close."
@@ -607,9 +619,9 @@ jobs:
               LISTS[$q]="$resp"
             done
           }
-          # Prints the version (a JSON number). Returns 0 if open, 3 if
-          # already done, 4 if found without a numeric version, 2 if not
-          # found and a list is missing, 1 if not found.
+          # Prints the version (a non-negative whole number). Returns 0 if
+          # open, 3 if already done, 4 if found without a whole-number
+          # version, 2 if not found and a list is missing, 1 if not found.
           get_version() {
             local id="$1" v q failed=0
             for q in todo in_progress backlog blocked "done"; do
@@ -629,7 +641,7 @@ jobs:
             case "$2" in
               0) return 0 ;;
               3) echo "  $1: already done." ;;
-              4) echo "::warning::$1: found without a numeric version — skipping." ;;
+              4) echo "::warning::$1: found without a whole-number version — skipping." ;;
               2)
                 if [ "${LATE}" -eq 1 ] && [ "${LFAIL}" -eq 1 ]; then
                   echo "::warning::$1: a status list lookup failed (token or API), and the run ran out of time before the rest were fetched — skipping."
