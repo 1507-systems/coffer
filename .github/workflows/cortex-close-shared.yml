@@ -5,11 +5,12 @@ name: Close Cortex Issues (shared)
 # below, so `secrets: inherit` is not needed); it never touches this repo.
 # Callers MUST pin to a commit SHA (supply-chain safety), and only a SHA
 # that includes the secrets declaration below. Epic 4a283f45.
-# Runner: pass `runs_on` (private callers: ${{ vars.RUNNER_LABEL ||
-# 'ubuntu-latest' }}, so they use the self-hosted runner). Without it the
-# job runs on GitHub-hosted ubuntu-latest, which is free for public repos.
-# Self-hosted labels are for private callers only. The runner needs bash 4+
+# Runner: pass `runs_on: ${{ github.event.repository.private &&
+# vars.RUNNER_LABEL || 'ubuntu-latest' }}`, so only a private repo can
+# reach the self-hosted runner. Without it the job runs on GitHub-hosted
+# ubuntu-latest, which is free for public repos. The runner needs bash 4+
 # first on PATH, curl 7.55+, git, gh and jq.
+# Callers grant the job `contents: read` and `pull-requests: read`.
 # The Cortex base URL is the caller's: pass `cortex_api_base` or set a
 # CORTEX_API_BASE Actions variable. With neither the job is a no-op.
 on:
@@ -28,8 +29,11 @@ on:
       CORTEX_WRITE_TOKEN:
         description: Cortex write-scope API token (marks referenced issues done)
         required: true
+# pull-requests: read lets a private repo's token list the merged
+# commit's PRs; callers must grant it too.
 permissions:
   contents: read
+  pull-requests: read
 jobs:
   close-cortex-issue:
     name: Close referenced Cortex issues
@@ -74,7 +78,10 @@ jobs:
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
           COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
-          PR_BODY="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[]?.body // empty' 2>/dev/null || true)"
+          if ! PR_BODY="$(GH_TOKEN="${_gh_tok}" gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[]?.body // empty' 2>/dev/null)"; then
+            echo "::warning::PR lookup failed; scanning the commit message only."
+            PR_BODY=""
+          fi
           SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
           mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" \
             | grep -oiE '(^|[^[:alnum:]])(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:space:]]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
