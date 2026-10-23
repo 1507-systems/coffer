@@ -16,8 +16,8 @@ name: Close Cortex Issues (shared)
 # with regex support, gh, a base64 that takes -d, an env that takes -0,
 # grep, sort, head, cut, mktemp, rm and sleep. Each must exist, and
 # bash, curl, jq, base64 and env are also checked by version or
-# feature; the job fails otherwise. Tested on bash 5.2, jq
-# 1.7 and curl 8.
+# feature; the job fails otherwise.
+# Tested on bash 5.2, jq 1.7 and curl 8.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
 # - the push's sender (type User) opened it and is GitHub's mergedBy,
@@ -181,19 +181,32 @@ jobs:
           done
           # bash cannot un-export an entry whose name is not a shell name
           # (e.g. BASH_FUNC_x%%) and passes it on; a tool that is a bash
-          # script would import it, so such an entry fails the job.
+          # script would import it, so such an entry fails the job. The
+          # exported LC_ALL=C must be seen, or env's output was not read.
           if ! command -v env >/dev/null 2>&1 || ! env -0 >/dev/null 2>&1; then
             echo "::error::runner env is missing or lacks -0."; exit 1
           fi
-          odd=0
+          odd=0; seen=0; names=""
           while IFS= read -r -d '' e; do
-            [[ "${e}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || odd=1
+            [[ "${e}" == "LC_ALL=C" ]] && seen=1
+            [[ "${e}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+            odd=$((odd + 1))
+            # Names only, never values; anything that could start a
+            # workflow command is replaced, and each name is capped.
+            if [ "${odd}" -le 5 ]; then
+              e="${e%%=*}"; e="${e//[^A-Za-z0-9_.%-]/?}"
+              names="${names} ${e:0:40}"
+            fi
           done < <(env -0)
           unset e
+          if [ "${seen}" -ne 1 ]; then
+            echo "::error::runner env -0 output could not be read."; exit 1
+          fi
           if [ "${odd}" -ne 0 ]; then
-            echo "::error::runner environment has a name bash cannot un-export."
+            echo "::error::runner environment has ${odd} name(s) bash cannot un-export:${names}"
             exit 1
           fi
+          unset odd seen names
           for t in curl gh jq base64 grep sort head cut mktemp rm sleep; do
             command -v "$t" >/dev/null 2>&1 \
               || { echo "::error::runner is missing ${t}."; exit 1; }
