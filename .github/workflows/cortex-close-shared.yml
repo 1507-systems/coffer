@@ -111,11 +111,15 @@ jobs:
           # gh call that hangs until timeout-minutes (gh has no timeout);
           # curl calls have --max-time, and no call starts after 8 min.
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
-          # (BASH_ENV itself runs first, with the token exported: that is
-          # the runner's trust, not this script's.)
+          # (BASH_ENV itself runs first, with the token exported, and an
+          # exported function could stand in for any tool: that is the
+          # runner's trust, not this script's.)
           # +xv: an inherited SHELLOPTS would trace the token to the log;
           # un-exported, it no longer reaches child shells either.
-          set +aexv -uo pipefail
+          # +C: an inherited noclobber would block the writes to ERRF.
+          # +k: keyword mode would make the declare +x words below plain
+          # assignments, and a bare declare +x prints every variable.
+          set +aeCkxv -uo pipefail
           export -n SHELLOPTS BASHOPTS
           # ASCII classes and case folding, whatever the runner's locale.
           export LC_ALL=C
@@ -327,8 +331,8 @@ jobs:
                   deletedBy { __typename login } } } } } }'
           # shellcheck disable=SC2016
           OWNED='def me: type == "object" and .__typename == "User"
-              and ((.login // "" | tostring | ascii_downcase)
-                == ($sender | ascii_downcase));
+              and (.login | type) == "string"
+              and (.login | ascii_downcase) == ($sender | ascii_downcase);
             (.data.repository.pullRequest)?
             | select(type == "object")
             | select(.author | me)
@@ -339,8 +343,9 @@ jobs:
               and (.userContentEdits.nodes | length)
                 == .userContentEdits.totalCount)
             | select(all(.userContentEdits.nodes[]?;
-              ((.editor)? // null | me)
-                and ((.deletedBy)? // null | . == null or me)))
+              type == "object" and (.editor | me)
+                and has("deletedBy")
+                and (.deletedBy == null or (.deletedBy | me))))
             | (.body // "" | tostring)
             | select(explode | all(. != 0))
             | "b:" + @base64'
@@ -376,7 +381,8 @@ jobs:
             fi
             BODIES+=("${b#b:}"); BNUMS+=("${n}")
           done
-          # Read each body's leading reference block (see the header).
+          # Read each body's leading reference block (see the comment at
+          # the top).
           # nocasematch makes =~ ignore case, so [0-9a-f] also takes A-F.
           # A cortex:issue/ on any other line closes nothing (a notice).
           UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -411,9 +417,10 @@ jobs:
             echo "::warning::out of time before the Cortex calls — skipping."
             exit 0
           fi
-          # The header goes to curl on stdin (-H @-), so the token is in
-          # no process list and no file. -q (first) makes curl ignore any
-          # ~/.curlrc on the runner.
+          # The Authorization header goes to curl on stdin (-H @-), so the
+          # token is in no process list and, on bash 5.1+, no file (older
+          # bash writes a 0600 temp file and unlinks it at once). -q
+          # (first) makes curl ignore any ~/.curlrc on the runner.
           cx() { curl -q -H @- "$@" <<< "Authorization: Bearer ${_cortex_tok}"; }
           # Each status list is fetched once (again after a 409), trimmed
           # to id and version. The API has no get-by-id or paging, so each
