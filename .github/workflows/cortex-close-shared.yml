@@ -23,8 +23,9 @@ name: Close Cortex Issues (shared)
 # - the push's sender (type User) opened it and is GitHub's mergedBy,
 #   and the run was started by that push or a re-run by the sender;
 # - it is from a branch in the caller's repo;
-# - it is not a bot's (a non-User type, a [bot] login, or a renovate/
-#   or dependabot/ branch, any case);
+# - it is not a bot's (a non-User type; a [bot], missing or
+#   non-string login; or a missing or non-string branch name, or a
+#   renovate/ or dependabot/ branch, any case);
 # - nobody but its opener ever edited the body.
 # If any PR listed for the commit is from a fork, nothing is scanned.
 # Commit messages are never scanned, so a push with no such PR behind
@@ -304,7 +305,7 @@ jobs:
           # $sha, $def, $repo and $sender are jq variables, not shell ones.
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
-            | select((.merged_at | type == "string")
+            | select((.merged_at | type == "string" and . != "")
               and .merge_commit_sha == $sha
               and ((.base.ref)? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
