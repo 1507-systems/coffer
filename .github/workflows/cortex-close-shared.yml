@@ -50,7 +50,8 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           # No -e: every failure below is handled; the job is non-blocking.
-          set +e -uo pipefail
+          # +a too: a BASH_ENV `set -a` would re-export the token copies.
+          set +ae -uo pipefail
           # Keep tokens out of child processes' environments; declare +x
           # drops an export the runner may already have on these names.
           declare +x _cortex_tok="${CORTEX_WRITE_TOKEN-}" _gh_tok="${GH_TOKEN-}"
@@ -109,21 +110,30 @@ jobs:
           printf 'Authorization: Bearer %s\n' "${_cortex_tok}" > "${HDR}" \
             || { echo "::warning::cannot write header file — skipping."; exit 0; }
           AUTH=(-H "@${HDR}")
+          # Prints the version as raw JSON. Returns 1 if not found, 2 if
+          # every lookup failed (bad token, outage).
           get_version() {
-            local id="$1" resp v q
+            local id="$1" resp v q ok=0
             for q in status=todo status=in_progress status=backlog status=blocked ""; do
               resp="$(curl -s -f --proto =https --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?${q:+${q}&}limit=200" 2>/dev/null)" || continue
-              v="$(printf '%s' "$resp" | jq -r --arg id "$id" '.issues[]? | select(.id==$id) | .version' 2>/dev/null | head -n1)"
+              ok=1
+              v="$(printf '%s' "$resp" | jq -c --arg id "$id" '.issues[]? | select(.id==$id) | .version' 2>/dev/null | head -n1)"
               [ -n "$v" ] && [ "$v" != "null" ] && { printf '%s' "$v"; return 0; }
             done
-            return 1
+            [ "${ok}" -eq 1 ] && return 1
+            return 2
           }
           for id in "${IDS[@]}"; do
-            version="$(get_version "$id")" || { echo "  ${id}: not found — skipping."; continue; }
+            version="$(get_version "$id")"
+            case $? in
+              0) ;;
+              2) echo "::warning::${id}: lookup failed (token or API) — skipping."; continue ;;
+              *) echo "  ${id}: not found — skipping."; continue ;;
+            esac
             for attempt in 1 2; do
               payload="$(jq -nc --argjson v "$version" --arg id "$id" --arg a "$attempt" \
-                --arg note "COMPLETED via merge (gh run ${GITHUB_RUN_ID}) — auto-closed by at-merge hook." \
-                '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+env.GITHUB_RUN_ID+"-"+$id+"-"+$a)}')" \
+                --arg rid "${GITHUB_RUN_ID}" --arg note "COMPLETED via merge (gh run ${GITHUB_RUN_ID}) — auto-closed by at-merge hook." \
+                '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: bad version — skipping."; break; }
               code="$(curl -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
@@ -135,7 +145,7 @@ jobs:
                   fi
                   echo "  ${id}: version_conflict; re-fetching."
                   version="$(get_version "$id")" \
-                    || { echo "::warning::${id}: not found on re-fetch — skipping."; break; } ;;
+                    || { echo "::warning::${id}: re-fetch failed — skipping."; break; } ;;
                 403) echo "::warning::${id}: 403 — token lacks write scope."; break ;;
                 *)   echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."; break ;;
               esac
