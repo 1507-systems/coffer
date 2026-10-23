@@ -104,27 +104,37 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           FORCED: ${{ github.event.forced }}
           TRIGGER_LOGIN: ${{ github.triggering_actor }}
-        shell: bash
+        # -p: bash ignores SHELLOPTS, BASHOPTS, BASH_ENV, ENV and exported
+        # functions from the environment (see the comments below).
+        shell: bash --noprofile --norc -p -o pipefail {0}
         run: |
           # No -e: lookup and API failures are handled and do not fail the
           # job. A runner without the tools below fails it, and so does a
           # gh call that hangs until timeout-minutes (gh has no timeout);
           # curl calls have --max-time, and no call starts after 8 min.
-          # +a too: a BASH_ENV `set -a` would re-export the token copies.
-          # (BASH_ENV itself runs first, with the token exported, and an
-          # exported function could stand in for any tool: that is the
-          # runner's trust, not this script's.)
+          # bash -p (see shell:) reads no BASH_ENV and imports no options
+          # or functions, so nothing runs before this line; the set and
+          # export -n lines below are a backstop for a shell without -p.
+          # +a too: a `set -a` would re-export the token copies.
           # +xv: an inherited SHELLOPTS would trace the token to the log;
-          # un-exported, it no longer reaches child shells either.
+          # the first set +x is traced only to /dev/null, so nothing is
+          # traced, whatever PS4 the environment holds. Un-exported,
+          # SHELLOPTS no longer reaches child shells either.
           # +C: an inherited noclobber would block the writes to ERRF.
-          # +k: keyword mode would make the declare +x words below plain
-          # assignments, and a bare declare +x prints every variable.
+          # +k: keyword mode would turn the declare +x words below into
+          # env assignments, leaving a bare declare +x, which prints
+          # every variable.
+          { set +x; } 2>/dev/null
           set +aeCkxv -uo pipefail
           export -n SHELLOPTS BASHOPTS
           # ASCII classes and case folding, whatever the runner's locale.
           export LC_ALL=C
           # Time from here, whatever SECONDS the environment held.
           SECONDS=0
+          # An inherited FUNCNEST would break the nested helpers, and a
+          # TMOUT would make read time out and drop body lines. BASH_ENV
+          # and ENV are dropped so no child shell runs them either.
+          unset FUNCNEST TMOUT BASH_ENV ENV
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
             "${SENDER_TYPE:=}" "${SENDER_LOGIN:=}" "${DEFAULT_BRANCH:=}" \
@@ -133,8 +143,9 @@ jobs:
           # drops an export the runner may already have on these names.
           declare +x _cortex_tok="${CORTEX_WRITE_TOKEN-}" _gh_tok="${GH_TOKEN-}"
           unset CORTEX_WRITE_TOKEN GH_TOKEN
-          # gh must talk to github.com, where GH_TOKEN is from.
-          unset GH_HOST
+          # gh must talk to github.com, where GH_TOKEN is from, with plain
+          # output; curl must not log TLS keys that would expose the token.
+          unset GH_HOST GH_PAGER GH_FORCE_TTY SSLKEYLOGFILE
           # Fail loudly: old bash or a missing tool would silently no-op.
           if [ "${BASH_VERSINFO[0]}" -lt 4 ] \
             || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
@@ -240,24 +251,26 @@ jobs:
             | select(.merged_at != null and .merge_commit_sha == $sha
               and ((.base.ref)? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
-          # an object), a [bot] login, or a bot's branch name.
+          # an object), a [bot] or non-string login, or a bot's (or a
+          # non-string) branch name. A non-string fork name is a fork.
           # shellcheck disable=SC2016
           BOT='(((.user.type)? // null) != "User")
-            or (((.user.login)? // "" | tostring) | endswith("[bot]"))
-            or (((.head.ref)? // "" | tostring)
-              | test("^(renovate|dependabot)/"; "i"))'
+            or ((.user.login)? // "" | type != "string" or endswith("[bot]"))
+            or ((.head.ref)? // "" | type != "string"
+              or test("^(renovate|dependabot)/"; "i"))'
           # Merged PRs a person opened and also merged (pushed).
           # shellcheck disable=SC2016
           OURS='['"${MERGED}"'[] | select(('"${BOT}"' | not)
-            and (((.user.login)? // "" | tostring | ascii_downcase)
-              == ($sender | ascii_downcase)))]'
+            and ((.user.login)? // null | type == "string"
+              and ascii_downcase == ($sender | ascii_downcase)))]'
           # A full page (100) may be truncated, and any entry that is not
           # an object is unreadable; both fail closed.
           # shellcheck disable=SC2016
           CLASSIFY='if type != "array" or length >= 100
               or any(.[]; type != "object") then "bad"
             elif any(.[] | objects; ((.head.repo.full_name)? // ""
-              | tostring | ascii_downcase) != ($repo | ascii_downcase)) then "fork"
+              | type != "string"
+                or ascii_downcase != ($repo | ascii_downcase))) then "fork"
             elif ('"${MERGED}"' | length) == 0 then "none"
             elif ('"${OURS}"' | length) == 0 then "other"
             else "ours" end'
@@ -346,7 +359,8 @@ jobs:
               type == "object" and (.editor | me)
                 and has("deletedBy")
                 and (.deletedBy == null or (.deletedBy | me))))
-            | (.body // "" | tostring)
+            | select(.body == null or (.body | type) == "string")
+            | (.body // "")
             | select(explode | all(. != 0))
             | "b:" + @base64'
           # One base64 line per trusted body, so each is read alone.
@@ -381,8 +395,8 @@ jobs:
             fi
             BODIES+=("${b#b:}"); BNUMS+=("${n}")
           done
-          # Read each body's leading reference block (see the comment at
-          # the top).
+          # Read each body's leading reference block (see "References
+          # must open the body" in the file header).
           # nocasematch makes =~ ignore case, so [0-9a-f] also takes A-F.
           # A cortex:issue/ on any other line closes nothing (a notice).
           UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
