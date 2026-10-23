@@ -11,14 +11,15 @@ name: Close Cortex Issues (shared)
 # variable). A public caller's `runs_on` is ignored and the job runs on
 # GitHub-hosted ubuntu-latest (free for public repos); runner-group repo
 # access remains the real gate for self-hosted runners. The runner needs
-# bash 4.4+ first on PATH, curl 7.55+, gh, jq, awk, base64, grep, sed,
-# sort, tr, head, cut, mktemp and sleep.
-# Trust: only a merged PR's body is scanned, and only when the person
-# who merged it (the push's sender, type User) also opened it, from a
-# branch in the caller's repo, it is not a bot's (a non-User type, a
-# [bot] login, or a renovate/ or dependabot/ branch), and nobody but its
-# opener ever edited the body. Commit messages are never scanned, so
-# direct pushes, bot PRs, merge-queue merges and PRs merged by someone
+# bash 4.4+ first on PATH, curl 7.55+, gh, jq, awk, base64, grep, sort,
+# tr, head, cut, mktemp, rm and sleep.
+# Trust: only the body of a PR merged into the default branch is
+# scanned, and only when the person who merged it (the push's sender,
+# type User, and GitHub's mergedBy) also opened it, from a branch in the
+# caller's repo, it is not a bot's (a non-User type, a [bot] login, or a
+# renovate/ or dependabot/ branch), and nobody but its opener ever
+# edited the body. Commit messages are never scanned, so direct pushes,
+# force-pushes, bot PRs, merge-queue merges and PRs merged by someone
 # other than their opener close nothing; if any PR listed for the
 # commit is from a fork, nothing is scanned. The lookup is retried while
 # no merged PR is listed (GitHub links a PR to its merge commit a little
@@ -28,10 +29,11 @@ name: Close Cortex Issues (shared)
 # resolve, resolves, resolved, retire, retires, retired; any case, an
 # optional colon), then cortex:issue/<uuid>, at the start of a line:
 # indented at most 3 spaces, optionally after a -, * or + list marker,
-# e.g. "Closes cortex:issue/<uuid>". Quoted (>), fenced and HTML-comment
-# lines are ignored; a fence inside a list item counts only if its
-# closing fence is indented at most 3 spaces (otherwise the rest of the
-# body is ignored).
+# e.g. "Closes cortex:issue/<uuid>". Ignored: quoted (>) lines and the
+# lines after them up to a blank line; fenced lines (also after a list
+# marker); <pre> blocks; any line that touches an HTML comment. (GitHub
+# shows <script>, <style> and <textarea> contents as text.) Any <!--, even in inline code, hides the rest
+# of the body until a -->.
 # Known limit: CORTEX_WRITE_TOKEN is a general write-scope token. Anyone
 # trusted above, in any caller repo, can close any issue in the Cortex
 # instance (issue UUIDs appear in public repos); anyone who can run a
@@ -81,6 +83,8 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           SENDER_TYPE: ${{ github.event.sender.type }}
           SENDER_LOGIN: ${{ github.event.sender.login }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          FORCED: ${{ github.event.forced }}
         run: |
           # No -e: every failure below is handled; the job is non-blocking.
           # +a too: a BASH_ENV `set -a` would re-export the token copies.
@@ -96,7 +100,7 @@ jobs:
             || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
             echo "::error::runner bash is ${BASH_VERSION}; need 4.4+."; exit 1
           fi
-          for t in curl gh jq awk base64 grep sed sort tr head cut mktemp sleep; do
+          for t in curl gh jq awk base64 grep sort tr head cut mktemp rm sleep; do
             command -v "$t" >/dev/null 2>&1 \
               || { echo "::error::runner is missing ${t}."; exit 1; }
           done
@@ -113,6 +117,10 @@ jobs:
             echo "::notice::push not made by a person; not trusted to close issues."
             exit 0
           fi
+          if [ "${FORCED:-}" = true ]; then
+            echo "::notice::force-push; it closes nothing."
+            exit 0
+          fi
           trap 'rm -f "${ERRF:-}" "${HDR:-}"' EXIT
           # Route signals through exit so the EXIT trap removes the files.
           trap 'exit 130' INT
@@ -121,10 +129,11 @@ jobs:
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit (with a merge queue, only the
           # last PR in the batch; its sender is a bot anyway).
-          # $sha, $repo and $sender are jq variables, not shell ones.
+          # $sha, $def, $repo and $sender are jq variables, not shell ones.
           # shellcheck disable=SC2016
           MERGED='[.[] | objects
-            | select(.merged_at != null and .merge_commit_sha == $sha)]'
+            | select(.merged_at != null and .merge_commit_sha == $sha
+              and (.base.ref? // "") == $def)]'
           # Not a person: a non-User type (fails closed if `user` is not
           # an object), a [bot] login, or a bot's branch name.
           # shellcheck disable=SC2016
@@ -155,7 +164,7 @@ jobs:
               echo "::warning::PR lookup failed (${st:-no HTTP status}) — skipping."
               exit 0
             fi
-            KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg repo "${REPO}" \
+            KIND="$(jq -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" --arg repo "${REPO}" \
               --arg sender "${SENDER_LOGIN}" "${CLASSIFY}" <<< "${PR_JSON}" 2>/dev/null)"
             if [ "${KIND}" != none ] || [ "${attempt}" -eq 4 ]; then
               break
@@ -177,7 +186,7 @@ jobs:
               echo "::warning::PR lookup unreadable — skipping."
               exit 0 ;;
           esac
-          mapfile -t NUMS < <(jq -r --arg sha "${HEAD_SHA}" \
+          mapfile -t NUMS < <(jq -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
             --arg sender "${SENDER_LOGIN}" "${OURS}"'[] | .number
             | select(type == "number")' <<< "${PR_JSON}" 2>/dev/null)
           unset PR_JSON
@@ -185,10 +194,12 @@ jobs:
           # the one checked. Only a body nobody but the opener (also the
           # merger) ever edited counts: anyone else's edit, even after the
           # merge and then a re-run, would put their text under his name.
+          # mergedBy must be the sender too, so pushing someone else's
+          # merge commit (e.g. a fast-forward) closes nothing.
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
-              author { login } body
+              author { login } mergedBy { login } body
               userContentEdits(first: 100) {
                 totalCount nodes { editor { login } } } } } }'
           # shellcheck disable=SC2016
@@ -196,7 +207,12 @@ jobs:
             | select(type == "object")
             | select((.author.login? // "" | tostring | ascii_downcase)
               == ($sender | ascii_downcase))
+            | select((.mergedBy.login? // "" | tostring | ascii_downcase)
+              == ($sender | ascii_downcase))
             | select((.userContentEdits.totalCount? // 101) <= 100)
+            | select((.userContentEdits.nodes | type) == "array"
+              and (.userContentEdits.nodes | length)
+                == .userContentEdits.totalCount)
             | select(all(.userContentEdits.nodes[]?;
               (.editor.login? // "" | tostring | ascii_downcase)
                 == ($sender | ascii_downcase)))
@@ -213,7 +229,8 @@ jobs:
               if [[ "${st}" =~ ^HTTP\ (429|5[0-9][0-9])$ ]] && [ "${attempt}" -lt 3 ]; then
                 sleep 10; continue
               fi
-              echo "::warning::PR #${n} lookup failed (${st:-no HTTP status}) — skipping."
+              # Fail closed as a whole: no body is scanned.
+              echo "::warning::PR #${n} lookup failed (${st:-no HTTP status}) — skipping all PRs."
               exit 0
             done
             b="$(jq -r --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)"
@@ -223,37 +240,52 @@ jobs:
             fi
             BODIES+=("${b#b:}")
           done
-          # Drop quoted, fenced and HTML-comment lines. A fence closes only
-          # on the same character, at least as long, with nothing after;
-          # a backtick run followed by another backtick is inline code.
-          # Any line that touches a comment is dropped, and the comment
-          # state is walked across the whole line. [ \t] (awk expands \t)
-          # rather than [[:space:]], for old mawk.
+          # Drop the lines GitHub shows as quote, code or comment. w is the
+          # line's indent. A fence closes only on the same character, at
+          # least as long, with nothing after; a backtick run followed by
+          # another backtick is inline code. A fence opened in a list item
+          # (content indent fi) also ends at a less-indented line, which is
+          # then read afresh. Fences and <pre> blocks are tested before
+          # comments, so <!-- in an info string is not a comment. A line
+          # that touches a comment is dropped and the comment state walked
+          # across it. Lines after a > line are dropped up to a blank line
+          # (lazy continuation). [ \t] (awk expands \t) rather than
+          # [[:space:]], for old mawk.
           # shellcheck disable=SC2016
-          STRIP='{ sub(/\r$/, "") }
+          STRIP='{ sub(/\r$/, ""); w = 0; while (substr($0, w + 1, 1) == " ") w++ }
+            fc != "" && fi > 0 && w < fi && $0 !~ /^[ \t]*$/ { fc = "" }
             fc != "" {
-              t = $0; sub(/^ ? ? ?/, "", t); n = 0
+              t = substr($0, w + 1); n = 0
               while (substr(t, n + 1, 1) == fc) n++
-              if (n >= fn && substr(t, n + 1) ~ /^[ \t]*$/) fc = ""
+              if (w - fi <= 3 && n >= fn && substr(t, n + 1) ~ /^[ \t]*$/) fc = ""
               next
             }
+            hb != "" { if (index(tolower($0), "</pre")) hb = ""; next }
+            !c && /^ ? ? ?(([-*+]|[0-9]+[.)])[ \t]+)?(```|~~~)/ {
+              t = $0; sub(/^ *(([-*+]|[0-9]+[.)])[ \t]+)?/, "", t)
+              ch = substr(t, 1, 1); k = 0
+              while (substr(t, k + 1, 1) == ch) k++
+              if (ch != "`" || !index(substr(t, k + 1), "`")) {
+                fc = ch; fn = k; q = 0
+                fi = ($0 ~ /^ *([-*+]|[0-9]+[.)])/) ? length($0) - length(t) : 0
+                next
+              }
+            }
+            !c && tolower($0) ~ /^ ? ? ?<pre([ \t>]|$)/ {
+              if (!index(tolower($0), "</pre")) hb = "pre"
+              q = 0; next
+            }
             c || index($0, "<!--") {
-              t = $0
+              t = $0; q = 0
               while (1) {
                 if (c) { i = index(t, "-->"); if (!i) break; t = substr(t, i + 3); c = 0 }
                 else { i = index(t, "<!--"); if (!i) break; t = substr(t, i + 4); c = 1 }
               }
               next
             }
-            /^ ? ? ?(([-*+]|[0-9]+[.)])[ \t]+)?(```|~~~)/ {
-              t = $0; sub(/^ *(([-*+]|[0-9]+[.)])[ \t]+)?/, "", t)
-              ch = substr(t, 1, 1); k = 0
-              while (substr(t, k + 1, 1) == ch) k++
-              if (ch != "`" || !index(substr(t, k + 1), "`")) {
-                fc = ch; fn = k; next
-              }
-            }
-            /^[ \t]*>/ { next }
+            /^[ \t]*>/ { q = 1; next }
+            /^[ \t]*$/ { q = 0 }
+            q { next }
             { print }'
           UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
           REF="^ {0,3}([-*+][[:blank:]]+)?(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:blank:]]+cortex:issue/${UUID}([^0-9a-f-]|\$)"
@@ -310,15 +342,16 @@ jobs:
             done
           }
           # Prints the version (a JSON number). Returns 0 if open, 3 if
-          # already done, 2 if not found and a list is missing, 1 if not
-          # found.
+          # already done, 4 if found without a numeric version, 2 if not
+          # found and a list is missing, 1 if not found.
           get_version() {
             local id="$1" v q failed=0
             for q in todo in_progress backlog blocked "done"; do
               [ -n "${LISTS[$q]+x}" ] || { failed=1; continue; }
-              v="$(printf '%s' "${LISTS[$q]}" | jq -c --arg id "$id" '.[] | select(.id==$id) | .version | select(type == "number")' 2>/dev/null | head -n1)"
+              v="$(printf '%s' "${LISTS[$q]}" | jq -c --arg id "$id" '.[] | select(.id==$id) | .version' 2>/dev/null | head -n1)"
               if [ -n "$v" ]; then
                 [ "$q" = "done" ] && return 3
+                [[ "$v" =~ ^[0-9]+$ ]] || return 4
                 printf '%s' "$v"; return 0
               fi
             done
@@ -330,6 +363,7 @@ jobs:
             case "$2" in
               0) return 0 ;;
               3) echo "  $1: already done." ;;
+              4) echo "::warning::$1: found without a numeric version — skipping." ;;
               2) echo "::warning::$1: lookup failed (token or API) — skipping." ;;
               *) echo "::warning::$1: not found in the first 200 issues of any status — skipping." ;;
             esac
