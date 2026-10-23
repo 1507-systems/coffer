@@ -12,10 +12,11 @@ name: Close Cortex Issues (shared)
 # a runner labelled ubuntu-latest: GitHub-hosted (free for public
 # repos) unless a self-hosted runner the repo can reach also carries
 # that label, so runner-group repo access remains the real gate. The
-# runner needs bash 4.4+, curl 7.55+, jq 1.5+ with regex support, gh,
-# a base64 that takes -d, grep, sort, head, cut, mktemp, rm and sleep.
-# Each must exist, and bash, curl, jq and base64 are also checked by
-# version or feature; the job fails otherwise. Tested on bash 5.2, jq
+# runner needs bash 4.4+ with the compgen builtin, curl 7.55+, jq 1.5+
+# with regex support, gh, a base64 that takes -d, an env that takes -0,
+# grep, sort, head, cut, mktemp, rm and sleep. Each must exist, and
+# bash, curl, jq, base64 and env are also checked by version or
+# feature; the job fails otherwise. Tested on bash 5.2, jq
 # 1.7 and curl 8.
 # Trust: only the body of a PR merged into the default branch is
 # scanned, and only when all of these hold:
@@ -53,8 +54,8 @@ name: Close Cortex Issues (shared)
 # trusted above, in any caller repo, can close any issue in the Cortex
 # instance (issue UUIDs appear in public repos); anyone who can run a
 # workflow in a caller repo, or code on its runner, can take the token
-# (e.g. from this step's /proc environ, or through the runner's proxy
-# or CA settings).
+# (e.g. from this step's /proc environ, or through the runner's PATH,
+# proxy or CA settings).
 # An account that opens and merges its own PRs is trusted as a person,
 # even a machine user; agents that open and merge PRs under a person's
 # account are trusted as that person.
@@ -123,8 +124,10 @@ jobs:
           # +xv: an inherited SHELLOPTS would trace the token to the log;
           # the first set +x has stdout and stderr on /dev/null, so its
           # own trace goes there, whatever PS4 holds, unless
-          # BASH_XTRACEFD names another open fd (the runner opens none).
-          # Un-exported, SHELLOPTS no longer reaches child shells either.
+          # BASH_XTRACEFD names an fd other than 1 or 2 that is open for
+          # writing (the runner opens none). Un-exported, SHELLOPTS no
+          # longer reaches child shells either (nor would it past the
+          # allowlist below).
           # +o posix: POSIXLY_CORRECT turns posix mode on even under -p,
           # and old bash then rejects the process substitutions below.
           # +C: an inherited noclobber would block the writes to ERRF.
@@ -140,8 +143,9 @@ jobs:
           SECONDS=0
           # An inherited FUNCNEST would break the nested helpers, and a
           # TMOUT would make read time out and drop body lines. BASH_ENV
-          # and ENV are dropped so no child shell runs them either, and
-          # BASH_COMPAT so this bash keeps its own behaviour.
+          # and ENV are dropped so no child shell runs them either (the
+          # allowlist below also covers that), and BASH_COMPAT so this
+          # bash keeps its own behaviour.
           unset FUNCNEST TMOUT BASH_ENV ENV BASH_COMPAT
           # Unset and empty mean the same below.
           : "${CORTEX_API_BASE:=}" "${REPO:=}" "${HEAD_SHA:=}" \
@@ -163,7 +167,8 @@ jobs:
           # the runner's proxy and CA settings (a known limit, above).
           # All else is un-exported, so no tool setting (gh's GH_HOST,
           # GH_DEBUG, DEBUG, GODEBUG or colour, curl's SSLKEYLOGFILE,
-          # GREP_OPTIONS, ...) reaches a child. The gh calls add GH_TOKEN,
+          # grep's GREP_OPTIONS, ...) reaches a child; a name bash cannot
+          # un-export fails the job (below). The gh calls add GH_TOKEN,
           # GH_CONFIG_DIR, HOME and GH_TELEMETRY=0, and jq gets HOME.
           # shellcheck disable=SC2163
           for v in $(compgen -e); do
@@ -174,6 +179,21 @@ jobs:
               *) export -n "${v}" ;;
             esac
           done
+          # bash cannot un-export an entry whose name is not a shell name
+          # (e.g. BASH_FUNC_x%%) and passes it on; a tool that is a bash
+          # script would import it, so such an entry fails the job.
+          if ! command -v env >/dev/null 2>&1 || ! env -0 >/dev/null 2>&1; then
+            echo "::error::runner env is missing or lacks -0."; exit 1
+          fi
+          odd=0
+          while IFS= read -r -d '' e; do
+            [[ "${e}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || odd=1
+          done < <(env -0)
+          unset e
+          if [ "${odd}" -ne 0 ]; then
+            echo "::error::runner environment has a name bash cannot un-export."
+            exit 1
+          fi
           for t in curl gh jq base64 grep sort head cut mktemp rm sleep; do
             command -v "$t" >/dev/null 2>&1 \
               || { echo "::error::runner is missing ${t}."; exit 1; }
