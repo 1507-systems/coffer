@@ -325,9 +325,12 @@ jobs:
           }
           # The job's if: already needs a real push; check its context here
           # too, since an empty repo or default branch would loosen the PR
-          # checks below.
+          # checks below, and a repo or SHA of another shape would change
+          # the REST path. An owner is letters, digits and hyphens; a repo
+          # name may not be . or ..
           if [ -z "${DEFAULT_BRANCH}" ] \
-            || ! [[ "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || ! [[ "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] \
+            || [ "${REPO#*/}" = . ] || [ "${REPO#*/}" = .. ] \
             || ! [[ "${HEAD_SHA}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
             echo "::warning::push context (repo, commit or default branch) unreadable — skipping."
             exit 0
@@ -345,7 +348,9 @@ jobs:
           MERGED='[.[] | objects
             | select((.merged_at | type == "string" and . != "")
               and .merge_commit_sha == $sha
-              and ((.base.ref)? // "") == $def)]'
+              and ((.base.ref)? // "") == $def
+              and ((.base.repo.full_name)? // "" | type == "string"
+                and ascii_downcase == ($repo | ascii_downcase)))]'
           # Not a person: a non-User type (fails closed if `user` is not
           # an object), a [bot], missing or non-string login, or a missing,
           # non-string or bot's (renovate/, dependabot/) branch name.
@@ -412,13 +417,12 @@ jobs:
           esac
           # KIND is "ours" only for exactly one document. A jq failure
           # leaves no PR number, which warns below.
-          nums="$(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" \
+          nums="$(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" --arg repo "${REPO}" \
             --arg sender "${SENDER_LOGIN}" "${ONE}"' | '"${OURS}"'[] | .number
             | if type == "number" then tostring else "bad" end' <<< "${PR_JSON}" 2>/dev/null)" \
             || nums=""
           mapfile -t NUMS <<< "${nums}"
-          unset nums
-          unset PR_JSON
+          unset nums PR_JSON
           # Any trusted PR whose number is not a whole number that
           # GraphQL's Int can hold (1-10 digits, at most 2147483647) fails
           # closed as a whole. An empty read is one empty entry, so it
@@ -446,15 +450,19 @@ jobs:
           # Each must also be a User (an App's GraphQL login has no [bot]
           # suffix), and a revision deleted from the edit history must
           # have been deleted by the sender. The PR's own editor and
-          # lastEditedAt must agree with the list: with no edits listed
-          # both are null, otherwise editor is the sender and lastEditedAt
-          # a non-empty string (so a latest edit missing from the list is
-          # caught).
+          # lastEditedAt must agree with the list: both keys present; with
+          # no edits listed both null, otherwise editor is the sender and
+          # lastEditedAt a timestamp string (so a latest edit missing from
+          # the list is caught).
+          # The PR must also be the one REST listed, so the body scanned is
+          # the one checked: its merge commit, base branch and base repo
+          # must be this push's commit, default branch and repo.
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
               author { __typename login } mergedBy { __typename login } body
               editor { __typename login } lastEditedAt
+              mergeCommit { oid } baseRefName baseRepository { nameWithOwner }
               userContentEdits(first: 100) {
                 totalCount nodes { editor { __typename login }
                   deletedBy { __typename login } } } } } }'
@@ -465,6 +473,11 @@ jobs:
             '"${ONE}"'
             | (.data.repository.pullRequest)?
             | select(type == "object")
+            | select(((.mergeCommit.oid)? // null) == $sha
+              and .baseRefName == $def
+              and ((.baseRepository.nameWithOwner)? // null
+                | type == "string"
+                  and ascii_downcase == ($repo | ascii_downcase)))
             | select(.author | me)
             | select(.mergedBy | me)
             | select((.userContentEdits | type) == "object")
@@ -476,9 +489,11 @@ jobs:
               type == "object" and (.editor | me)
                 and has("deletedBy")
                 and (.deletedBy == null or (.deletedBy | me))))
+            | select(has("editor") and has("lastEditedAt"))
             | select(if .userContentEdits.totalCount == 0
                 then .editor == null and .lastEditedAt == null
-                else (.editor | me) and (.lastEditedAt | type == "string" and . != "") end)
+                else (.editor | me) and (.lastEditedAt | type == "string"
+                  and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) end)
             | select(.body == null or (.body | type) == "string")
             | (.body // "")
             | select(explode | all(. != 0))
@@ -510,10 +525,11 @@ jobs:
             done
             # As for the REST answer, jq -s reads the whole answer, and
             # anything but exactly one JSON document is not trusted.
-            b="$(jq -s -r --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)" \
+            b="$(jq -s -r --arg sha "${HEAD_SHA}" --arg def "${DEFAULT_BRANCH}" --arg repo "${REPO}" \
+              --arg sender "${SENDER_LOGIN}" "${OWNED}" <<< "${g}" 2>/dev/null)" \
               || b=""
             if [ "${b#b:}" = "${b}" ]; then
-              echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, its body has a NUL, or the answer is unreadable; not trusted."
+              echo "::notice::PR #${n}: its opener, merger or body edits are not all the pusher's, it is not the PR merged as this commit, its body has a NUL, or the answer is unreadable; not trusted."
               continue
             fi
             BODIES+=("${b#b:}"); BNUMS+=("${n}")
@@ -625,10 +641,20 @@ jobs:
                 --arg rid "${GITHUB_RUN_ID:-0}.${GITHUB_RUN_ATTEMPT:-1}" \
                 '{version:$v, patch:{status:"done"}, request_id:("gh-merge-"+$rid+"-"+$id+"-"+$a)}')" \
                 || { echo "::warning::${id}: cannot build PATCH payload — skipping."; break; }
+              # curl can exit non-zero after a 2xx (e.g. a timeout while
+              # reading the body), so the close may have applied.
+              rc=0
               code="$(cx -s --proto =https -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH \
-                -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
+                -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || rc=$?
+              code="${code:-000}"
               case "$code" in
-                2[0-9][0-9]) echo "  ${id}: closed (status=done)."; break ;;
+                2[0-9][0-9])
+                  if [ "${rc}" -eq 0 ]; then
+                    echo "  ${id}: closed (status=done)."
+                  else
+                    echo "::warning::${id}: HTTP ${code}, curl exit ${rc} — may have applied; check it by hand."
+                  fi
+                  break ;;
                 409)
                   if [ "${attempt}" -eq 2 ]; then
                     echo "::warning::${id}: version_conflict again — skipping."; break
