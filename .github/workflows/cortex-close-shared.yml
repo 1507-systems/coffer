@@ -52,6 +52,9 @@ jobs:
         run: |
           # No -e: every failure below is handled; the job is non-blocking.
           set +e -uo pipefail
+          # Keep the token out of child processes' environments.
+          TOKEN="${CORTEX_WRITE_TOKEN-}"
+          unset CORTEX_WRITE_TOKEN
           # Fail loudly: old bash or a missing tool would silently no-op.
           if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
             echo "::error::runner bash is ${BASH_VERSION}; need 4+."; exit 1
@@ -63,8 +66,10 @@ jobs:
           # -H @file (used below) needs curl 7.55+.
           cv="$(curl --version | head -n1 | cut -d' ' -f2)"
           IFS=. read -r cmaj cmin _ <<< "${cv}"
-          if [ "${cmaj:-0}" -lt 7 ] 2>/dev/null \
-            || { [ "${cmaj}" -eq 7 ] && [ "${cmin:-0}" -lt 55 ]; }; then
+          if ! [[ "${cmaj}" =~ ^[0-9]+$ && "${cmin}" =~ ^[0-9]+$ ]]; then
+            echo "::error::cannot parse curl version '${cv}'."; exit 1
+          fi
+          if [ "${cmaj}" -lt 7 ] || { [ "${cmaj}" -eq 7 ] && [ "${cmin}" -lt 55 ]; }; then
             echo "::error::runner curl is ${cv}; need 7.55+."; exit 1
           fi
           COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
@@ -79,7 +84,7 @@ jobs:
           fi
           echo "Found ${#IDS[@]} cortex issue reference(s): ${IDS[*]}"
           # The secret is required, so this only catches an empty value.
-          if [ -z "${CORTEX_WRITE_TOKEN}" ]; then
+          if [ -z "${TOKEN}" ]; then
             echo "::notice::CORTEX_WRITE_TOKEN not set — skipping (no-op)."
             exit 0
           fi
@@ -92,16 +97,16 @@ jobs:
             https://*) ;;
             *) echo "::warning::CORTEX_API_BASE is not https:// — skipping."; exit 0 ;;
           esac
-          case "${CORTEX_WRITE_TOKEN}" in
+          case "${TOKEN}" in
             *$'\n'*|*$'\r'*)
-              echo "::warning::CORTEX_WRITE_TOKEN has a newline — skipping."
+              echo "::warning::CORTEX_WRITE_TOKEN has a CR/LF — skipping."
               exit 0 ;;
           esac
           # Header from a 0600 file so the token stays out of the process list.
           HDR="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-hdr.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           trap 'rm -f "${HDR}"' EXIT
-          printf 'Authorization: Bearer %s\n' "${CORTEX_WRITE_TOKEN}" > "${HDR}" \
+          printf 'Authorization: Bearer %s\n' "${TOKEN}" > "${HDR}" \
             || { echo "::warning::cannot write header file — skipping."; exit 0; }
           AUTH=(-H "@${HDR}")
           get_version() {
@@ -115,7 +120,7 @@ jobs:
           }
           for id in "${IDS[@]}"; do
             version="$(get_version "$id")" || { echo "  ${id}: not found — skipping."; continue; }
-            for _ in 1 2; do
+            for attempt in 1 2; do
               payload="$(jq -nc --argjson v "$version" --arg id "$id" \
                 --arg note "COMPLETED via merge (gh run ${GITHUB_RUN_ID}) — auto-closed by at-merge hook." \
                 '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+env.GITHUB_RUN_ID+"-"+$id)}')" \
@@ -124,7 +129,13 @@ jobs:
                 -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)" || code="${code:-000}"
               case "$code" in
                 200) echo "  ${id}: closed (status=done)."; break ;;
-                409) echo "  ${id}: version_conflict; re-fetching."; version="$(get_version "$id")" || break ;;
+                409)
+                  if [ "${attempt}" -eq 2 ]; then
+                    echo "::warning::${id}: version_conflict again — skipping."; break
+                  fi
+                  echo "  ${id}: version_conflict; re-fetching."
+                  version="$(get_version "$id")" \
+                    || { echo "  ${id}: not found on re-fetch — skipping."; break; } ;;
                 403) echo "::warning::${id}: 403 — token lacks write scope."; break ;;
                 *)   echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."; break ;;
               esac
