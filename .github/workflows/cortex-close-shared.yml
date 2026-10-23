@@ -7,8 +7,8 @@ name: Close Cortex Issues (shared)
 # coffer#40's merge (the trust model below). Epic 4a283f45.
 # Runs only for a push to the caller's default branch; any other event
 # or ref skips the job. Runs only on github.com (github.api_url must be
-# https://api.github.com, since gh is given no GH_HOST); elsewhere a
-# notice and no GitHub call.
+# https://api.github.com, since gh is given no GH_HOST); elsewhere it
+# prints a notice and makes no GitHub call.
 # Runner: private callers pass `runs_on` (e.g. their RUNNER_LABEL
 # variable). A public caller's `runs_on` is ignored and the job runs on
 # a runner labelled ubuntu-latest: GitHub-hosted (free for public
@@ -323,6 +323,15 @@ jobs:
             [[ -z "$1" || "$1" =~ ^HTTP\ (429|5[0-9][0-9])$ ]] && return 0
             [ "$1" = "HTTP 403" ] && grep -qi 'rate limit' "${ERRF}"
           }
+          # The job's if: already needs a real push; check its context here
+          # too, since an empty repo or default branch would loosen the PR
+          # checks below.
+          if [ -z "${DEFAULT_BRANCH}" ] \
+            || ! [[ "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || ! [[ "${HEAD_SHA}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::warning::push context (repo, commit or default branch) unreadable — skipping."
+            exit 0
+          fi
           ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit. A path that could meet a
@@ -410,9 +419,10 @@ jobs:
           mapfile -t NUMS <<< "${nums}"
           unset nums
           unset PR_JSON
-          # Any trusted PR without a whole number GraphQL's Int can hold
-          # (1-10 digits, at most 2147483647) fails closed as a whole. An
-          # empty read is one empty entry, so it fails too.
+          # Any trusted PR whose number is not a whole number that
+          # GraphQL's Int can hold (1-10 digits, at most 2147483647) fails
+          # closed as a whole. An empty read is one empty entry, so it
+          # fails too.
           bad=0
           for n in "${NUMS[@]}"; do
             if ! [[ "${n}" =~ ^[0-9]{1,10}$ ]] || [ "${n}" -gt 2147483647 ]; then
@@ -438,7 +448,8 @@ jobs:
           # have been deleted by the sender. The PR's own editor and
           # lastEditedAt must agree with the list: with no edits listed
           # both are null, otherwise editor is the sender and lastEditedAt
-          # a string (so a latest edit missing from the list is caught).
+          # a non-empty string (so a latest edit missing from the list is
+          # caught).
           # shellcheck disable=SC2016
           GQL='query($o: String!, $r: String!, $n: Int!) {
             repository(owner: $o, name: $r) { pullRequest(number: $n) {
@@ -467,7 +478,7 @@ jobs:
                 and (.deletedBy == null or (.deletedBy | me))))
             | select(if .userContentEdits.totalCount == 0
                 then .editor == null and .lastEditedAt == null
-                else (.editor | me) and (.lastEditedAt | type) == "string" end)
+                else (.editor | me) and (.lastEditedAt | type == "string" and . != "") end)
             | select(.body == null or (.body | type) == "string")
             | (.body // "")
             | select(explode | all(. != 0))
