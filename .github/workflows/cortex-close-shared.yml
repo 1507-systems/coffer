@@ -517,7 +517,7 @@ jobs:
             | select(explode | all(. != 0))
             | "b:" + @base64'
           # One base64 line per trusted body, so each is read alone.
-          # A NUL fails closed: bash's read would drop it silently.
+          # A NUL fails closed: bash's $(...) and read would drop it.
           BODIES=(); BNUMS=()
           for n in "${NUMS[@]}"; do
             if out_of_time; then
@@ -568,7 +568,7 @@ jobs:
               continue
             fi
             lead=1; late=0
-            while IFS= read -r line || [ -n "${line}" ]; do
+            while IFS= read -r line; do
               line="${line%$'\r'}"
               if [ "${lead}" -eq 1 ]; then
                 [[ "${line}" =~ ^[[:blank:]]*$ ]] && continue
