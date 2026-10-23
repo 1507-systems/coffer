@@ -216,7 +216,7 @@ jobs:
               e="${e//[^A-Za-z0-9_.-]/?}"
               names="${names} ${e:0:$((40 - ${#sfx}))}${sfx}"
             fi
-          done < <(env -0)
+          done < <(env -0 2>/dev/null)
           unset e sfx
           if [ "${seen}" -ne 1 ]; then
             echo "::error::runner env -0 output could not be read."; exit 1
@@ -234,14 +234,16 @@ jobs:
           # loads ~/.jq into every program and gh reads ~/.config/gh, so
           # both get an empty private directory instead (curl gets -q).
           # Cleared first, so an inherited ISO or ERRF names nothing to
-          # delete; the traps are set before the directory is made.
+          # delete. For ISO this is defence in depth: the mktemp line
+          # below overwrites it before any exit, so only a signal in the
+          # next few builtins could find it. The traps come before it.
           ISO=; ERRF=
           trap 'rm -rf "${ISO:-}"; rm -f "${ERRF:-}"' EXIT
           # INT and TERM exit with their usual codes, through the EXIT
           # trap; being trapped, they also end a retry wait at once.
           trap 'exit 130' INT
           trap 'exit 143' TERM
-          ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX")" \
+          ISO="$(umask 077 && mktemp -d "${RUNNER_TEMP:-/tmp}/cortex-iso.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           jq() { HOME="${ISO}" command jq "$@"; }
           if [ "$(printf 'eA==' | base64 -d 2>/dev/null)" != x ]; then
@@ -264,7 +266,7 @@ jobs:
             echo "::error::runner jq has no regex support (test)."; exit 1
           fi
           # -H @- (used below) needs curl 7.55+.
-          cv="$(curl -q --version | head -n1 | cut -d' ' -f2)"
+          cv="$(curl -q --version 2>/dev/null | head -n1 | cut -d' ' -f2)"
           # Cut like the jq version, for the errors below.
           cv="${cv//[^A-Za-z0-9_.-]/?}"; cv="${cv:0:40}"
           IFS=. read -r cmaj cmin _ <<< "${cv}"
@@ -349,7 +351,7 @@ jobs:
             echo "::warning::push context (repo, commit or default branch) unreadable — skipping."
             exit 0
           fi
-          ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX")" \
+          ERRF="$(umask 077 && mktemp "${RUNNER_TEMP:-/tmp}/cortex-err.XXXXXX" 2>/dev/null)" \
             || { echo "::warning::mktemp failed — skipping."; exit 0; }
           # The PRs merged as this commit. A path that could meet a
           # non-object is read with (path)? (which guards every step) or
@@ -439,13 +441,13 @@ jobs:
             || nums=""
           mapfile -t NUMS <<< "${nums}"
           unset nums PR_JSON
-          # Any trusted PR whose number is not a whole number that
-          # GraphQL's Int can hold (1-10 digits, at most 2147483647) fails
-          # closed as a whole. An empty read is one empty entry, so it
-          # fails too.
+          # Any trusted PR whose number is not a positive whole number
+          # that GraphQL's Int can hold (1-10 digits, no leading zero, at
+          # most 2147483647) fails closed as a whole. An empty read is
+          # one empty entry, so it fails too.
           bad=0
           for n in "${NUMS[@]}"; do
-            if ! [[ "${n}" =~ ^[0-9]{1,10}$ ]] || [ "${n}" -gt 2147483647 ]; then
+            if ! [[ "${n}" =~ ^[1-9][0-9]{0,9}$ ]] || [ "${n}" -gt 2147483647 ]; then
               bad=1
             fi
           done
