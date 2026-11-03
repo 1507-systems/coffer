@@ -145,23 +145,133 @@ test_die_exits_nonzero() {
 
 test_alert_recursion_guard() {
     # Regression: the nested `coffer get` that fetches the ntfy token runs with
-    # COFFER_IN_ALERT=1. If it dies (e.g. sops missing) it MUST NOT re-enter
-    # alerting, or one failure recurses into an unbounded ntfy storm. Assert
-    # that die() under COFFER_IN_ALERT sends zero alerts (curl never called).
+    # a COFFER_IN_ALERT nonce. If it dies (e.g. sops missing) it MUST NOT
+    # re-enter alerting, or one failure recurses into an unbounded ntfy storm.
+    # A nonce backed by its marker file suppresses the alert (curl never called).
+    local tmp count n nonce
+    tmp="$(mktemp -d)"
+    count="$tmp/curl_calls"
+    : > "$count"
+    nonce="0123456789abcdef0123456789abcdef"
+    mkdir -p "$tmp/home/.cache/coffer/alerts"
+    : > "$tmp/home/.cache/coffer/alerts/in-alert.${nonce}"
+    printf '#!/usr/bin/env bash\nprintf x >> "%s"\n' "$count" > "$tmp/curl"
+    chmod +x "$tmp/curl"
+    COFFER_NTFY_TOPIC="http://localhost:1/fake" HOME="$tmp/home" COFFER_IN_ALERT="$nonce" bash -c '
+        export PATH="'"$tmp"':$PATH"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        die "guarded error"
+    ' >/dev/null 2>&1 || true
+    n="$(wc -c < "$count" | tr -d ' ')"
+    rm -rf "$tmp"
+    assert_eq "0" "$n" "die() under a verified alert nonce must not send an alert"
+}
+
+test_inherited_in_alert_is_not_trusted() {
+    # An inherited COFFER_IN_ALERT with no matching marker file (e.g. a caller
+    # exporting COFFER_IN_ALERT=1) must NOT silence the failure alert, and must
+    # not leak into child processes.
+    local tmp count n v
+    for v in 1 0123456789abcdef0123456789abcdef; do
+        tmp="$(mktemp -d)"
+        count="$tmp/curl_calls"
+        : > "$count"
+        printf '#!/usr/bin/env bash\nprintf x >> "%s"\n' "$count" > "$tmp/curl"
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/coffer"
+        chmod +x "$tmp/curl" "$tmp/coffer"
+        COFFER_NTFY_TOPIC="http://localhost:1/fake" HOME="$tmp/home" COFFER_IN_ALERT="$v" bash -c '
+            export PATH="'"$tmp"':$PATH"
+            mkdir -p "$HOME"
+            source "'"${COFFER_ROOT}/lib/common.sh"'"
+            [[ -z "${COFFER_IN_ALERT+set}" ]] || exit 3
+            die "unguarded error"
+        ' >/dev/null 2>&1 || true
+        n="$(wc -c < "$count" | tr -d ' ')"
+        rm -rf "$tmp"
+        assert_eq "1" "$n" "inherited COFFER_IN_ALERT=${v} must not suppress the alert" || return 1
+    done
+}
+
+test_alert_cooldown_rejects_non_digits() {
+    # COFFER_ALERT_COOLDOWN feeds shell arithmetic. A non-digit value must be
+    # ignored (default 900), never evaluated.
     local tmp count n
     tmp="$(mktemp -d)"
     count="$tmp/curl_calls"
     : > "$count"
     printf '#!/usr/bin/env bash\nprintf x >> "%s"\n' "$count" > "$tmp/curl"
-    chmod +x "$tmp/curl"
-    COFFER_NTFY_TOPIC="http://localhost:1/fake" bash -c '
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/coffer"
+    chmod +x "$tmp/curl" "$tmp/coffer"
+    COFFER_NTFY_TOPIC="http://localhost:1/fake" HOME="$tmp/home" \
+    COFFER_ALERT_COOLDOWN='a[$(touch '"$tmp"'/pwned)]' bash -c '
         export PATH="'"$tmp"':$PATH"
+        mkdir -p "$HOME"
         source "'"${COFFER_ROOT}/lib/common.sh"'"
-        COFFER_IN_ALERT=1 die "guarded error"
+        coffer_ntfy_urgent "Coffer Error" "same body"
+        coffer_ntfy_urgent "Coffer Error" "same body"
     ' >/dev/null 2>&1 || true
     n="$(wc -c < "$count" | tr -d ' ')"
+    local pwned=no
+    [[ -e "$tmp/pwned" ]] && pwned=yes
     rm -rf "$tmp"
-    assert_eq "0" "$n" "die() under COFFER_IN_ALERT must not send an alert"
+    assert_eq "no" "$pwned" "a non-digit cooldown must not be evaluated" || return 1
+    assert_eq "1" "$n" "a non-digit cooldown falls back to the default window"
+}
+
+# Run one alert with a stub `coffer` that prints a token ONLY if the nonce
+# handshake verifies, and print the Authorization header curl received (or
+# "none"). Args: config-file topic ("" for no file), COFFER_NTFY_TOPIC.
+_alert_auth_header() {
+    local file_topic="$1" env_topic="$2" tmp out
+    tmp="$(mktemp -d)"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s/curl_args"\n' "$tmp" > "$tmp/curl"
+    cat > "$tmp/coffer" <<STUB
+#!/usr/bin/env bash
+source "${COFFER_ROOT}/lib/common.sh"
+[[ "\${_COFFER_IN_ALERT}" == 1 ]] && printf 'stub-token'
+exit 0
+STUB
+    chmod +x "$tmp/curl" "$tmp/coffer"
+    mkdir -p "$tmp/home/.config/coffer"
+    [[ -n "$file_topic" ]] && printf '%s\n' "$file_topic" > "$tmp/home/.config/coffer/ntfy-topic"
+    COFFER_NTFY_TOPIC="$env_topic" COFFER_CONFIG_DIR="$tmp/home/.config/coffer" HOME="$tmp/home" bash -c '
+        export PATH="'"$tmp"':$PATH"
+        source "'"${COFFER_ROOT}/lib/common.sh"'"
+        coffer_ntfy_urgent "Coffer Error" "auth check"
+    ' >/dev/null 2>&1 || true
+    out="$(command grep '^Authorization:' "$tmp/curl_args" 2>/dev/null || true)"
+    local leftover
+    leftover="$(find "$tmp/home/.cache/coffer/alerts" -name 'in-alert.*' 2>/dev/null | wc -l | tr -d ' ')"
+    rm -rf "$tmp"
+    [[ "$leftover" == 0 ]] || { printf 'marker-left-behind'; return; }
+    printf '%s' "${out:-none}"
+}
+
+test_ntfy_token_only_to_trusted_origin() {
+    local h
+    # Config-file https topic: token sent (and the nonce handshake works end to end).
+    h="$(_alert_auth_header "https://ntfy.example.test/coffer" "")"
+    assert_eq "Authorization: Bearer stub-token" "$h" "token goes to the config-file https origin" || return 1
+    # Env topic on the same origin: still allowed.
+    h="$(_alert_auth_header "https://ntfy.example.test/coffer" "https://NTFY.example.test/other")"
+    assert_eq "Authorization: Bearer stub-token" "$h" "same-origin env topic keeps the token" || return 1
+    # Env topic on another host: alert goes out with no token.
+    h="$(_alert_auth_header "https://ntfy.example.test/coffer" "https://evil.example/steal")"
+    assert_eq "none" "$h" "env topic on another host must not get the token" || return 1
+    # Look-alike host (userinfo / suffix tricks) gets nothing.
+    h="$(_alert_auth_header "https://ntfy.example.test/coffer" "https://ntfy.example.test.evil.example/x")"
+    assert_eq "none" "$h" "suffix look-alike host must not get the token" || return 1
+    h="$(_alert_auth_header "https://ntfy.example.test/coffer" "https://ntfy.example.test@evil.example/x")"
+    assert_eq "none" "$h" "userinfo look-alike URL must not get the token" || return 1
+    # Same host over plain http: refused.
+    h="$(_alert_auth_header "https://ntfy.example.test/coffer" "http://ntfy.example.test/coffer")"
+    assert_eq "none" "$h" "http scheme must not get the token" || return 1
+    # Config file itself is http: nothing is trusted.
+    h="$(_alert_auth_header "http://ntfy.example.test/coffer" "")"
+    assert_eq "none" "$h" "an http config topic must not get the token" || return 1
+    # No config file: an env-only topic never gets the token.
+    h="$(_alert_auth_header "" "https://ntfy.example.test/coffer")"
+    assert_eq "none" "$h" "env-only topic (no config file) must not get the token"
 }
 
 test_alert_cooldown_dedups() {
@@ -2642,6 +2752,9 @@ main() {
     # Common helper tests
     run_test test_die_exits_nonzero
     run_test test_alert_recursion_guard
+    run_test test_inherited_in_alert_is_not_trusted
+    run_test test_alert_cooldown_rejects_non_digits
+    run_test test_ntfy_token_only_to_trusted_origin
     run_test test_alert_cooldown_dedups
     run_test test_no_topic_configured_sends_nothing
     run_test test_topic_read_from_config_file
