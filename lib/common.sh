@@ -11,6 +11,23 @@ set -euo pipefail
 # neither set, failures still print to stderr but push no notification.
 COFFER_NTFY_TOPIC="${COFFER_NTFY_TOPIC:-}"
 
+# --- Alert-path recursion guard ---
+#
+# The nested `coffer get` that fetches the ntfy token must not re-enter
+# alerting (one failure would recurse into an alert storm), so the alert path
+# passes COFFER_IN_ALERT to that child. An INHERITED value is not trusted:
+# any caller could otherwise export COFFER_IN_ALERT=1 and silence every coffer
+# failure alert. The child honours it only when it is a nonce that the parent
+# alert path wrote as a marker file under the user's private cache dir just
+# before spawning it. Anything else is discarded here, at source time.
+_COFFER_ALERT_STATE_DIR="${HOME}/.cache/coffer/alerts"
+_COFFER_IN_ALERT=""
+if [[ "${COFFER_IN_ALERT:-}" =~ ^[0-9a-f]{32}$ ]] \
+    && [[ -f "${_COFFER_ALERT_STATE_DIR}/in-alert.${COFFER_IN_ALERT}" ]]; then
+    _COFFER_IN_ALERT=1
+fi
+unset COFFER_IN_ALERT
+
 # --- Logging ---
 
 # Return the machine identity used in alert titles/tags.
@@ -42,6 +59,30 @@ coffer_ntfy_topic() {
     fi
 }
 
+# Print the scheme://host[:port] origin of an http(s) URL, or nothing.
+coffer_url_origin() {
+    local url="$1"
+    if [[ "$url" =~ ^(https?://[A-Za-z0-9.-]+(:[0-9]+)?)(/|$) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]'
+    fi
+}
+
+# Decide whether the ntfy token may be sent to TOPIC. coffer posts the token
+# as a bearer header, so it must never follow a topic URL that a caller's
+# environment chose. The trusted origin is the one in the machine-local
+# ${COFFER_CONFIG_DIR}/ntfy-topic file (operator configuration, mode 600 dir),
+# never the environment, and it must be https. A COFFER_NTFY_TOPIC on that
+# same origin still gets the token; any other scheme or host does not.
+coffer_ntfy_token_allowed() {
+    local topic="$1" topic_file trusted="" origin=""
+    topic_file="${COFFER_CONFIG_DIR:-${HOME}/.config/coffer}/ntfy-topic"
+    if [[ -r "$topic_file" ]]; then
+        trusted="$(coffer_url_origin "$(tr -d '[:space:]' < "$topic_file")")"
+    fi
+    origin="$(coffer_url_origin "$topic")"
+    [[ -n "$trusted" && "$trusted" == https://* && "$origin" == "$trusted" ]]
+}
+
 # Send an urgent ntfy alert tagged with the machine identity so multi-host
 # vaults disclose which machine produced the error. The title carries the
 # identity (lock screens show it) and the tag list includes it for filtering;
@@ -67,8 +108,14 @@ coffer_ntfy_urgent() {
     # re-surfaces once per window so it stays visible. Best-effort: if the
     # state dir or hashing tools aren't available we fall through and send
     # (visibility beats silence).
+    # The cooldown feeds shell arithmetic, so accept digits only (an inherited
+    # value like "a[$(cmd)]" would otherwise be evaluated). Anything else, or
+    # an empty value, means the 900 s default.
     local cooldown="${COFFER_ALERT_COOLDOWN:-900}"
-    local state_dir="${HOME}/.cache/coffer/alerts"
+    if ! [[ "$cooldown" =~ ^[0-9]{1,9}$ ]]; then
+        cooldown=900
+    fi
+    local state_dir="${_COFFER_ALERT_STATE_DIR}"
     local sig="" marker="" now="" last=""
     now="$(date +%s 2>/dev/null || echo 0)"
     sig="$(printf '%s\n%s' "$title" "$body" | shasum -a 256 2>/dev/null | awk '{print $1}')"
@@ -91,10 +138,25 @@ coffer_ntfy_urgent() {
     # so a failure here (e.g. sops missing) can't recurse back into this
     # function. Without the guard, a broken environment turns one failure into
     # an unbounded recursion of alerts + coffer subprocesses.
-    local ntfy_token=""
-    ntfy_token="$(COFFER_IN_ALERT=1 coffer get ntfy/token-pub-coffer 2>/dev/null | tr -d '\n' || true)"
+    #
+    # The token goes ONLY to a trusted origin (see coffer_ntfy_token_allowed);
+    # otherwise the alert is sent without it, so an inherited or misconfigured
+    # COFFER_NTFY_TOPIC can never receive the token.
+    local -a auth=()
+    if coffer_ntfy_token_allowed "$topic"; then
+        local ntfy_token="" nonce=""
+        nonce="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        if [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] \
+            && (umask 077 && mkdir -p "$state_dir" && : > "${state_dir}/in-alert.${nonce}") 2>/dev/null; then
+            ntfy_token="$(COFFER_IN_ALERT="$nonce" coffer get ntfy/token-pub-coffer 2>/dev/null | tr -d '\n' || true)"
+            rm -f "${state_dir}/in-alert.${nonce}" 2>/dev/null || true
+        fi
+        if [[ -n "$ntfy_token" ]]; then
+            auth=(-H "Authorization: Bearer ${ntfy_token}")
+        fi
+    fi
     curl -s \
-        -H "Authorization: Bearer ${ntfy_token}" \
+        ${auth[@]+"${auth[@]}"} \
         -H "Priority: urgent" \
         -H "Title: ${title} [${machine}]" \
         -H "Tags: lock,warning,${machine}" \
@@ -104,7 +166,7 @@ coffer_ntfy_urgent() {
 
 # Print an error message, send an ntfy urgent notification, and exit 1.
 # Every failure in coffer is fatal and loud — but NOT when we're already inside
-# the alert path (COFFER_IN_ALERT): the nested `coffer get` that fetches the
+# the alert path (_COFFER_IN_ALERT, set from a verified nonce above): the nested `coffer get` that fetches the
 # ntfy token must never re-enter alerting, or one failure recurses into a storm.
 #
 # The alert body names the top-level invoking script (BASH_SOURCE[-1], falling
@@ -120,7 +182,7 @@ die() {
     # shebang, so compute the last index manually for compatibility.
     local caller="${BASH_SOURCE[$((${#BASH_SOURCE[@]} - 1))]:-$0}"
     echo "coffer: error: $* (from: ${caller})" >&2
-    if [[ -z "${COFFER_IN_ALERT:-}" ]]; then
+    if [[ -z "${_COFFER_IN_ALERT}" ]]; then
         coffer_ntfy_urgent "Coffer Error" "$* (from: ${caller})"
     fi
     exit 1
